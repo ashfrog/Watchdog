@@ -870,29 +870,29 @@ function WdStartApp {
 # =================== 5.1 Compatibility layer (legacy -> Wd* APIs) ===================
 # Keep legacy function-name wrappers to preserve runtime compatibility.
 # New integrations should use Wd* interface names directly.
-function Open-LogWriter { WdOpenLogWriter @PSBoundParameters }
-function Close-LogWriter { WdCloseLogWriter @PSBoundParameters }
-function Rotate-Log { WdRotateLog @PSBoundParameters }
-function Write-Log { WdWriteLog @PSBoundParameters }
-function Ensure-Directory { WdEnsureDirectory @PSBoundParameters }
-function Normalize-PathSafe { WdNormalizePathSafe @PSBoundParameters }
-function Escape-WmiString { WdEscapeWmiString @PSBoundParameters }
-function Test-DisableFlag { WdTestDisableFlag @PSBoundParameters }
-function Initialize-CounterIfNeeded { WdInitializeCounter @PSBoundParameters }
-function Cleanup-RestartStats { WdCleanupRestartStats @PSBoundParameters }
-function Get-PythonInterpreter { WdGetPythonInterpreter @PSBoundParameters }
-function Get-ConsoleMode { WdGetConsoleMode @PSBoundParameters }
-function Test-HasConsoleWindow { WdIsConsoleWindowPresent @PSBoundParameters }
-function Resolve-EffectiveConsoleMode { WdResolveConsoleMode @PSBoundParameters }
-function Test-IsScriptPathInCommandLine { WdIsScriptPathInCommandLine @PSBoundParameters }
-function Get-TargetProcess { WdGetTargetProcess @PSBoundParameters }
-function Wait-ForWindowHandle { WdWaitForWindowHandle @PSBoundParameters }
-function Test-IsWindowForeground { WdIsWindowForeground @PSBoundParameters }
-function Set-WindowToForeground { WdSetWindowToForeground @PSBoundParameters }
-function Repair-WindowDisplayMode { WdRepairWindowDisplayMode @PSBoundParameters }
-function Stop-ProcessTreeSafe { WdStopProcessTreeSafe @PSBoundParameters }
-function Test-ProcessStillMissing { WdIsProcessMissing @PSBoundParameters }
-function Start-App { WdStartApp @PSBoundParameters }
+function Open-LogWriter { return WdOpenLogWriter @PSBoundParameters }
+function Close-LogWriter { return WdCloseLogWriter @PSBoundParameters }
+function Rotate-Log { return WdRotateLog @PSBoundParameters }
+function Write-Log { return WdWriteLog @PSBoundParameters }
+function Ensure-Directory { return WdEnsureDirectory @PSBoundParameters }
+function Normalize-PathSafe { return WdNormalizePathSafe @PSBoundParameters }
+function Escape-WmiString { return WdEscapeWmiString @PSBoundParameters }
+function Test-DisableFlag { return WdTestDisableFlag @PSBoundParameters }
+function Initialize-CounterIfNeeded { return WdInitializeCounter @PSBoundParameters }
+function Cleanup-RestartStats { return WdCleanupRestartStats @PSBoundParameters }
+function Get-PythonInterpreter { return WdGetPythonInterpreter @PSBoundParameters }
+function Get-ConsoleMode { return WdGetConsoleMode @PSBoundParameters }
+function Test-HasConsoleWindow { return WdIsConsoleWindowPresent @PSBoundParameters }
+function Resolve-EffectiveConsoleMode { return WdResolveConsoleMode @PSBoundParameters }
+function Test-IsScriptPathInCommandLine { return WdIsScriptPathInCommandLine @PSBoundParameters }
+function Get-TargetProcess { return WdGetTargetProcess @PSBoundParameters }
+function Wait-ForWindowHandle { return WdWaitForWindowHandle @PSBoundParameters }
+function Test-IsWindowForeground { return WdIsWindowForeground @PSBoundParameters }
+function Set-WindowToForeground { return WdSetWindowToForeground @PSBoundParameters }
+function Repair-WindowDisplayMode { return WdRepairWindowDisplayMode @PSBoundParameters }
+function Stop-ProcessTreeSafe { return WdStopProcessTreeSafe @PSBoundParameters }
+function Test-ProcessStillMissing { return WdIsProcessMissing @PSBoundParameters }
+function Start-App { return WdStartApp @PSBoundParameters }
 
 # =================== 6. 初始化 ===================
 WdEnsureDirectory -Path $WatchdogRoot
