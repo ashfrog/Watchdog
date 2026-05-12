@@ -187,7 +187,7 @@ namespace WatchdogWin32
 $Script:LogWriter = $null
 $Script:IsRotatingLog = $false
 
-function Open-LogWriter {
+function WdOpenLogWriter {
     try {
         $utf8Bom = New-Object System.Text.UTF8Encoding($true)
         $Script:LogWriter = New-Object System.IO.StreamWriter($LogPath, $true, $utf8Bom)
@@ -198,7 +198,7 @@ function Open-LogWriter {
     }
 }
 
-function Close-LogWriter {
+function WdCloseLogWriter {
     if ($Script:LogWriter) {
         try {
             $Script:LogWriter.Flush()
@@ -212,13 +212,13 @@ function Close-LogWriter {
 
 # =================== 5. 辅助函数 ===================
 
-function Rotate-Log {
+function WdRotateLog {
     if (-not (Test-Path $LogPath)) { return }
     $file = Get-Item $LogPath -ErrorAction SilentlyContinue
     if (-not $file -or $file.Length -le ($MaxLogSizeMB * 1MB)) { return }
 
     $Script:IsRotatingLog = $true
-    Close-LogWriter
+    WdCloseLogWriter
 
     try {
         for ($i = $MaxLogBackups; $i -ge 1; $i--) {
@@ -255,12 +255,12 @@ function Rotate-Log {
         catch {}
     }
     finally {
-        Open-LogWriter
+        WdOpenLogWriter
         $Script:IsRotatingLog = $false
     }
 }
 
-function Write-Log {
+function WdWriteLog {
     param(
         [string]$Message,
         [string]$Color = "White"
@@ -293,14 +293,14 @@ function Write-Log {
     catch {}
 }
 
-function Ensure-Directory {
+function WdEnsureDirectory {
     param([string]$Path)
     if (-not (Test-Path $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
 }
 
-function Normalize-PathSafe {
+function WdNormalizePath {
     param([string]$Path)
     try {
         return [System.IO.Path]::GetFullPath($Path).Trim().ToLowerInvariant()
@@ -310,17 +310,17 @@ function Normalize-PathSafe {
     }
 }
 
-function Escape-WmiString {
+function WdEscapeWmiString {
     param([string]$Value)
     if ($null -eq $Value) { return "" }
     return $Value.Replace('\', '\\').Replace("'", "\'")
 }
 
-function Test-DisableFlag {
+function WdIsDisableFlagPresent {
     return (Test-Path $DisableFlag)
 }
 
-function Initialize-CounterIfNeeded {
+function WdInitializeCounter {
     param(
         [hashtable]$Table,
         [string]$Key,
@@ -331,7 +331,7 @@ function Initialize-CounterIfNeeded {
     }
 }
 
-function Cleanup-RestartStats {
+function WdCleanupRestartStats {
     param(
         [hashtable]$Table,
         [int]$CurrentHour
@@ -347,7 +347,7 @@ function Cleanup-RestartStats {
     }
 }
 
-function Get-PythonInterpreter {
+function WdGetPythonInterpreter {
     param(
         [bool]$HideWindow,
         [string]$PythonExe
@@ -366,7 +366,7 @@ function Get-PythonInterpreter {
     return "python.exe"
 }
 
-function Get-ConsoleMode {
+function WdGetConsoleMode {
     param([hashtable]$Config)
 
     if ($null -eq $Config) { return "Auto" }
@@ -376,7 +376,7 @@ function Get-ConsoleMode {
     return "Auto"
 }
 
-function Test-HasConsoleWindow {
+function WdHasConsoleWindow {
     try {
         $h = [WatchdogWin32.DisplayAPI]::GetConsoleWindow()
         return ($h -ne [IntPtr]::Zero)
@@ -386,7 +386,7 @@ function Test-HasConsoleWindow {
     }
 }
 
-function Resolve-EffectiveConsoleMode {
+function WdResolveConsoleMode {
     param(
         [string]$RequestedMode,
         [bool]$HideWindow
@@ -396,15 +396,15 @@ function Resolve-EffectiveConsoleMode {
 
     $mode = if ([string]::IsNullOrWhiteSpace($RequestedMode)) { "Auto" } else { $RequestedMode.Trim() }
 
-    if ($mode -ieq "Shared" -and -not (Test-HasConsoleWindow)) {
-        Write-Log "START: Shared console requested but current host has no console. Fallback to New." "DarkYellow"
+    if ($mode -ieq "Shared" -and -not (WdHasConsoleWindow)) {
+        WdWriteLog "START: Shared console requested but current host has no console. Fallback to New." "DarkYellow"
         return "New"
     }
 
     return $mode
 }
 
-function Test-IsScriptPathInCommandLine {
+function WdIsScriptPathInCommandLine {
     param(
         [string]$CommandLine,
         [string]$TargetPath
@@ -415,7 +415,7 @@ function Test-IsScriptPathInCommandLine {
     }
 
     $cmd = $CommandLine.ToLowerInvariant()
-    $target = (Normalize-PathSafe $TargetPath)
+    $target = (WdNormalizePath $TargetPath)
 
     if (-not $StrictScriptPathBoundary) {
         return $cmd.Contains($target)
@@ -425,19 +425,19 @@ function Test-IsScriptPathInCommandLine {
     return ($cmd -match "(^|[\s`"'])$escaped($|[\s`"'])")
 }
 
-function Get-TargetProcess {
+function WdGetTargetProcess {
     param(
         [string]$Path,
         [string]$FileName
     )
 
     $CurrentPID     = [System.Diagnostics.Process]::GetCurrentProcess().Id
-    $NormalizedPath = Normalize-PathSafe $Path
+    $NormalizedPath = WdNormalizePath $Path
 
     try {
         if ($Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
             return Get-Process -ErrorAction SilentlyContinue | Where-Object {
-                $_.Id -ne $CurrentPID -and $_.Path -and (Normalize-PathSafe $_.Path) -eq $NormalizedPath
+                $_.Id -ne $CurrentPID -and $_.Path -and (WdNormalizePath $_.Path) -eq $NormalizedPath
             }
         }
         else {
@@ -458,7 +458,7 @@ function Get-TargetProcess {
 
             if ($MatchFullPathForScripts) {
                 return $candidates | Where-Object {
-                    $_.CommandLine -and (Test-IsScriptPathInCommandLine -CommandLine $_.CommandLine -TargetPath $Path)
+                    $_.CommandLine -and (WdIsScriptPathInCommandLine -CommandLine $_.CommandLine -TargetPath $Path)
                 }
             }
             else {
@@ -474,7 +474,7 @@ function Get-TargetProcess {
     }
 }
 
-function Wait-ForWindowHandle {
+function WdWaitForWindowHandle {
     param(
         $ProcessObj,
         [int]$TimeoutMs = 5000
@@ -491,7 +491,7 @@ function Wait-ForWindowHandle {
     return [IntPtr]::Zero
 }
 
-function Test-IsWindowForeground {
+function WdIsWindowForeground {
     param($Hwnd)
     try {
         $fg = [WatchdogWin32.DisplayAPI]::GetForegroundWindow()
@@ -500,7 +500,7 @@ function Test-IsWindowForeground {
     catch { return $false }
 }
 
-function Set-WindowToForeground {
+function WdSetWindowToForeground {
     param($ProcessObj)
 
     if ($null -eq $ProcessObj) { return $false }
@@ -513,10 +513,10 @@ function Set-WindowToForeground {
     $VK_MENU         = 0x12
     $KEYEVENTF_KEYUP = 0x0002
 
-    $hwnd = Wait-ForWindowHandle -ProcessObj $ProcessObj
+    $hwnd = WdWaitForWindowHandle -ProcessObj $ProcessObj
     if ($hwnd -eq [IntPtr]::Zero) { return $false }
 
-    if (Test-IsWindowForeground -Hwnd $hwnd) { return $true }
+    if (WdIsWindowForeground -Hwnd $hwnd) { return $true }
 
     $currentThreadId = [WatchdogWin32.DisplayAPI]::GetCurrentThreadId()
     $targetThreadId  = [WatchdogWin32.DisplayAPI]::GetWindowThreadProcessId($hwnd, [IntPtr]::Zero)
@@ -551,7 +551,7 @@ function Set-WindowToForeground {
     }
 }
 
-function Repair-WindowDisplayMode {
+function WdRepairWindowDisplayMode {
     param(
         $ProcessObj,
         [bool]$Fullscreen
@@ -559,9 +559,9 @@ function Repair-WindowDisplayMode {
 
     if ($null -eq $ProcessObj) { return }
 
-    $hwnd = Wait-ForWindowHandle -ProcessObj $ProcessObj -TimeoutMs 3000
+    $hwnd = WdWaitForWindowHandle -ProcessObj $ProcessObj -TimeoutMs 3000
     if ($hwnd -eq [IntPtr]::Zero) {
-        Write-Log "DISPLAY: Window handle not ready, skipping repair." "DarkGray"
+        WdWriteLog "DISPLAY: Window handle not ready, skipping repair." "DarkGray"
         return
     }
 
@@ -599,7 +599,7 @@ function Repair-WindowDisplayMode {
     )
 
     if ($Fullscreen -and -not $isFullscreen) {
-        Write-Log "DISPLAY: Forcing fullscreen for PID $($ProcessObj.Id)..." "Yellow"
+        WdWriteLog "DISPLAY: Forcing fullscreen for PID $($ProcessObj.Id)..." "Yellow"
         $curStyle = [WatchdogWin32.DisplayAPI]::GetWindowLong($hwnd, $GWL_STYLE)
         $newStyle = $curStyle -band (-bnot $WS_OVERLAPPEDWINDOW)
         [WatchdogWin32.DisplayAPI]::SetWindowLong($hwnd, $GWL_STYLE, $newStyle) | Out-Null
@@ -609,10 +609,10 @@ function Repair-WindowDisplayMode {
             $mLeft, $mTop, $mWidth, $mHeight,
             ($SWP_FRAMECHANGED -bor $SWP_SHOWWINDOW -bor $SWP_NOZORDER)
         ) | Out-Null
-        Write-Log "DISPLAY: Fullscreen applied ($mWidth x $mHeight)." "Green"
+        WdWriteLog "DISPLAY: Fullscreen applied ($mWidth x $mHeight)." "Green"
     }
     elseif (-not $Fullscreen -and $isFullscreen) {
-        Write-Log "DISPLAY: Forcing windowed for PID $($ProcessObj.Id)..." "Yellow"
+        WdWriteLog "DISPLAY: Forcing windowed for PID $($ProcessObj.Id)..." "Yellow"
         $curStyle = [WatchdogWin32.DisplayAPI]::GetWindowLong($hwnd, $GWL_STYLE)
         $newStyle = $curStyle -bor $WS_OVERLAPPEDWINDOW
         [WatchdogWin32.DisplayAPI]::SetWindowLong($hwnd, $GWL_STYLE, $newStyle) | Out-Null
@@ -628,11 +628,11 @@ function Repair-WindowDisplayMode {
             $winX, $winY, $winW, $winH,
             ($SWP_FRAMECHANGED -bor $SWP_SHOWWINDOW -bor $SWP_NOZORDER)
         ) | Out-Null
-        Write-Log "DISPLAY: Windowed applied (${winW}x${winH} @ $winX,$winY)." "Green"
+        WdWriteLog "DISPLAY: Windowed applied (${winW}x${winH} @ $winX,$winY)." "Green"
     }
 }
 
-function Stop-ProcessTreeSafe {
+function WdStopProcessTreeSafe {
     param(
         [int]$Pid,
         [bool]$KillTree
@@ -651,9 +651,9 @@ function Stop-ProcessTreeSafe {
     catch {}
 }
 
-function Test-ProcessStillMissing {
+function WdIsProcessStillMissing {
     param([string]$Path, [string]$FileName)
-    $procs = Get-TargetProcess -Path $Path -FileName $FileName
+    $procs = WdGetTargetProcess -Path $Path -FileName $FileName
     $count = if ($procs) { ($procs | Measure-Object).Count } else { 0 }
 
     if ($procs) {
@@ -667,7 +667,7 @@ function Test-ProcessStillMissing {
     return ($count -eq 0)
 }
 
-function Start-App {
+function WdStartApp {
     param(
         [string]$Path,
         [string]$Arguments,
@@ -680,12 +680,12 @@ function Start-App {
     )
 
     if (-not (Test-Path $Path)) {
-        Write-Log "ERROR: Path not found [$Path]" "Red"
+        WdWriteLog "ERROR: Path not found [$Path]" "Red"
         return $null
     }
 
     $Dir = [System.IO.Path]::GetDirectoryName($Path)
-    $effectiveMode = Resolve-EffectiveConsoleMode -RequestedMode $ConsoleMode -HideWindow:$HideWindow
+    $effectiveMode = WdResolveConsoleMode -RequestedMode $ConsoleMode -HideWindow:$HideWindow
 
     if ($Path.EndsWith(".bat", [System.StringComparison]::OrdinalIgnoreCase) -or
         $Path.EndsWith(".cmd", [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -696,7 +696,7 @@ function Start-App {
 
             if ($effectiveMode -eq "Hidden") {
                 $cmdArgs = "/c $quotedPath$argText"
-                Write-Log "START: Launching [$FileName] hidden CMD=[cmd.exe $cmdArgs]" "DarkCyan"
+                WdWriteLog "START: Launching [$FileName] hidden CMD=[cmd.exe $cmdArgs]" "DarkCyan"
                 $proc = Start-Process -FilePath "cmd.exe" `
                     -ArgumentList $cmdArgs `
                     -WorkingDirectory $Dir `
@@ -707,7 +707,7 @@ function Start-App {
                 switch ($effectiveMode.ToLowerInvariant()) {
                     "shared" {
                         $cmdArgs = "/c $quotedPath$argText"
-                        Write-Log "START: Launching [$FileName] in shared console CMD=[cmd.exe $cmdArgs]" "DarkCyan"
+                        WdWriteLog "START: Launching [$FileName] in shared console CMD=[cmd.exe $cmdArgs]" "DarkCyan"
                         $proc = Start-Process -FilePath "cmd.exe" `
                             -ArgumentList $cmdArgs `
                             -WorkingDirectory $Dir `
@@ -716,7 +716,7 @@ function Start-App {
                     }
                     "new" {
                         $cmdArgs = "/c $quotedPath$argText"
-                        Write-Log "START: Launching [$FileName] in new console CMD=[cmd.exe $cmdArgs]" "DarkCyan"
+                        WdWriteLog "START: Launching [$FileName] in new console CMD=[cmd.exe $cmdArgs]" "DarkCyan"
                         $proc = Start-Process -FilePath "cmd.exe" `
                             -ArgumentList $cmdArgs `
                             -WorkingDirectory $Dir `
@@ -724,7 +724,7 @@ function Start-App {
                     }
                     default {
                         $cmdArgs = "/c $quotedPath$argText"
-                        Write-Log "START: Launching [$FileName] in auto mode CMD=[cmd.exe $cmdArgs]" "DarkCyan"
+                        WdWriteLog "START: Launching [$FileName] in auto mode CMD=[cmd.exe $cmdArgs]" "DarkCyan"
                         $proc = Start-Process -FilePath "cmd.exe" `
                             -ArgumentList $cmdArgs `
                             -WorkingDirectory $Dir `
@@ -734,23 +734,23 @@ function Start-App {
             }
 
             if ($proc) {
-                Write-Log "SUCCESS: Started $FileName PID=$($proc.Id) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
+                WdWriteLog "SUCCESS: Started $FileName PID=$($proc.Id) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
             }
             else {
-                Write-Log "SUCCESS: Started $FileName (PID unavailable) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
+                WdWriteLog "SUCCESS: Started $FileName (PID unavailable) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
             }
 
             return $proc
         }
         catch {
-            Write-Log "FAILED: $FileName - $($_.Exception.Message)" "Red"
+            WdWriteLog "FAILED: $FileName - $($_.Exception.Message)" "Red"
             return $null
         }
     }
 
     if ($Path.EndsWith(".py", [System.StringComparison]::OrdinalIgnoreCase)) {
         try {
-            $pyExe  = Get-PythonInterpreter -HideWindow:$HideWindow -PythonExe $PythonExe
+            $pyExe  = WdGetPythonInterpreter -HideWindow:$HideWindow -PythonExe $PythonExe
             $pyArgs = if ([string]::IsNullOrWhiteSpace($Arguments)) {
                 "`"$Path`""
             }
@@ -759,7 +759,7 @@ function Start-App {
             }
 
             if ($effectiveMode -eq "Hidden") {
-                Write-Log "START: Launching [$FileName] hidden CMD=[$pyExe $pyArgs]" "DarkCyan"
+                WdWriteLog "START: Launching [$FileName] hidden CMD=[$pyExe $pyArgs]" "DarkCyan"
                 $proc = Start-Process -FilePath $pyExe `
                     -ArgumentList $pyArgs `
                     -WorkingDirectory $Dir `
@@ -769,7 +769,7 @@ function Start-App {
             else {
                 switch ($effectiveMode.ToLowerInvariant()) {
                     "shared" {
-                        Write-Log "START: Launching [$FileName] in shared console CMD=[$pyExe $pyArgs]" "DarkCyan"
+                        WdWriteLog "START: Launching [$FileName] in shared console CMD=[$pyExe $pyArgs]" "DarkCyan"
                         $proc = Start-Process -FilePath $pyExe `
                             -ArgumentList $pyArgs `
                             -WorkingDirectory $Dir `
@@ -777,14 +777,14 @@ function Start-App {
                             -PassThru
                     }
                     "new" {
-                        Write-Log "START: Launching [$FileName] in new console CMD=[$pyExe $pyArgs]" "DarkCyan"
+                        WdWriteLog "START: Launching [$FileName] in new console CMD=[$pyExe $pyArgs]" "DarkCyan"
                         $proc = Start-Process -FilePath $pyExe `
                             -ArgumentList $pyArgs `
                             -WorkingDirectory $Dir `
                             -PassThru
                     }
                     default {
-                        Write-Log "START: Launching [$FileName] in auto mode CMD=[$pyExe $pyArgs]" "DarkCyan"
+                        WdWriteLog "START: Launching [$FileName] in auto mode CMD=[$pyExe $pyArgs]" "DarkCyan"
                         $proc = Start-Process -FilePath $pyExe `
                             -ArgumentList $pyArgs `
                             -WorkingDirectory $Dir `
@@ -794,16 +794,16 @@ function Start-App {
             }
 
             if ($proc) {
-                Write-Log "SUCCESS: Started $FileName PID=$($proc.Id) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
+                WdWriteLog "SUCCESS: Started $FileName PID=$($proc.Id) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
             }
             else {
-                Write-Log "SUCCESS: Started $FileName (PID unavailable) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
+                WdWriteLog "SUCCESS: Started $FileName (PID unavailable) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
             }
 
             return $proc
         }
         catch {
-            Write-Log "FAILED: $FileName - $($_.Exception.Message)" "Red"
+            WdWriteLog "FAILED: $FileName - $($_.Exception.Message)" "Red"
             return $null
         }
     }
@@ -828,7 +828,7 @@ function Start-App {
         $fsFlag = if ($Fullscreen) { "1" } else { "0" }
         if ($extraArgs -notmatch "(^|\s)-screen-fullscreen(\s|$)") {
             $extraArgs = ("$extraArgs -screen-fullscreen $fsFlag").Trim()
-            Write-Log "DISPLAY: Injecting Unity arg: -screen-fullscreen $fsFlag" "Cyan"
+            WdWriteLog "DISPLAY: Injecting Unity arg: -screen-fullscreen $fsFlag" "Cyan"
         }
     }
 
@@ -842,41 +842,68 @@ function Start-App {
     $proc = $null
     try {
         $cmdLine = "$($StartInfo.FileName) $($StartInfo.Arguments)".Trim()
-        Write-Log "START: Launching [$FileName] CMD=[$cmdLine]" "DarkCyan"
+        WdWriteLog "START: Launching [$FileName] CMD=[$cmdLine]" "DarkCyan"
 
         $proc = [System.Diagnostics.Process]::Start($StartInfo)
 
         if ($proc) {
-            Write-Log "SUCCESS: Started $FileName PID=$($proc.Id) (Hide=$HideWindow, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
+            WdWriteLog "SUCCESS: Started $FileName PID=$($proc.Id) (Hide=$HideWindow, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
         }
         else {
-            Write-Log "SUCCESS: Started $FileName (PID unavailable) (Hide=$HideWindow, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
+            WdWriteLog "SUCCESS: Started $FileName (PID unavailable) (Hide=$HideWindow, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
         }
 
         if ($FocusTop -and -not $HideWindow -and $proc) {
             Start-Sleep -Milliseconds 500
-            [void](Set-WindowToForeground -ProcessObj $proc)
+            [void](WdSetWindowToForeground -ProcessObj $proc)
         }
 
         return $proc
     }
     catch {
-        Write-Log "FAILED: $FileName - $($_.Exception.Message)" "Red"
+        WdWriteLog "FAILED: $FileName - $($_.Exception.Message)" "Red"
         if ($proc) { try { $proc.Dispose() } catch {} }
         return $null
     }
 }
 
-# =================== 6. 初始化 ===================
-Ensure-Directory -Path $WatchdogRoot
-Open-LogWriter
+# =================== 5.1 兼容层（旧名称 -> 新规范接口名） ===================
+# 说明：为了保障现网脚本引用稳定，保留旧函数名包装器；
+# 新代码请统一使用 Wd* 接口。
+function Open-LogWriter { WdOpenLogWriter @PSBoundParameters }
+function Close-LogWriter { WdCloseLogWriter @PSBoundParameters }
+function Rotate-Log { WdRotateLog @PSBoundParameters }
+function Write-Log { WdWriteLog @PSBoundParameters }
+function Ensure-Directory { WdEnsureDirectory @PSBoundParameters }
+function Normalize-PathSafe { WdNormalizePath @PSBoundParameters }
+function Escape-WmiString { WdEscapeWmiString @PSBoundParameters }
+function Test-DisableFlag { WdIsDisableFlagPresent @PSBoundParameters }
+function Initialize-CounterIfNeeded { WdInitializeCounter @PSBoundParameters }
+function Cleanup-RestartStats { WdCleanupRestartStats @PSBoundParameters }
+function Get-PythonInterpreter { WdGetPythonInterpreter @PSBoundParameters }
+function Get-ConsoleMode { WdGetConsoleMode @PSBoundParameters }
+function Test-HasConsoleWindow { WdHasConsoleWindow @PSBoundParameters }
+function Resolve-EffectiveConsoleMode { WdResolveConsoleMode @PSBoundParameters }
+function Test-IsScriptPathInCommandLine { WdIsScriptPathInCommandLine @PSBoundParameters }
+function Get-TargetProcess { WdGetTargetProcess @PSBoundParameters }
+function Wait-ForWindowHandle { WdWaitForWindowHandle @PSBoundParameters }
+function Test-IsWindowForeground { WdIsWindowForeground @PSBoundParameters }
+function Set-WindowToForeground { WdSetWindowToForeground @PSBoundParameters }
+function Repair-WindowDisplayMode { WdRepairWindowDisplayMode @PSBoundParameters }
+function Stop-ProcessTreeSafe { WdStopProcessTreeSafe @PSBoundParameters }
+function Test-ProcessStillMissing { WdIsProcessStillMissing @PSBoundParameters }
+function Start-App { WdStartApp @PSBoundParameters }
 
-Write-Log "=== Watchdog Service Active (Monitor Count: $($Apps.Count)) ===" "Yellow"
-Write-Log "INFO: Disable flag path = $DisableFlag" "DarkGray"
-Write-Log "INFO: Check interval = $CheckInterval sec, Max retry/hour = $MaxRetryInHour" "DarkGray"
-Write-Log "INFO: Log max size = ${MaxLogSizeMB}MB, Backups = $MaxLogBackups" "DarkGray"
-Write-Log "INFO: GC collect every $GCCollectEvery iterations (~$($GCCollectEvery * $CheckInterval) sec)" "DarkGray"
-Write-Log "INFO: Min restart gap = $MinRestartGapSeconds sec, Display loop repair = $DisplayLoopRepair" "DarkGray"
+# =================== 6. 初始化 ===================
+WdEnsureDirectory -Path $WatchdogRoot
+WdOpenLogWriter
+
+WdWriteLog "=== Watchdog Service Active (Monitor Count: $($Apps.Count)) ===" "Yellow"
+WdWriteLog "INFO: Disable flag path = $DisableFlag" "DarkGray"
+WdWriteLog "INFO: Check interval = $CheckInterval sec, Max retry/hour = $MaxRetryInHour" "DarkGray"
+WdWriteLog "INFO: Log max size = ${MaxLogSizeMB}MB, Backups = $MaxLogBackups" "DarkGray"
+WdWriteLog "INFO: GC collect every $GCCollectEvery iterations (~$($GCCollectEvery * $CheckInterval) sec)" "DarkGray"
+WdWriteLog "INFO: Min restart gap = $MinRestartGapSeconds sec, Display loop repair = $DisplayLoopRepair" "DarkGray"
 
 $FirstRun          = $true
 $RestartStats      = @{}
@@ -890,12 +917,12 @@ $Script:GCCounter  = 0
 try {
     while ($true) {
         try {
-            Rotate-Log
+            WdRotateLog
             $CurrentHour = (Get-Date).Hour
-            Cleanup-RestartStats -Table $RestartStats -CurrentHour $CurrentHour
+            WdCleanupRestartStats -Table $RestartStats -CurrentHour $CurrentHour
 
-            if (Test-DisableFlag) {
-                Write-Log "SAFE-MODE: Disable flag detected. Monitoring paused; no app will be launched or restarted." "Yellow"
+            if (WdIsDisableFlagPresent) {
+                WdWriteLog "SAFE-MODE: Disable flag detected. Monitoring paused; no app will be launched or restarted." "Yellow"
                 $FirstRun = $false
                 Start-Sleep -Seconds $CheckInterval
                 continue
@@ -910,10 +937,10 @@ try {
                 $AliveKey    = "${Path}::Alive"
                 $StartGapKey = "${Path}::LastStart"
 
-                Initialize-CounterIfNeeded -Table $RestartStats -Key $StatKey -DefaultValue 0
+                WdInitializeCounter -Table $RestartStats -Key $StatKey -DefaultValue 0
 
                 if ($RestartStats[$StatKey] -ge $MaxRetryInHour) {
-                    Write-Log "CRITICAL: $FileName failed too many times this hour ($($RestartStats[$StatKey])/$MaxRetryInHour). Skipping..." "Red"
+                    WdWriteLog "CRITICAL: $FileName failed too many times this hour ($($RestartStats[$StatKey])/$MaxRetryInHour). Skipping..." "Red"
                     continue
                 }
 
@@ -932,7 +959,7 @@ try {
                     $minUpSeconds = [Math]::Max(1, [int]$Config.MinUpSeconds)
                 }
 
-                $procs     = Get-TargetProcess -Path $Path -FileName $FileName
+                $procs     = WdGetTargetProcess -Path $Path -FileName $FileName
                 $procCount = if ($procs) { ($procs | Measure-Object).Count } else { 0 }
 
                 if ($procCount -eq 0) {
@@ -943,23 +970,23 @@ try {
                     if ($LastStartAttempt.ContainsKey($Path) -and $LastStartAttempt[$Path]) {
                         $sinceLastStart = ((Get-Date) - $LastStartAttempt[$Path]).TotalSeconds
                         if ($sinceLastStart -lt $MinRestartGapSeconds) {
-                            Write-Log "THROTTLE: $FileName skipped; only $([int]$sinceLastStart)s since last start attempt." "DarkYellow"
+                            WdWriteLog "THROTTLE: $FileName skipped; only $([int]$sinceLastStart)s since last start attempt." "DarkYellow"
                             continue
                         }
                     }
 
                     $WaitTime = if ($FirstRun) { [int]$Config.First } else { [int]$Config.Restart }
-                    Write-Log "MISSING: $FileName, launch scheduled in $WaitTime sec..." "Cyan"
+                    WdWriteLog "MISSING: $FileName, launch scheduled in $WaitTime sec..." "Cyan"
                     Start-Sleep -Seconds $WaitTime
 
-                    if (-not (Test-ProcessStillMissing -Path $Path -FileName $FileName)) {
-                        Write-Log "SKIP: $FileName already started by another source during wait window." "DarkYellow"
+                    if (-not (WdIsProcessStillMissing -Path $Path -FileName $FileName)) {
+                        WdWriteLog "SKIP: $FileName already started by another source during wait window." "DarkYellow"
                         continue
                     }
 
                     $LastStartAttempt[$Path] = Get-Date
 
-                    $proc = Start-App `
+                    $proc = WdStartApp `
                         -Path        $Path `
                         -Arguments   $Config.Arguments `
                         -FileName    $FileName `
@@ -967,7 +994,7 @@ try {
                         -FocusTop    ([bool]$Config.FocusTop) `
                         -Fullscreen  ([bool]$Config.Fullscreen) `
                         -PythonExe   ([string]$Config.PythonExe) `
-                        -ConsoleMode (Get-ConsoleMode -Config $Config)
+                        -ConsoleMode (WdGetConsoleMode -Config $Config)
 
                     if ($proc) {
                         $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
@@ -985,12 +1012,12 @@ try {
                 }
                 else {
                     if (-not $allowMultiInstance -and $procCount -gt 1) {
-                        Write-Log "CONFLICT: $procCount instances of $FileName detected. Cleaning up extra instances..." "Magenta"
+                        WdWriteLog "CONFLICT: $procCount instances of $FileName detected. Cleaning up extra instances..." "Magenta"
                         $procs | Select-Object -Skip 1 | ForEach-Object {
                             $TargetID = if ($null -ne $_.Id) { $_.Id } else { $_.ProcessId }
                             try {
-                                Stop-ProcessTreeSafe -Pid $TargetID -KillTree $true
-                                Write-Log "CLEANUP: Killed extra instance PID=$TargetID for $FileName" "DarkMagenta"
+                                WdStopProcessTreeSafe -Pid $TargetID -KillTree $true
+                                WdWriteLog "CLEANUP: Killed extra instance PID=$TargetID for $FileName" "DarkMagenta"
                             }
                             catch {}
 
@@ -1031,19 +1058,19 @@ try {
                         }
 
                         if ($Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase) -and -not $mainProc.Responding) {
-                            Write-Log "HANG: $FileName (PID:$TargetID) not responding. Restarting..." "Red"
+                            WdWriteLog "HANG: $FileName (PID:$TargetID) not responding. Restarting..." "Red"
 
-                            Stop-ProcessTreeSafe -Pid $TargetID -KillTree $killTreeOnHang
+                            WdStopProcessTreeSafe -Pid $TargetID -KillTree $killTreeOnHang
                             Start-Sleep -Seconds ([int]$Config.Restart)
 
-                            if (-not (Test-ProcessStillMissing -Path $Path -FileName $FileName)) {
-                                Write-Log "SKIP: $FileName recovered or restarted externally after hang handling." "DarkYellow"
+                            if (-not (WdIsProcessStillMissing -Path $Path -FileName $FileName)) {
+                                WdWriteLog "SKIP: $FileName recovered or restarted externally after hang handling." "DarkYellow"
                                 continue
                             }
 
                             $LastStartAttempt[$Path] = Get-Date
 
-                            $proc = Start-App `
+                            $proc = WdStartApp `
                                 -Path        $Path `
                                 -Arguments   $Config.Arguments `
                                 -FileName    $FileName `
@@ -1051,7 +1078,7 @@ try {
                                 -FocusTop    ([bool]$Config.FocusTop) `
                                 -Fullscreen  ([bool]$Config.Fullscreen) `
                                 -PythonExe   ([string]$Config.PythonExe) `
-                                -ConsoleMode (Get-ConsoleMode -Config $Config)
+                                -ConsoleMode (WdGetConsoleMode -Config $Config)
 
                             if ($proc) {
                                 $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
@@ -1079,7 +1106,7 @@ try {
                             }
 
                             if ($needRepair) {
-                                Repair-WindowDisplayMode -ProcessObj $mainProc -Fullscreen ([bool]$Config.Fullscreen)
+                                WdRepairWindowDisplayMode -ProcessObj $mainProc -Fullscreen ([bool]$Config.Fullscreen)
                             }
                         }
 
@@ -1096,12 +1123,12 @@ try {
                             if ($allowFocus) {
                                 $fgHwnd = [IntPtr]::Zero
                                 try { $fgHwnd = $mainProc.MainWindowHandle } catch {} # process may have just exited; leave fgHwnd as Zero
-                                if ($fgHwnd -ne [IntPtr]::Zero -and (Test-IsWindowForeground -Hwnd $fgHwnd)) {
+                                if ($fgHwnd -ne [IntPtr]::Zero -and (WdIsWindowForeground -Hwnd $fgHwnd)) {
                                     # Already in foreground; reset cooldown to skip redundant attempts
                                     $FocusLastTime[$Path] = Get-Date
-                                } elseif (Set-WindowToForeground -ProcessObj $mainProc) {
+                                } elseif (WdSetWindowToForeground -ProcessObj $mainProc) {
                                     $FocusLastTime[$Path] = Get-Date
-                                    Write-Log "FOCUS: Brought $FileName (PID:$TargetID) to foreground." "DarkCyan"
+                                    WdWriteLog "FOCUS: Brought $FileName (PID:$TargetID) to foreground." "DarkCyan"
                                 }
                             }
                         }
@@ -1135,16 +1162,16 @@ try {
             }
         }
         catch {
-            Write-Log "LOOP-ERROR: Unhandled exception in main loop: $($_.Exception.Message)" "Red"
-            Write-Log "LOOP-ERROR: StackTrace: $($_.ScriptStackTrace)" "DarkRed"
+            WdWriteLog "LOOP-ERROR: Unhandled exception in main loop: $($_.Exception.Message)" "Red"
+            WdWriteLog "LOOP-ERROR: StackTrace: $($_.ScriptStackTrace)" "DarkRed"
         }
 
         Start-Sleep -Seconds $CheckInterval
     }
 }
 finally {
-    try { Write-Log "=== Watchdog shutting down. Releasing resources... ===" "Yellow" } catch {}
-    Close-LogWriter
+    try { WdWriteLog "=== Watchdog shutting down. Releasing resources... ===" "Yellow" } catch {}
+    WdCloseLogWriter
 
     if ($Script:MutexOwned) {
         try { $Script:Mutex.ReleaseMutex() } catch {}
