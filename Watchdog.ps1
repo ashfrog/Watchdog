@@ -634,18 +634,18 @@ function WdRepairWindowDisplayMode {
 
 function WdStopProcessTreeSafe {
     param(
-        [int]$Pid,
+        [int]$ProcessId,
         [bool]$KillTree
     )
 
-    if ($Pid -le 0) { return }
+    if ($ProcessId -le 0) { return }
 
     try {
         if ($KillTree) {
-            & taskkill.exe /PID $Pid /T /F | Out-Null
+            & taskkill.exe /PID $ProcessId /T /F | Out-Null
         }
         else {
-            Stop-Process -Id $Pid -Force -ErrorAction SilentlyContinue
+            Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
         }
     }
     catch {}
@@ -1016,7 +1016,7 @@ try {
                         $procs | Select-Object -Skip 1 | ForEach-Object {
                             $TargetID = if ($null -ne $_.Id) { $_.Id } else { $_.ProcessId }
                             try {
-                                WdStopProcessTreeSafe -Pid $TargetID -KillTree $true
+                                WdStopProcessTreeSafe -ProcessId $TargetID -KillTree $true
                                 WdWriteLog "CLEANUP: Killed extra instance PID=$TargetID for $FileName" "DarkMagenta"
                             }
                             catch {}
@@ -1060,7 +1060,7 @@ try {
                         if ($Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase) -and -not $mainProc.Responding) {
                             WdWriteLog "HANG: $FileName (PID:$TargetID) not responding. Restarting..." "Red"
 
-                            WdStopProcessTreeSafe -Pid $TargetID -KillTree $killTreeOnHang
+                            WdStopProcessTreeSafe -ProcessId $TargetID -KillTree $killTreeOnHang
                             Start-Sleep -Seconds ([int]$Config.Restart)
 
                             if (-not (WdIsProcessMissing -Path $Path -FileName $FileName)) {
