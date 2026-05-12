@@ -376,7 +376,7 @@ function WdGetConsoleMode {
     return "Auto"
 }
 
-function WdHasConsoleWindow {
+function WdIsConsoleWindowPresent {
     try {
         $h = [WatchdogWin32.DisplayAPI]::GetConsoleWindow()
         return ($h -ne [IntPtr]::Zero)
@@ -396,7 +396,7 @@ function WdResolveConsoleMode {
 
     $mode = if ([string]::IsNullOrWhiteSpace($RequestedMode)) { "Auto" } else { $RequestedMode.Trim() }
 
-    if ($mode -ieq "Shared" -and -not (WdHasConsoleWindow)) {
+    if ($mode -ieq "Shared" -and -not (WdIsConsoleWindowPresent)) {
         WdWriteLog "START: Shared console requested but current host has no console. Fallback to New." "DarkYellow"
         return "New"
     }
@@ -651,7 +651,7 @@ function WdStopProcessTreeSafe {
     catch {}
 }
 
-function WdTestProcessStillMissing {
+function WdIsProcessMissing {
     param([string]$Path, [string]$FileName)
     $procs = WdGetTargetProcess -Path $Path -FileName $FileName
     $count = if ($procs) { ($procs | Measure-Object).Count } else { 0 }
@@ -882,7 +882,7 @@ function Initialize-CounterIfNeeded { WdInitializeCounter @PSBoundParameters }
 function Cleanup-RestartStats { WdCleanupRestartStats @PSBoundParameters }
 function Get-PythonInterpreter { WdGetPythonInterpreter @PSBoundParameters }
 function Get-ConsoleMode { WdGetConsoleMode @PSBoundParameters }
-function Test-HasConsoleWindow { WdHasConsoleWindow @PSBoundParameters }
+function Test-HasConsoleWindow { WdIsConsoleWindowPresent @PSBoundParameters }
 function Resolve-EffectiveConsoleMode { WdResolveConsoleMode @PSBoundParameters }
 function Test-IsScriptPathInCommandLine { WdIsScriptPathInCommandLine @PSBoundParameters }
 function Get-TargetProcess { WdGetTargetProcess @PSBoundParameters }
@@ -891,7 +891,7 @@ function Test-IsWindowForeground { WdIsWindowForeground @PSBoundParameters }
 function Set-WindowToForeground { WdSetWindowToForeground @PSBoundParameters }
 function Repair-WindowDisplayMode { WdRepairWindowDisplayMode @PSBoundParameters }
 function Stop-ProcessTreeSafe { WdStopProcessTreeSafe @PSBoundParameters }
-function Test-ProcessStillMissing { WdTestProcessStillMissing @PSBoundParameters }
+function Test-ProcessStillMissing { WdIsProcessMissing @PSBoundParameters }
 function Start-App { WdStartApp @PSBoundParameters }
 
 # =================== 6. 初始化 ===================
@@ -979,7 +979,7 @@ try {
                     WdWriteLog "MISSING: $FileName, launch scheduled in $WaitTime sec..." "Cyan"
                     Start-Sleep -Seconds $WaitTime
 
-                    if (-not (WdTestProcessStillMissing -Path $Path -FileName $FileName)) {
+                    if (-not (WdIsProcessMissing -Path $Path -FileName $FileName)) {
                         WdWriteLog "SKIP: $FileName already started by another source during wait window." "DarkYellow"
                         continue
                     }
@@ -1063,7 +1063,7 @@ try {
                             WdStopProcessTreeSafe -Pid $TargetID -KillTree $killTreeOnHang
                             Start-Sleep -Seconds ([int]$Config.Restart)
 
-                            if (-not (WdTestProcessStillMissing -Path $Path -FileName $FileName)) {
+                            if (-not (WdIsProcessMissing -Path $Path -FileName $FileName)) {
                                 WdWriteLog "SKIP: $FileName recovered or restarted externally after hang handling." "DarkYellow"
                                 continue
                             }
