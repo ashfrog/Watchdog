@@ -1094,7 +1094,12 @@ try {
                             }
 
                             if ($allowFocus) {
-                                if (Set-WindowToForeground -ProcessObj $mainProc) {
+                                $fgHwnd = [IntPtr]::Zero
+                                try { $fgHwnd = $mainProc.MainWindowHandle } catch {} # process may have just exited; leave fgHwnd as Zero
+                                if ($fgHwnd -ne [IntPtr]::Zero -and (Test-IsWindowForeground -Hwnd $fgHwnd)) {
+                                    # Already in foreground; reset cooldown to skip redundant attempts
+                                    $FocusLastTime[$Path] = Get-Date
+                                } elseif (Set-WindowToForeground -ProcessObj $mainProc) {
                                     $FocusLastTime[$Path] = Get-Date
                                     Write-Log "FOCUS: Brought $FileName (PID:$TargetID) to foreground." "DarkCyan"
                                 }
