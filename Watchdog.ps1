@@ -33,7 +33,7 @@
 # - 生产环境不建议随意开启 FocusTop / ForceDisplayMode
 
 $Apps = [ordered]@{
-    "U:\UnityRelease\MediaPlayer_Hu\MediaPlayerServer.exe" = @{
+    "M:\GitHub\NetWorkBlockTest\TestNewBlock\Release\TestNewBlock.exe" = @{
         First = 1; Restart = 5; Arguments = ""
         Once = $false; HideWindow = $false; FocusTop = $true
         Fullscreen = $true; ForceDisplayMode = $false; PythonExe = ""
