@@ -310,12 +310,6 @@ function WdNormalizePathSafe {
     }
 }
 
-function WdEscapeWmiString {
-    param([string]$Value)
-    if ($null -eq $Value) { return "" }
-    return $Value.Replace('\', '\\').Replace("'", "\'")
-}
-
 function WdTestDisableFlag {
     return (Test-Path $DisableFlag)
 }
@@ -872,14 +866,9 @@ function WdStartApp {
 # New integrations should use Wd* interface names directly.
 function Open-LogWriter { return WdOpenLogWriter @PSBoundParameters }
 function Close-LogWriter { return WdCloseLogWriter @PSBoundParameters }
-function Rotate-Log { return WdRotateLog @PSBoundParameters }
 function Write-Log { return WdWriteLog @PSBoundParameters }
-function Ensure-Directory { return WdEnsureDirectory @PSBoundParameters }
-function Normalize-PathSafe { return WdNormalizePathSafe @PSBoundParameters }
-function Escape-WmiString { return WdEscapeWmiString @PSBoundParameters }
 function Test-DisableFlag { return WdTestDisableFlag @PSBoundParameters }
 function Initialize-CounterIfNeeded { return WdInitializeCounter @PSBoundParameters }
-function Cleanup-RestartStats { return WdCleanupRestartStats @PSBoundParameters }
 function Get-PythonInterpreter { return WdGetPythonInterpreter @PSBoundParameters }
 function Get-ConsoleMode { return WdGetConsoleMode @PSBoundParameters }
 function Test-HasConsoleWindow { return WdIsConsoleWindowPresent @PSBoundParameters }
@@ -932,10 +921,9 @@ try {
                 $Config   = $Apps[$Path]
                 $FileName = [System.IO.Path]::GetFileName($Path)
 
-                $StatKey     = "${Path}::H${CurrentHour}"
-                $OnceKey     = "${Path}::Once"
-                $AliveKey    = "${Path}::Alive"
-                $StartGapKey = "${Path}::LastStart"
+                $StatKey  = "${Path}::H${CurrentHour}"
+                $OnceKey  = "${Path}::Once"
+                $AliveKey = "${Path}::Alive"
 
                 WdInitializeCounter -Table $RestartStats -Key $StatKey -DefaultValue 0
 
