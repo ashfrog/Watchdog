@@ -300,7 +300,7 @@ function WdEnsureDirectory {
     }
 }
 
-function WdNormalizePath {
+function WdNormalizePathSafe {
     param([string]$Path)
     try {
         return [System.IO.Path]::GetFullPath($Path).Trim().ToLowerInvariant()
@@ -415,7 +415,7 @@ function WdIsScriptPathInCommandLine {
     }
 
     $cmd = $CommandLine.ToLowerInvariant()
-    $target = (WdNormalizePath $TargetPath)
+    $target = (WdNormalizePathSafe $TargetPath)
 
     if (-not $StrictScriptPathBoundary) {
         return $cmd.Contains($target)
@@ -432,12 +432,12 @@ function WdGetTargetProcess {
     )
 
     $CurrentPID     = [System.Diagnostics.Process]::GetCurrentProcess().Id
-    $NormalizedPath = WdNormalizePath $Path
+    $NormalizedPath = WdNormalizePathSafe $Path
 
     try {
         if ($Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
             return Get-Process -ErrorAction SilentlyContinue | Where-Object {
-                $_.Id -ne $CurrentPID -and $_.Path -and (WdNormalizePath $_.Path) -eq $NormalizedPath
+                $_.Id -ne $CurrentPID -and $_.Path -and (WdNormalizePathSafe $_.Path) -eq $NormalizedPath
             }
         }
         else {
@@ -651,7 +651,7 @@ function WdStopProcessTreeSafe {
     catch {}
 }
 
-function WdIsProcessMissing {
+function WdTestProcessStillMissing {
     param([string]$Path, [string]$FileName)
     $procs = WdGetTargetProcess -Path $Path -FileName $FileName
     $count = if ($procs) { ($procs | Measure-Object).Count } else { 0 }
@@ -875,7 +875,7 @@ function Close-LogWriter { WdCloseLogWriter @PSBoundParameters }
 function Rotate-Log { WdRotateLog @PSBoundParameters }
 function Write-Log { WdWriteLog @PSBoundParameters }
 function Ensure-Directory { WdEnsureDirectory @PSBoundParameters }
-function Normalize-PathSafe { WdNormalizePath @PSBoundParameters }
+function Normalize-PathSafe { WdNormalizePathSafe @PSBoundParameters }
 function Escape-WmiString { WdEscapeWmiString @PSBoundParameters }
 function Test-DisableFlag { WdTestDisableFlag @PSBoundParameters }
 function Initialize-CounterIfNeeded { WdInitializeCounter @PSBoundParameters }
@@ -891,7 +891,7 @@ function Test-IsWindowForeground { WdIsWindowForeground @PSBoundParameters }
 function Set-WindowToForeground { WdSetWindowToForeground @PSBoundParameters }
 function Repair-WindowDisplayMode { WdRepairWindowDisplayMode @PSBoundParameters }
 function Stop-ProcessTreeSafe { WdStopProcessTreeSafe @PSBoundParameters }
-function Test-ProcessStillMissing { WdIsProcessMissing @PSBoundParameters }
+function Test-ProcessStillMissing { WdTestProcessStillMissing @PSBoundParameters }
 function Start-App { WdStartApp @PSBoundParameters }
 
 # =================== 6. 初始化 ===================
@@ -979,7 +979,7 @@ try {
                     WdWriteLog "MISSING: $FileName, launch scheduled in $WaitTime sec..." "Cyan"
                     Start-Sleep -Seconds $WaitTime
 
-                    if (-not (WdIsProcessMissing -Path $Path -FileName $FileName)) {
+                    if (-not (WdTestProcessStillMissing -Path $Path -FileName $FileName)) {
                         WdWriteLog "SKIP: $FileName already started by another source during wait window." "DarkYellow"
                         continue
                     }
@@ -1063,7 +1063,7 @@ try {
                             WdStopProcessTreeSafe -Pid $TargetID -KillTree $killTreeOnHang
                             Start-Sleep -Seconds ([int]$Config.Restart)
 
-                            if (-not (WdIsProcessMissing -Path $Path -FileName $FileName)) {
+                            if (-not (WdTestProcessStillMissing -Path $Path -FileName $FileName)) {
                                 WdWriteLog "SKIP: $FileName recovered or restarted externally after hang handling." "DarkYellow"
                                 continue
                             }
