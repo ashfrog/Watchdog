@@ -182,6 +182,7 @@ namespace WatchdogWin32
 # =================== 4. 日志 StreamWriter 管理 ===================
 $Script:LogWriter = $null
 $Script:IsRotatingLog = $false
+$Script:PathErrorLogged = @{}
 
 function WdOpenLogWriter {
     try {
@@ -670,9 +671,13 @@ function WdStartApp {
     )
 
     if (-not (Test-Path $Path)) {
-        WdWriteLog "ERROR: Path not found [$Path]" "Red"
+        if (-not $Script:PathErrorLogged[$Path]) {
+            WdWriteLog "ERROR: Path not found [$Path]" "Red"
+            $Script:PathErrorLogged[$Path] = $true
+        }
         return $null
     }
+    $Script:PathErrorLogged[$Path] = $false
 
     $Dir = [System.IO.Path]::GetDirectoryName($Path)
     $effectiveMode = WdResolveConsoleMode -RequestedMode $ConsoleMode -HideWindow:$HideWindow
@@ -897,6 +902,7 @@ $DisplayRepairDone = @{}
 $FocusLastTime     = @{}
 $LastStartAttempt  = @{}
 $ThrottleWarned    = @{}
+$MissingLogged     = @{}
 $Script:GCCounter  = 0
 
 # =================== 7. 主循环 ===================
@@ -965,10 +971,14 @@ try {
                     }
 
                     $WaitTime = if ($FirstRun) { [int]$Config.First } else { [int]$Config.Restart }
-                    WdWriteLog "MISSING: $FileName, launch scheduled in $WaitTime sec..." "Cyan"
+                    if (-not $MissingLogged[$Path]) {
+                        WdWriteLog "MISSING: $FileName, launch scheduled in $WaitTime sec..." "Cyan"
+                        $MissingLogged[$Path] = $true
+                    }
                     Start-Sleep -Seconds $WaitTime
 
                     if (-not (WdIsProcessMissing -Path $Path -FileName $FileName)) {
+                        $MissingLogged[$Path] = $false
                         WdWriteLog "SKIP: $FileName already started by another source during wait window." "DarkYellow"
                         continue
                     }
@@ -1000,6 +1010,7 @@ try {
                     }
                 }
                 else {
+                    $MissingLogged[$Path] = $false
                     if (-not $allowMultiInstance -and $procCount -gt 1) {
                         WdWriteLog "CONFLICT: $procCount instances of $FileName detected. Cleaning up extra instances..." "Magenta"
                         $procs | Select-Object -Skip 1 | ForEach-Object {
