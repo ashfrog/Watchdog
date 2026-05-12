@@ -316,7 +316,7 @@ function WdEscapeWmiString {
     return $Value.Replace('\', '\\').Replace("'", "\'")
 }
 
-function WdIsDisableFlagPresent {
+function WdTestDisableFlag {
     return (Test-Path $DisableFlag)
 }
 
@@ -651,7 +651,7 @@ function WdStopProcessTreeSafe {
     catch {}
 }
 
-function WdIsProcessStillMissing {
+function WdIsProcessMissing {
     param([string]$Path, [string]$FileName)
     $procs = WdGetTargetProcess -Path $Path -FileName $FileName
     $count = if ($procs) { ($procs | Measure-Object).Count } else { 0 }
@@ -867,9 +867,9 @@ function WdStartApp {
     }
 }
 
-# =================== 5.1 兼容层（旧名称 -> 新规范接口名） ===================
-# 说明：为了保障现网脚本引用稳定，保留旧函数名包装器；
-# 新代码请统一使用 Wd* 接口。
+# =================== 5.1 Compatibility layer (legacy -> Wd* APIs) ===================
+# Keep legacy function-name wrappers to preserve runtime compatibility.
+# New integrations should use Wd* interface names directly.
 function Open-LogWriter { WdOpenLogWriter @PSBoundParameters }
 function Close-LogWriter { WdCloseLogWriter @PSBoundParameters }
 function Rotate-Log { WdRotateLog @PSBoundParameters }
@@ -877,7 +877,7 @@ function Write-Log { WdWriteLog @PSBoundParameters }
 function Ensure-Directory { WdEnsureDirectory @PSBoundParameters }
 function Normalize-PathSafe { WdNormalizePath @PSBoundParameters }
 function Escape-WmiString { WdEscapeWmiString @PSBoundParameters }
-function Test-DisableFlag { WdIsDisableFlagPresent @PSBoundParameters }
+function Test-DisableFlag { WdTestDisableFlag @PSBoundParameters }
 function Initialize-CounterIfNeeded { WdInitializeCounter @PSBoundParameters }
 function Cleanup-RestartStats { WdCleanupRestartStats @PSBoundParameters }
 function Get-PythonInterpreter { WdGetPythonInterpreter @PSBoundParameters }
@@ -891,7 +891,7 @@ function Test-IsWindowForeground { WdIsWindowForeground @PSBoundParameters }
 function Set-WindowToForeground { WdSetWindowToForeground @PSBoundParameters }
 function Repair-WindowDisplayMode { WdRepairWindowDisplayMode @PSBoundParameters }
 function Stop-ProcessTreeSafe { WdStopProcessTreeSafe @PSBoundParameters }
-function Test-ProcessStillMissing { WdIsProcessStillMissing @PSBoundParameters }
+function Test-ProcessStillMissing { WdIsProcessMissing @PSBoundParameters }
 function Start-App { WdStartApp @PSBoundParameters }
 
 # =================== 6. 初始化 ===================
@@ -921,7 +921,7 @@ try {
             $CurrentHour = (Get-Date).Hour
             WdCleanupRestartStats -Table $RestartStats -CurrentHour $CurrentHour
 
-            if (WdIsDisableFlagPresent) {
+            if (WdTestDisableFlag) {
                 WdWriteLog "SAFE-MODE: Disable flag detected. Monitoring paused; no app will be launched or restarted." "Yellow"
                 $FirstRun = $false
                 Start-Sleep -Seconds $CheckInterval
@@ -979,7 +979,7 @@ try {
                     WdWriteLog "MISSING: $FileName, launch scheduled in $WaitTime sec..." "Cyan"
                     Start-Sleep -Seconds $WaitTime
 
-                    if (-not (WdIsProcessStillMissing -Path $Path -FileName $FileName)) {
+                    if (-not (WdIsProcessMissing -Path $Path -FileName $FileName)) {
                         WdWriteLog "SKIP: $FileName already started by another source during wait window." "DarkYellow"
                         continue
                     }
@@ -1063,7 +1063,7 @@ try {
                             WdStopProcessTreeSafe -Pid $TargetID -KillTree $killTreeOnHang
                             Start-Sleep -Seconds ([int]$Config.Restart)
 
-                            if (-not (WdIsProcessStillMissing -Path $Path -FileName $FileName)) {
+                            if (-not (WdIsProcessMissing -Path $Path -FileName $FileName)) {
                                 WdWriteLog "SKIP: $FileName recovered or restarted externally after hang handling." "DarkYellow"
                                 continue
                             }
