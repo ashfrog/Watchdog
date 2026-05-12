@@ -1,9 +1,10 @@
 ﻿# Watchdog (Production Hardened)
 # 编码要求：UTF-8 with BOM
 #
-# 建议启动方式（正式环境优先）：
-# 1) 任务计划程序：开机或用户登录时启动
-# 2) 如必须 kiosk / 无桌面方式，再考虑注册表 Shell
+# 配置无桌面启动：Win + R -> regedit
+# 路径：HKEY_CURRENT_USER\Software\Microsoft\Windows NT\CurrentVersion\Winlogon
+# 键名：Shell (右键新建 字符串值)
+# 数值：powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Watchdog\watchdog.ps1"
 #
 # 紧急停用：
 #   创建文件 C:\Watchdog\disable.flag
@@ -20,17 +21,12 @@
 # ForceDisplayMode:   $true=启用显示模式修复  $false=不干预窗口模式
 # PythonExe:          可选，指定 python.exe / pythonw.exe 所在路径；为空则走系统 PATH
 # ConsoleMode:        控制台模式（仅脚本类有效）
-#                     Auto=按默认兼容行为启动
-#                     Shared=与 Watchdog 共用当前控制台（无控制台环境会自动回退）
-#                     New=单独新建控制台窗口
+#                     	Auto=按默认兼容行为启动
+#                     	Shared=与 Watchdog 共用当前控制台（无控制台环境会自动回退）
+#                     	New=单独新建控制台窗口
 # AllowMultiInstance: $true=允许多实例并存  $false=仅保留一个
 # KillTreeOnHang:     $true=挂死时结束进程树  $false=仅结束主进程
 # MinUpSeconds:       启动后若很快退出，按失败重启节流处理
-#
-# 说明：
-# - bat/cmd 在 Auto/New 模式下一律使用 cmd.exe /c，避免脚本已结束但 cmd 窗口仍常驻造成误判
-# - 脚本类进程识别优先基于 Win32_Process.CommandLine 的“脚本路径包含”匹配，不再对整条命令行做 GetFullPath 规范化
-# - 生产环境不建议随意开启 FocusTop / ForceDisplayMode
 
 $Apps = [ordered]@{
     "M:\GitHub\NetWorkBlockTest\TestNewBlock\Release\TestNewBlock.exe" = @{
