@@ -896,6 +896,7 @@ $LaunchTime        = @{}
 $DisplayRepairDone = @{}
 $FocusLastTime     = @{}
 $LastStartAttempt  = @{}
+$ThrottleWarned    = @{}
 $Script:GCCounter  = 0
 
 # =================== 7. 主循环 ===================
@@ -905,6 +906,7 @@ try {
             WdRotateLog
             $CurrentHour = (Get-Date).Hour
             WdCleanupRestartStats -Table $RestartStats -CurrentHour $CurrentHour
+            WdCleanupRestartStats -Table $ThrottleWarned -CurrentHour $CurrentHour
 
             if (WdTestDisableFlag) {
                 WdWriteLog "SAFE-MODE: Disable flag detected. Monitoring paused; no app will be launched or restarted." "Yellow"
@@ -924,7 +926,10 @@ try {
                 WdInitializeCounter -Table $RestartStats -Key $StatKey -DefaultValue 0
 
                 if ($RestartStats[$StatKey] -ge $MaxRetryInHour) {
-                    WdWriteLog "CRITICAL: $FileName failed too many times this hour ($($RestartStats[$StatKey])/$MaxRetryInHour). Skipping..." "Red"
+                    if (-not $ThrottleWarned.ContainsKey($StatKey)) {
+                        WdWriteLog "CRITICAL: $FileName failed too many times this hour ($($RestartStats[$StatKey])/$MaxRetryInHour). Skipping until next hour..." "Red"
+                        $ThrottleWarned[$StatKey] = $true
+                    }
                     continue
                 }
 
