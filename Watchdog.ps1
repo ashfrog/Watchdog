@@ -1061,6 +1061,7 @@ try {
                     $FileName = [System.IO.Path]::GetFileName($Path)
                 }
                 $isExe    = $Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)
+                $isUrl    = WdIsBrowserUrl -Path $Path
 
                 $StatKey  = "${Path}::H${CurrentHour}"
                 $OnceKey  = "${Path}::Once"
@@ -1267,7 +1268,7 @@ try {
                             }
                         }
 
-                        if ([bool]$Config.FocusTop -and -not [bool]$Config.HideWindow -and $isExe) {
+                        if ([bool]$Config.FocusTop -and -not [bool]$Config.HideWindow -and ($isExe -or $isUrl)) {
                             $allowFocus = $true
 
                             if ($FocusLastTime.ContainsKey($Path) -and $FocusLastTime[$Path]) {
