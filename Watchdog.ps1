@@ -1068,7 +1068,7 @@ try {
                         if ($isExe -and -not $mainProc.Responding) {
                             WdInitializeCounter -Table $HangFailCount -Key $Path -DefaultValue 0
                             $HangFailCount[$Path] = [int]$HangFailCount[$Path] + 1
-                            $hangFailTimes = [int]$HangFailCount[$Path]
+                            $hangFailTimes = $HangFailCount[$Path]
 
                             if ($hangFailTimes -lt $HangConsecutiveFailuresToRestart) {
                                 WdWriteLog "HANG-WARN: $FileName (PID:$TargetID) not responding ($hangFailTimes/$HangConsecutiveFailuresToRestart). Waiting for consecutive confirmation..." "DarkYellow"
@@ -1109,7 +1109,7 @@ try {
                             }
                             continue
                         }
-                        elseif ($isExe -and $HangFailCount.ContainsKey($Path) -and [int]$HangFailCount[$Path] -gt 0) {
+                        elseif ($isExe -and [int]$HangFailCount[$Path] -gt 0) {
                             WdWriteLog "HANG-RECOVERED: $FileName (PID:$TargetID) responding again; reset consecutive hang counter." "DarkGreen"
                             $HangFailCount[$Path] = 0
                         }
