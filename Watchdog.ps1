@@ -40,34 +40,40 @@
 #   进程检测仅匹配该 Profile 的主进程，不会误杀子渲染进程。
 
 $Apps = [ordered]@{
-    "https://www.baidu.com" = @{
+    "M:\GitHub\NetWorkBlockTest\TestNewBlock\Release\TestNewBlock.exe" = @{
         First = 1; Restart = 5; Arguments = ""
         Once = $false; HideWindow = $false; FocusTop = $true
         Fullscreen = $true; ForceDisplayMode = $false; PythonExe = ""
         ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
         MinUpSeconds = 15; Browser = "auto"
     }
-    "C:\Scripts\test.bat" = @{
+    "https://www.google.com" = @{
         First = 1; Restart = 5; Arguments = ""
         Once = $false; HideWindow = $false; FocusTop = $false
         Fullscreen = $false; ForceDisplayMode = $false; PythonExe = ""
-        ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
-        MinUpSeconds = 3; Browser = "auto"
+        ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
+        MinUpSeconds = 15; Browser = "auto"
     }
-    "C:\Scripts\main.py" = @{
-        First = 1; Restart = 10; Arguments = ""
-        Once = $false; HideWindow = $false; FocusTop = $false
-        Fullscreen = $false; ForceDisplayMode = $false; PythonExe = "C:\Python311\python.exe"
-        ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
-        MinUpSeconds = 5; Browser = "auto"
+    "C:\WINDOWS\system32\notepad.exe" = @{
+        First = 1; Restart = 5; Arguments = ""
+        Once = $true; HideWindow = $false; FocusTop = $false
+        Fullscreen = $false; ForceDisplayMode = $false; PythonExe = ""
+        ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
+        MinUpSeconds = 15; Browser = "auto"
     }
-    # 示例：通过 Chrome/Edge 全屏（kiosk）守护网页
-    # "https://example.com" = @{
-    #     First = 3; Restart = 5; Arguments = ""
+    # "C:\Scripts\test.bat" = @{
+    #     First = 1; Restart = 5; Arguments = ""
     #     Once = $false; HideWindow = $false; FocusTop = $false
-    #     Fullscreen = $true; ForceDisplayMode = $false; PythonExe = ""
-    #     ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $false
-    #     MinUpSeconds = 10; Browser = "auto"   # auto / chrome / msedge
+    #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = ""
+    #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
+    #     MinUpSeconds = 3; Browser = "auto"
+    # }
+    # "C:\Scripts\main.py" = @{
+    #     First = 1; Restart = 10; Arguments = ""
+    #     Once = $false; HideWindow = $false; FocusTop = $false
+    #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = "C:\Python311\python.exe"
+    #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
+    #     MinUpSeconds = 5; Browser = "auto"
     # }
 }
 
@@ -943,21 +949,7 @@ function WdStartApp {
 
     $StartInfo.FileName = $Path
     $extraArgs = $Arguments
-
-    if (-not $HideWindow) {
-        $fsFlag = if ($Fullscreen) { "1" } else { "0" }
-        if ($extraArgs -notmatch "(^|\s)-screen-fullscreen(\s|$)") {
-            $extraArgs = ("$extraArgs -screen-fullscreen $fsFlag").Trim()
-            WdWriteLog "DISPLAY: Injecting Unity arg: -screen-fullscreen $fsFlag" "Cyan"
-        }
-    }
-
-    if ($FileName -ieq "notepad++.exe" -and $HideWindow) {
-        $StartInfo.Arguments = ("-multiInst " + $extraArgs).Trim()
-    }
-    else {
-        $StartInfo.Arguments = $extraArgs
-    }
+    $StartInfo.Arguments = $extraArgs
 
     $proc = $null
     try {
