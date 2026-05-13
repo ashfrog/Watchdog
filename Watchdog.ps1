@@ -63,6 +63,9 @@ $CheckInterval   = 3
 $MaxRetryInHour  = 10
 $GCCollectEvery  = 100
 
+# 连续 N 次检测到不响应后才执行挂死重启，避免偶发卡顿触发误重启
+$HangConsecutiveFailuresToRestart = 3
+
 # 启动后最短再次尝试间隔，避免同一轮/短时间重复拉起
 $MinRestartGapSeconds = 2
 
@@ -894,6 +897,7 @@ WdWriteLog "INFO: Check interval = $CheckInterval sec, Max retry/hour = $MaxRetr
 WdWriteLog "INFO: Log max size = ${MaxLogSizeMB}MB, Backups = $MaxLogBackups" "DarkGray"
 WdWriteLog "INFO: GC collect every $GCCollectEvery iterations (~$($GCCollectEvery * $CheckInterval) sec)" "DarkGray"
 WdWriteLog "INFO: Min restart gap = $MinRestartGapSeconds sec, Display loop repair = $DisplayLoopRepair" "DarkGray"
+WdWriteLog "INFO: Hang restart threshold = $HangConsecutiveFailuresToRestart consecutive failures" "DarkGray"
 
 $FirstRun          = $true
 $RestartStats      = @{}
@@ -903,6 +907,7 @@ $FocusLastTime     = @{}
 $LastStartAttempt  = @{}
 $ThrottleWarned    = @{}
 $MissingLogged     = @{}
+$HangFailCount     = @{}
 $Script:GCCounter  = 0
 
 # =================== 7. 主循环 ===================
@@ -924,6 +929,7 @@ try {
             foreach ($Path in $Apps.Keys) {
                 $Config   = $Apps[$Path]
                 $FileName = [System.IO.Path]::GetFileName($Path)
+                $isExe    = $Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)
 
                 $StatKey  = "${Path}::H${CurrentHour}"
                 $OnceKey  = "${Path}::Once"
@@ -955,9 +961,10 @@ try {
                 }
 
                 $procs     = WdGetTargetProcess -Path $Path -FileName $FileName
-                $procCount = if ($procs) { ($procs | Measure-Object).Count } else { 0 }
+                $procCount = if ($procs -is [array]) { $procs.Count } elseif ($procs) { 1 } else { 0 }
 
                 if ($procCount -eq 0) {
+                    $HangFailCount[$Path] = 0
                     if ($Config.Once -and $RestartStats.ContainsKey($OnceKey) -and $RestartStats[$OnceKey]) {
                         continue
                     }
@@ -1000,6 +1007,7 @@ try {
                         $LaunchTime[$Path] = Get-Date
                         $DisplayRepairDone[$Path] = $false
                         $RestartStats[$AliveKey] = $false
+                        $HangFailCount[$Path] = 0
 
                         if ($Config.Once) {
                             $RestartStats[$OnceKey] = $true
@@ -1057,8 +1065,18 @@ try {
                             }
                         }
 
-                        if ($Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase) -and -not $mainProc.Responding) {
-                            WdWriteLog "HANG: $FileName (PID:$TargetID) not responding. Restarting..." "Red"
+                        if ($isExe -and -not $mainProc.Responding) {
+                            WdInitializeCounter -Table $HangFailCount -Key $Path -DefaultValue 0
+                            $HangFailCount[$Path] = [int]$HangFailCount[$Path] + 1
+                            $hangFailTimes = [int]$HangFailCount[$Path]
+
+                            if ($hangFailTimes -lt $HangConsecutiveFailuresToRestart) {
+                                WdWriteLog "HANG-WARN: $FileName (PID:$TargetID) not responding ($hangFailTimes/$HangConsecutiveFailuresToRestart). Waiting for consecutive confirmation..." "DarkYellow"
+                                continue
+                            }
+
+                            WdWriteLog "HANG: $FileName (PID:$TargetID) not responding for $hangFailTimes consecutive checks. Restarting..." "Red"
+                            $HangFailCount[$Path] = 0
 
                             WdStopProcessTreeSafe -ProcessId $TargetID -KillTree $killTreeOnHang
                             Start-Sleep -Seconds ([int]$Config.Restart)
@@ -1085,10 +1103,15 @@ try {
                                 $LaunchTime[$Path] = Get-Date
                                 $DisplayRepairDone[$Path] = $false
                                 $RestartStats[$AliveKey] = $false
+                                $HangFailCount[$Path] = 0
                                 try { $proc.Dispose() } catch {}
                                 $proc = $null
                             }
                             continue
+                        }
+                        elseif ($isExe -and $HangFailCount.ContainsKey($Path) -and [int]$HangFailCount[$Path] -gt 0) {
+                            WdWriteLog "HANG-RECOVERED: $FileName (PID:$TargetID) responding again; reset consecutive hang counter." "DarkGreen"
+                            $HangFailCount[$Path] = 0
                         }
 
                         if ($Config.ContainsKey("ForceDisplayMode") -and [bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
@@ -1110,7 +1133,7 @@ try {
                             }
                         }
 
-                        if ([bool]$Config.FocusTop -and -not [bool]$Config.HideWindow -and $Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
+                        if ([bool]$Config.FocusTop -and -not [bool]$Config.HideWindow -and $isExe) {
                             $allowFocus = $true
 
                             if ($FocusLastTime.ContainsKey($Path) -and $FocusLastTime[$Path]) {
