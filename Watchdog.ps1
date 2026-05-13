@@ -19,6 +19,7 @@
 # FocusTop:           $true=允许置顶并抢焦点（建议仅 kiosk 场景启用）
 # Fullscreen:         $true=目标为全屏  $false=目标为窗口化
 # ForceDisplayMode:   $true=启用显示模式修复  $false=不干预窗口模式
+#                     （网页 URL 条目建议保持 $false，浏览器 --kiosk 自行管理全屏）
 # PythonExe:          可选，指定 python.exe / pythonw.exe 所在路径；为空则走系统 PATH
 # ConsoleMode:        控制台模式（仅脚本类有效）
 #                     	Auto=按默认兼容行为启动
@@ -27,6 +28,16 @@
 # AllowMultiInstance: $true=允许多实例并存  $false=仅保留一个
 # KillTreeOnHang:     $true=挂死时结束进程树  $false=仅结束主进程
 # MinUpSeconds:       启动后若很快退出，按失败重启节流处理
+# Browser:            网页 URL 条目专用，指定打开浏览器
+#                     	auto=自动检测（优先 Chrome，其次 Edge）
+#                     	chrome=Google Chrome
+#                     	msedge=Microsoft Edge
+#
+# 【网页 URL 支持】
+#   将 http:// 或 https:// 开头的 URL 作为 Key，Watchdog 会通过 Chrome/Edge 打开并持续守护。
+#   Fullscreen=$true 时以 --kiosk 模式启动（真正无边框全屏），$false 时最大化窗口。
+#   每个 URL 使用独立的浏览器 Profile（存于 $WatchdogRoot\browser_profiles\），
+#   进程检测仅匹配该 Profile 的主进程，不会误杀子渲染进程。
 
 $Apps = [ordered]@{
     "M:\GitHub\NetWorkBlockTest\TestNewBlock\Release\TestNewBlock.exe" = @{
@@ -34,22 +45,30 @@ $Apps = [ordered]@{
         Once = $false; HideWindow = $false; FocusTop = $true
         Fullscreen = $true; ForceDisplayMode = $false; PythonExe = ""
         ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
-        MinUpSeconds = 15
+        MinUpSeconds = 15; Browser = "auto"
     }
     "C:\Scripts\test.bat" = @{
         First = 1; Restart = 5; Arguments = ""
         Once = $false; HideWindow = $false; FocusTop = $false
         Fullscreen = $false; ForceDisplayMode = $false; PythonExe = ""
         ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
-        MinUpSeconds = 3
+        MinUpSeconds = 3; Browser = "auto"
     }
     "C:\Scripts\main.py" = @{
         First = 1; Restart = 10; Arguments = ""
         Once = $false; HideWindow = $false; FocusTop = $false
         Fullscreen = $false; ForceDisplayMode = $false; PythonExe = "C:\Python311\python.exe"
         ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
-        MinUpSeconds = 5
+        MinUpSeconds = 5; Browser = "auto"
     }
+    # 示例：通过 Chrome/Edge 全屏（kiosk）守护网页
+    # "https://example.com" = @{
+    #     First = 3; Restart = 5; Arguments = ""
+    #     Once = $false; HideWindow = $false; FocusTop = $false
+    #     Fullscreen = $true; ForceDisplayMode = $false; PythonExe = ""
+    #     ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $false
+    #     MinUpSeconds = 10; Browser = "auto"   # auto / chrome / msedge
+    # }
 }
 
 # =================== 1. 全局配置 ===================
@@ -427,6 +446,19 @@ function WdGetTargetProcess {
     $CurrentPID     = [System.Diagnostics.Process]::GetCurrentProcess().Id
     $NormalizedPath = WdNormalizePathSafe $Path
 
+    if (WdIsBrowserUrl -Path $Path) {
+        $profileBase = Join-Path $WatchdogRoot "browser_profiles"
+        $profileDir  = (Join-Path $profileBase (WdSanitizeForPath -Url $Path)).ToLowerInvariant()
+        return Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $procName = $_.Name.ToLowerInvariant() -replace '\.exe$', ''
+            $cmdLine  = if ($_.CommandLine) { $_.CommandLine.ToLowerInvariant() } else { "" }
+            $_.ProcessId -ne $CurrentPID -and
+            ($procName -eq "chrome" -or $procName -eq "msedge") -and
+            $cmdLine.Contains($profileDir) -and
+            $cmdLine -notmatch '--type='
+        }
+    }
+
     try {
         if ($Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
             return Get-Process -ErrorAction SilentlyContinue | Where-Object {
@@ -465,6 +497,55 @@ function WdGetTargetProcess {
     catch {
         return $null
     }
+}
+
+# =================== 5.x 浏览器 URL 辅助函数 ===================
+
+function WdIsBrowserUrl {
+    param([string]$Path)
+    return ($Path -imatch '^https?://')
+}
+
+function WdSanitizeForPath {
+    param([string]$Url)
+    # Use truncated human-readable prefix + 8-char MD5 suffix to guarantee uniqueness
+    $md5    = [System.Security.Cryptography.MD5]::Create()
+    $hash   = ($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Url)) |
+               ForEach-Object { $_.ToString("x2") }) -join ''
+    $md5.Dispose()
+    $short  = $hash.Substring(0, 8)
+    $prefix = ($Url -replace '^https?://', '' -replace '[^\w\-.]', '_')
+    if ($prefix.Length -gt 40) { $prefix = $prefix.Substring(0, 40) }
+    return "${prefix}_${short}"
+}
+
+function WdResolveBrowserExe {
+    param([string]$Browser)
+
+    $chromePaths = @(
+        "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+        "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
+        "$env:LocalAppData\Google\Chrome\Application\chrome.exe"
+    )
+    $edgePaths = @(
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+        "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+    )
+
+    $pref = if ([string]::IsNullOrWhiteSpace($Browser)) { "auto" } else { $Browser.Trim().ToLowerInvariant() }
+
+    if ($pref -in @("chrome", "google", "googlechrome")) {
+        foreach ($p in $chromePaths) { if (Test-Path $p) { return $p } }
+        return "chrome.exe"
+    }
+    if ($pref -in @("edge", "msedge", "microsoft", "microsoftedge")) {
+        foreach ($p in $edgePaths) { if (Test-Path $p) { return $p } }
+        return "msedge.exe"
+    }
+    # auto: prefer Chrome, fall back to Edge
+    foreach ($p in $chromePaths) { if (Test-Path $p) { return $p } }
+    foreach ($p in $edgePaths)   { if (Test-Path $p) { return $p } }
+    return "chrome.exe"
 }
 
 function WdWaitForWindowHandle {
@@ -669,8 +750,50 @@ function WdStartApp {
         [bool]$FocusTop,
         [bool]$Fullscreen,
         [string]$PythonExe,
-        [string]$ConsoleMode = "Auto"
+        [string]$ConsoleMode = "Auto",
+        [string]$Browser = "auto"
     )
+
+    # ---- 网页 URL 处理 ----
+    if (WdIsBrowserUrl -Path $Path) {
+        $browserExe  = WdResolveBrowserExe -Browser $Browser
+        $profileBase = Join-Path $WatchdogRoot "browser_profiles"
+        $profileDir  = Join-Path $profileBase (WdSanitizeForPath -Url $Path)
+
+        $browserArgs = @(
+            "--user-data-dir=`"$profileDir`"",
+            "--no-first-run",
+            "--disable-infobars",
+            "--disable-session-crashed-bubble"
+        )
+        if ($Fullscreen) {
+            $browserArgs += "--kiosk"
+        }
+        else {
+            $browserArgs += "--start-maximized"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Arguments)) {
+            $browserArgs += $Arguments
+        }
+        $browserArgs += "`"$Path`""
+        $argStr = $browserArgs -join " "
+
+        try {
+            WdWriteLog "START: Launching [$FileName] via [$browserExe] Args=[$argStr]" "DarkCyan"
+            $proc = Start-Process -FilePath $browserExe -ArgumentList $argStr -PassThru -ErrorAction Stop
+            if ($proc) {
+                WdWriteLog "SUCCESS: Started $FileName PID=$($proc.Id) (Browser=$browserExe, Fullscreen=$Fullscreen)" "Green"
+            }
+            else {
+                WdWriteLog "SUCCESS: Started $FileName (PID unavailable) (Browser=$browserExe, Fullscreen=$Fullscreen)" "Green"
+            }
+            return $proc
+        }
+        catch {
+            WdWriteLog "FAILED: $FileName (browser) - $($_.Exception.Message)" "Red"
+            return $null
+        }
+    }
 
     if (-not (Test-Path $Path)) {
         if (-not $Script:PathErrorLogged[$Path]) {
@@ -927,7 +1050,16 @@ try {
 
             foreach ($Path in $Apps.Keys) {
                 $Config   = $Apps[$Path]
-                $FileName = [System.IO.Path]::GetFileName($Path)
+                if (WdIsBrowserUrl -Path $Path) {
+                    try { $FileName = "[$(([System.Uri]$Path).Host)]" }
+                    catch {
+                        WdWriteLog "WARN: Could not parse URL [$Path] as URI; using raw string as display name." "DarkYellow"
+                        $FileName = $Path
+                    }
+                }
+                else {
+                    $FileName = [System.IO.Path]::GetFileName($Path)
+                }
                 $isExe    = $Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)
 
                 $StatKey  = "${Path}::H${CurrentHour}"
@@ -998,7 +1130,8 @@ try {
                         -FocusTop    ([bool]$Config.FocusTop) `
                         -Fullscreen  ([bool]$Config.Fullscreen) `
                         -PythonExe   ([string]$Config.PythonExe) `
-                        -ConsoleMode (WdGetConsoleMode -Config $Config)
+                        -ConsoleMode (WdGetConsoleMode -Config $Config) `
+                        -Browser     (if ($Config.ContainsKey("Browser")) { [string]$Config.Browser } else { "auto" })
 
                     if ($proc) {
                         $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
@@ -1092,7 +1225,8 @@ try {
                                 -FocusTop    ([bool]$Config.FocusTop) `
                                 -Fullscreen  ([bool]$Config.Fullscreen) `
                                 -PythonExe   ([string]$Config.PythonExe) `
-                                -ConsoleMode (WdGetConsoleMode -Config $Config)
+                                -ConsoleMode (WdGetConsoleMode -Config $Config) `
+                                -Browser     (if ($Config.ContainsKey("Browser")) { [string]$Config.Browser } else { "auto" })
 
                             if ($proc) {
                                 $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
