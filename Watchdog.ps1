@@ -421,8 +421,7 @@ function WdIsScriptPathInCommandLine {
 
 function WdGetTargetProcess {
     param(
-        [string]$Path,
-        [string]$FileName
+        [string]$Path
     )
 
     $CurrentPID     = [System.Diagnostics.Process]::GetCurrentProcess().Id
@@ -646,8 +645,8 @@ function WdStopProcessTreeSafe {
 }
 
 function WdIsProcessMissing {
-    param([string]$Path, [string]$FileName)
-    $procs = WdGetTargetProcess -Path $Path -FileName $FileName
+    param([string]$Path)
+    $procs = WdGetTargetProcess -Path $Path
     $count = if ($procs) { ($procs | Measure-Object).Count } else { 0 }
 
     if ($procs) {
@@ -933,7 +932,6 @@ try {
 
                 $StatKey  = "${Path}::H${CurrentHour}"
                 $OnceKey  = "${Path}::Once"
-                $AliveKey = "${Path}::Alive"
 
                 WdInitializeCounter -Table $RestartStats -Key $StatKey -DefaultValue 0
 
@@ -960,7 +958,7 @@ try {
                     $minUpSeconds = [Math]::Max(1, [int]$Config.MinUpSeconds)
                 }
 
-                $procs     = WdGetTargetProcess -Path $Path -FileName $FileName
+                $procs     = WdGetTargetProcess -Path $Path
                 $procCount = if ($procs -is [array]) { $procs.Count } elseif ($procs) { 1 } else { 0 }
 
                 if ($procCount -eq 0) {
@@ -984,7 +982,7 @@ try {
                     }
                     Start-Sleep -Seconds $WaitTime
 
-                    if (-not (WdIsProcessMissing -Path $Path -FileName $FileName)) {
+                    if (-not (WdIsProcessMissing -Path $Path)) {
                         $MissingLogged[$Path] = $false
                         WdWriteLog "SKIP: $FileName already started by another source during wait window." "DarkYellow"
                         continue
@@ -1006,7 +1004,6 @@ try {
                         $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
                         $LaunchTime[$Path] = Get-Date
                         $DisplayRepairDone[$Path] = $false
-                        $RestartStats[$AliveKey] = $false
                         $HangFailCount[$Path] = 0
 
                         if ($Config.Once) {
@@ -1061,7 +1058,6 @@ try {
                         if ($LaunchTime.ContainsKey($Path) -and $LaunchTime[$Path]) {
                             $uptime = ((Get-Date) - $LaunchTime[$Path]).TotalSeconds
                             if ($uptime -ge $minUpSeconds) {
-                                $RestartStats[$AliveKey] = $true
                             }
                         }
 
@@ -1081,7 +1077,7 @@ try {
                             WdStopProcessTreeSafe -ProcessId $TargetID -KillTree $killTreeOnHang
                             Start-Sleep -Seconds ([int]$Config.Restart)
 
-                            if (-not (WdIsProcessMissing -Path $Path -FileName $FileName)) {
+                            if (-not (WdIsProcessMissing -Path $Path)) {
                                 WdWriteLog "SKIP: $FileName recovered or restarted externally after hang handling." "DarkYellow"
                                 continue
                             }
@@ -1102,7 +1098,6 @@ try {
                                 $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
                                 $LaunchTime[$Path] = Get-Date
                                 $DisplayRepairDone[$Path] = $false
-                                $RestartStats[$AliveKey] = $false
                                 $HangFailCount[$Path] = 0
                                 try { $proc.Dispose() } catch {}
                                 $proc = $null
