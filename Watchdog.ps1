@@ -1109,7 +1109,7 @@ try {
                             }
                             continue
                         }
-                        elseif ($isExe -and [int]$HangFailCount[$Path] -gt 0) {
+                        elseif ($isExe -and $HangFailCount.ContainsKey($Path) -and [int]$HangFailCount[$Path] -gt 0) {
                             WdWriteLog "HANG-RECOVERED: $FileName (PID:$TargetID) responding again; reset consecutive hang counter." "DarkGreen"
                             $HangFailCount[$Path] = 0
                         }
