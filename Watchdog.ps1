@@ -40,7 +40,7 @@
 #   进程检测仅匹配该 Profile 的主进程，不会误杀子渲染进程。
 
 $Apps = [ordered]@{
-    "M:\GitHub\NetWorkBlockTest\TestNewBlock\Release\TestNewBlock.exe" = @{
+    "https://www.baidu.com" = @{
         First = 1; Restart = 5; Arguments = ""
         Once = $false; HideWindow = $false; FocusTop = $true
         Fullscreen = $true; ForceDisplayMode = $false; PythonExe = ""
