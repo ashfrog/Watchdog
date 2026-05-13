@@ -1067,7 +1067,7 @@ try {
 
                         if ($isExe -and -not $mainProc.Responding) {
                             WdInitializeCounter -Table $HangFailCount -Key $Path -DefaultValue 0
-                            $HangFailCount[$Path] = [int]$HangFailCount[$Path] + 1
+                            $HangFailCount[$Path]++
                             $hangFailTimes = $HangFailCount[$Path]
 
                             if ($hangFailTimes -lt $HangConsecutiveFailuresToRestart) {
