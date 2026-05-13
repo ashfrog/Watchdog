@@ -1085,6 +1085,11 @@ try {
                     $killTreeOnHang = [bool]$Config.KillTreeOnHang
                 }
 
+                $browserName = "auto"
+                if ($Config.ContainsKey("Browser") -and -not [string]::IsNullOrWhiteSpace([string]$Config.Browser)) {
+                    $browserName = [string]$Config.Browser
+                }
+
                 $minUpSeconds = 5
                 if ($Config.ContainsKey("MinUpSeconds") -and $null -ne $Config.MinUpSeconds) {
                     $minUpSeconds = [Math]::Max(1, [int]$Config.MinUpSeconds)
@@ -1131,7 +1136,7 @@ try {
                         -Fullscreen  ([bool]$Config.Fullscreen) `
                         -PythonExe   ([string]$Config.PythonExe) `
                         -ConsoleMode (WdGetConsoleMode -Config $Config) `
-                        -Browser     (if ($Config.ContainsKey("Browser")) { [string]$Config.Browser } else { "auto" })
+                        -Browser     $browserName
 
                     if ($proc) {
                         $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
@@ -1226,7 +1231,7 @@ try {
                                 -Fullscreen  ([bool]$Config.Fullscreen) `
                                 -PythonExe   ([string]$Config.PythonExe) `
                                 -ConsoleMode (WdGetConsoleMode -Config $Config) `
-                                -Browser     (if ($Config.ContainsKey("Browser")) { [string]$Config.Browser } else { "auto" })
+                                -Browser     $browserName
 
                             if ($proc) {
                                 $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
