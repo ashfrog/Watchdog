@@ -870,7 +870,7 @@ function WdStartApp {
 # New integrations should use Wd* interface names directly.
 function Open-LogWriter { return WdOpenLogWriter @PSBoundParameters }
 function Close-LogWriter { return WdCloseLogWriter @PSBoundParameters }
-function Write-Log { return WdWriteLog @PSBoundParameters }
+function Write-WatchdogLog { return WdWriteLog @PSBoundParameters }
 function Test-DisableFlag { return WdTestDisableFlag @PSBoundParameters }
 function Initialize-CounterIfNeeded { return WdInitializeCounter @PSBoundParameters }
 function Get-PythonInterpreter { return WdGetPythonInterpreter @PSBoundParameters }
