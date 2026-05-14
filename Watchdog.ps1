@@ -97,7 +97,7 @@ $StrictScriptPathBoundary = $false
 
 # =================== 2. 核心保护：防止 Watchdog 自身多开 ===================
 $Script:MutexOwned = $false
-$Script:MutexReleasedFlag = 0
+[int]$Script:MutexReleasedFlag = 0
 $Script:Mutex = New-Object System.Threading.Mutex($false, "Global\WindowsWatchdogServiceMutex")
 try {
     $Script:MutexOwned = $Script:Mutex.WaitOne(0)
