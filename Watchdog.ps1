@@ -97,6 +97,7 @@ $StrictScriptPathBoundary = $false
 
 # =================== 2. 核心保护：防止 Watchdog 自身多开 ===================
 $Script:MutexOwned = $false
+[int]$Script:MutexReleasedFlag = 0
 $Script:Mutex = New-Object System.Threading.Mutex($false, "Global\WindowsWatchdogServiceMutex")
 try {
     $Script:MutexOwned = $Script:Mutex.WaitOne(0)
@@ -105,9 +106,27 @@ catch [System.Threading.AbandonedMutexException] {
     $Script:MutexOwned = $true
 }
 
+function WdReleaseMutexSafe {
+    if ([System.Threading.Interlocked]::Exchange([ref]$Script:MutexReleasedFlag, 1) -eq 1) { return }
+
+    if ($Script:Mutex) {
+        if ($Script:MutexOwned) {
+            try { $Script:Mutex.ReleaseMutex() } catch {
+                try { Write-Host "WARN: Failed to release mutex: $($_.Exception.Message)" } catch {}
+            }
+        }
+        try { $Script:Mutex.Dispose() } catch {
+            try { Write-Host "WARN: Failed to dispose mutex: $($_.Exception.Message)" } catch {}
+        }
+    }
+
+    $Script:MutexOwned = $false
+    $Script:Mutex = $null
+}
+
 if (-not $Script:MutexOwned) {
     Write-Host "Another instance is already running. Exiting."
-    $Script:Mutex.Dispose()
+    WdReleaseMutexSafe
     exit 1
 }
 
@@ -185,10 +204,7 @@ namespace WatchdogWin32
     }
     catch {
         Write-Host "FATAL: Failed to load Win32 API type: $($_.Exception.Message)"
-        if ($Script:MutexOwned) {
-            try { $Script:Mutex.ReleaseMutex() } catch {}
-        }
-        $Script:Mutex.Dispose()
+        WdReleaseMutexSafe
         exit 1
     }
 }
@@ -350,6 +366,81 @@ function WdCleanupRestartStats {
             }
         }
     }
+}
+
+$Script:AppConfigDefaults = [ordered]@{
+    First              = 1
+    Restart            = 5
+    Arguments          = ""
+    Once               = $false
+    HideWindow         = $false
+    FocusTop           = $false
+    Fullscreen         = $false
+    ForceDisplayMode   = $false
+    PythonExe          = ""
+    ConsoleMode        = "Auto"
+    AllowMultiInstance = $false
+    KillTreeOnHang     = $true
+    MinUpSeconds       = 5
+    Browser            = "auto"
+}
+$Script:AppConfigMin = [ordered]@{
+    First        = 1
+    Restart      = 1
+    MinUpSeconds = 1
+}
+
+function WdResolveAppConfig {
+    param(
+        [string]$Path,
+        [hashtable]$Config
+    )
+
+    $rawConfig = if ($null -eq $Config) { @{} } else { $Config }
+    $resolved = [ordered]@{}
+    foreach ($key in $Script:AppConfigDefaults.Keys) {
+        $resolved[$key] = if ($rawConfig.ContainsKey($key)) { $rawConfig[$key] } else { $Script:AppConfigDefaults[$key] }
+    }
+
+    try { $resolved.First = [Math]::Max([int]$Script:AppConfigMin.First, [int]$resolved.First) } catch {
+        $resolved.First = [int]$Script:AppConfigDefaults.First
+        WdWriteLog "CONFIG-WARN: [$Path] invalid First value; fallback to $($resolved.First)." "DarkYellow"
+    }
+    try { $resolved.Restart = [Math]::Max([int]$Script:AppConfigMin.Restart, [int]$resolved.Restart) } catch {
+        $resolved.Restart = [int]$Script:AppConfigDefaults.Restart
+        WdWriteLog "CONFIG-WARN: [$Path] invalid Restart value; fallback to $($resolved.Restart)." "DarkYellow"
+    }
+    try { $resolved.MinUpSeconds = [Math]::Max([int]$Script:AppConfigMin.MinUpSeconds, [int]$resolved.MinUpSeconds) } catch {
+        $resolved.MinUpSeconds = [int]$Script:AppConfigDefaults.MinUpSeconds
+        WdWriteLog "CONFIG-WARN: [$Path] invalid MinUpSeconds value; fallback to $($resolved.MinUpSeconds)." "DarkYellow"
+    }
+
+    $resolved.Arguments          = [string]$resolved.Arguments
+    $resolved.PythonExe          = [string]$resolved.PythonExe
+    $resolved.Once               = [bool]$resolved.Once
+    $resolved.HideWindow         = [bool]$resolved.HideWindow
+    $resolved.FocusTop           = [bool]$resolved.FocusTop
+    $resolved.Fullscreen         = [bool]$resolved.Fullscreen
+    $resolved.ForceDisplayMode   = [bool]$resolved.ForceDisplayMode
+    $resolved.AllowMultiInstance = [bool]$resolved.AllowMultiInstance
+    $resolved.KillTreeOnHang     = [bool]$resolved.KillTreeOnHang
+
+    $consoleMode = [string]$resolved.ConsoleMode
+    if ([string]::IsNullOrWhiteSpace($consoleMode)) { $consoleMode = [string]$Script:AppConfigDefaults.ConsoleMode }
+    $resolved.ConsoleMode = $consoleMode.Trim()
+
+    $browserName = [string]$resolved.Browser
+    if ([string]::IsNullOrWhiteSpace($browserName)) { $browserName = [string]$Script:AppConfigDefaults.Browser }
+    $resolved.Browser = $browserName.Trim()
+
+    if (-not (WdIsBrowserUrl -Path $Path)) {
+        if ($resolved.Browser -ne [string]$Script:AppConfigDefaults.Browser) {
+            WdWriteLog "CONFIG-INFO: [$Path] Browser option is only used for URL entries and will be ignored." "DarkGray"
+            $resolved.Browser = [string]$Script:AppConfigDefaults.Browser
+        }
+    }
+
+    return $resolved
 }
 
 function WdGetPythonInterpreter {
@@ -1016,7 +1107,7 @@ try {
             }
 
             foreach ($Path in $Apps.Keys) {
-                $Config   = $Apps[$Path]
+                $Config   = WdResolveAppConfig -Path $Path -Config $Apps[$Path]
                 if (WdIsBrowserUrl -Path $Path) {
                     try { $FileName = "[$(([System.Uri]$Path).Host)]" }
                     catch {
@@ -1043,25 +1134,10 @@ try {
                     continue
                 }
 
-                $allowMultiInstance = $false
-                if ($Config.ContainsKey("AllowMultiInstance")) {
-                    $allowMultiInstance = [bool]$Config.AllowMultiInstance
-                }
-
-                $killTreeOnHang = $true
-                if ($Config.ContainsKey("KillTreeOnHang")) {
-                    $killTreeOnHang = [bool]$Config.KillTreeOnHang
-                }
-
-                $browserName = "auto"
-                if ($Config.ContainsKey("Browser") -and -not [string]::IsNullOrWhiteSpace([string]$Config.Browser)) {
-                    $browserName = [string]$Config.Browser
-                }
-
-                $minUpSeconds = 5
-                if ($Config.ContainsKey("MinUpSeconds") -and $null -ne $Config.MinUpSeconds) {
-                    $minUpSeconds = [Math]::Max(1, [int]$Config.MinUpSeconds)
-                }
+                $allowMultiInstance = [bool]$Config.AllowMultiInstance
+                $killTreeOnHang = [bool]$Config.KillTreeOnHang
+                $browserName = [string]$Config.Browser
+                $minUpSeconds = [int]$Config.MinUpSeconds
 
                 $procs     = WdGetTargetProcess -Path $Path
                 $procCount = if ($procs -is [array]) { $procs.Count } elseif ($procs) { 1 } else { 0 }
@@ -1097,7 +1173,7 @@ try {
 
                     $proc = WdStartApp `
                         -Path        $Path `
-                        -Arguments   $Config.Arguments `
+                        -Arguments   ([string]$Config.Arguments) `
                         -FileName    $FileName `
                         -HideWindow  ([bool]$Config.HideWindow) `
                         -FocusTop    ([bool]$Config.FocusTop) `
@@ -1112,7 +1188,7 @@ try {
                         $DisplayRepairDone[$Path] = $false
                         $HangFailCount[$Path] = 0
 
-                        if ($Config.ContainsKey("ForceDisplayMode") -and [bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
+                        if ([bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
                             WdRepairWindowDisplayMode -ProcessObj $proc -Fullscreen ([bool]$Config.Fullscreen)
                         }
 
@@ -1190,7 +1266,7 @@ try {
 
                             $proc = WdStartApp `
                                 -Path        $Path `
-                                -Arguments   $Config.Arguments `
+                                -Arguments   ([string]$Config.Arguments) `
                                 -FileName    $FileName `
                                 -HideWindow  ([bool]$Config.HideWindow) `
                                 -FocusTop    ([bool]$Config.FocusTop) `
@@ -1205,7 +1281,7 @@ try {
                                 $DisplayRepairDone[$Path] = $false
                                 $HangFailCount[$Path] = 0
 
-                                if ($Config.ContainsKey("ForceDisplayMode") -and [bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
+                                if ([bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
                                     WdRepairWindowDisplayMode -ProcessObj $proc -Fullscreen ([bool]$Config.Fullscreen)
                                 }
 
@@ -1219,7 +1295,7 @@ try {
                             $HangFailCount[$Path] = 0
                         }
 
-                        if ($Config.ContainsKey("ForceDisplayMode") -and [bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
+                        if ([bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
                             $needRepair = $false
 
                             if (-not $DisplayRepairDone.ContainsKey($Path) -or -not $DisplayRepairDone[$Path]) {
@@ -1301,8 +1377,5 @@ finally {
     try { WdWriteLog "=== Watchdog shutting down. Releasing resources... ===" "Yellow" } catch {}
     WdCloseLogWriter
 
-    if ($Script:MutexOwned) {
-        try { $Script:Mutex.ReleaseMutex() } catch {}
-    }
-    try { $Script:Mutex.Dispose() } catch {}
+    WdReleaseMutexSafe
 }
