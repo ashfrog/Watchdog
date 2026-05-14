@@ -1126,6 +1126,10 @@ try {
                         $DisplayRepairDone[$Path] = $false
                         $HangFailCount[$Path] = 0
 
+                        if ($Config.ContainsKey("ForceDisplayMode") -and [bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
+                            WdRepairWindowDisplayMode -ProcessObj $proc -Fullscreen ([bool]$Config.Fullscreen)
+                        }
+
                         if ($Config.Once) {
                             $RestartStats[$OnceKey] = $true
                         }
@@ -1214,6 +1218,11 @@ try {
                                 $LaunchTime[$Path] = Get-Date
                                 $DisplayRepairDone[$Path] = $false
                                 $HangFailCount[$Path] = 0
+
+                                if ($Config.ContainsKey("ForceDisplayMode") -and [bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
+                                    WdRepairWindowDisplayMode -ProcessObj $proc -Fullscreen ([bool]$Config.Fullscreen)
+                                }
+
                                 try { $proc.Dispose() } catch {}
                                 $proc = $null
                             }
