@@ -358,13 +358,13 @@ function WdTestDisableFlag {
 $Script:LastDisableReason = $null
 
 function WdUpdateDisableState {
-    param([string]$Reason)
+    param([string]$DisableReason)
 
-    if ($Reason) {
+    if ($DisableReason) {
         WdRestoreSystemCursor
-        if ($Script:LastDisableReason -ne $Reason) {
-            WdWriteLog "SAFE-MODE: $Reason detected. Monitoring paused; no app will be launched or restarted." "Yellow"
-            $Script:LastDisableReason = $Reason
+        if ($Script:LastDisableReason -ne $DisableReason) {
+            WdWriteLog "SAFE-MODE: $DisableReason detected. Monitoring paused; no app will be launched or restarted." "Yellow"
+            $Script:LastDisableReason = $DisableReason
         }
         return $true
     }
@@ -1126,7 +1126,7 @@ try {
             WdCleanupRestartStats -Table $ThrottleWarned -CurrentHour $CurrentHour
 
             $disableReason = WdGetDisableReason
-            if (WdUpdateDisableState -Reason $disableReason) {
+            if (WdUpdateDisableState -DisableReason $disableReason) {
                 $FirstRun = $false
                 Start-Sleep -Seconds $CheckInterval
                 continue
@@ -1154,8 +1154,7 @@ try {
                 WdInitializeCounter -Table $RestartStats -Key $StatKey -DefaultValue 0
 
                 $disableReason = WdGetDisableReason
-                if ($disableReason) {
-                    $null = WdUpdateDisableState -Reason $disableReason
+                if (WdUpdateDisableState -DisableReason $disableReason) {
                     break
                 }
 
@@ -1416,7 +1415,7 @@ try {
             }
 
             $disableReason = WdGetDisableReason
-            if (WdUpdateDisableState -Reason $disableReason) {
+            if (WdUpdateDisableState -DisableReason $disableReason) {
                 $FirstRun = $false
                 Start-Sleep -Seconds $CheckInterval
                 continue
