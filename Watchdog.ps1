@@ -14,19 +14,19 @@
 # First:              首次启动延迟秒数
 # Restart:            异常重启前等待秒数
 # Arguments:          传递给程序的额外参数
-# Once:               $false=持续监控  $true=仅启动一次
-# HideWindow:         $true=隐藏窗口启动  $false=正常显示
-# FocusTop:           $true=允许置顶并抢焦点（建议仅 kiosk 场景启用）
-# Fullscreen:         $true=目标为全屏  $false=目标为窗口化
-# ForceDisplayMode:   $true=启用显示模式修复  $false=不干预窗口模式
-#                     （网页 URL 条目建议保持 $false，浏览器 --kiosk 自行管理全屏）
+# Once:               0/$false=持续监控  1/$true=仅启动一次
+# HideWindow:         1/$true=隐藏窗口启动  0/$false=正常显示
+# FocusTop:           1/$true=允许置顶并抢焦点（建议仅 kiosk 场景启用）
+# Fullscreen:         1/$true=目标为全屏  0/$false=目标为窗口化
+# ForceDisplayMode:   1/$true=启用显示模式修复  0/$false=不干预窗口模式
+#                     （网页 URL 条目建议保持 0/$false，浏览器 --kiosk 自行管理全屏）
 # PythonExe:          可选，指定 python.exe / pythonw.exe 所在路径；为空则走系统 PATH
 # ConsoleMode:        控制台模式（仅脚本类有效）
 #                     	Auto=按默认兼容行为启动
 #                     	Shared=与 Watchdog 共用当前控制台（无控制台环境会自动回退）
 #                     	New=单独新建控制台窗口
-# AllowMultiInstance: $true=允许多实例并存  $false=仅保留一个
-# KillTreeOnHang:     $true=挂死时结束进程树  $false=仅结束主进程
+# AllowMultiInstance: 1/$true=允许多实例并存  0/$false=仅保留一个
+# KillTreeOnHang:     1/$true=挂死时结束进程树  0/$false=仅结束主进程
 # MinUpSeconds:       启动后若很快退出，按失败重启节流处理
 # Browser:            网页 URL 条目专用，指定打开浏览器
 #                     	auto=自动检测（优先 Chrome，其次 Edge）
@@ -35,33 +35,63 @@
 #
 # 【网页 URL 支持】
 #   将 http:// 或 https:// 开头的 URL 作为 Key，Watchdog 会通过 Chrome/Edge 打开并持续守护。
-#   Fullscreen=$true 时以 --kiosk 模式启动（真正无边框全屏），$false 时最大化窗口。
+#   Fullscreen=1/$true 时以 --kiosk 模式启动（真正无边框全屏），0/$false 时最大化窗口。
 #   每个 URL 使用独立的浏览器 Profile（存于 $WatchdogRoot\browser_profiles\），
 #   进程检测仅匹配该 Profile 的主进程，不会误杀子渲染进程。
 
-$Apps = [ordered]@{
+$AppsConfigText = @'
+[ordered]@{
     "https://www.baidu.com" = @{
-        First = 1; Restart = 5; Arguments = ""
-        Once = $false; HideWindow = $false; FocusTop = $true
-        Fullscreen = $true; ForceDisplayMode = $true; PythonExe = ""
-        ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
-        MinUpSeconds = 15; Browser = "auto"
+        First = 1
+        Restart = 5
+        Arguments = ""
+        Once = 0
+        HideWindow = 0
+        FocusTop = 1
+        Fullscreen = 1
+        ForceDisplayMode = 1
+        PythonExe = ""
+        ConsoleMode = "Auto"
+        AllowMultiInstance = 0
+        KillTreeOnHang = 1
+        MinUpSeconds = 15
+        Browser = "auto"
     }
     # "C:\Scripts\test.bat" = @{
-    #     First = 1; Restart = 5; Arguments = ""
-    #     Once = $false; HideWindow = $false; FocusTop = $false
-    #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = ""
-    #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
-    #     MinUpSeconds = 3; Browser = "auto"
+    #     First = 1
+    #     Restart = 5
+    #     Arguments = ""
+    #     Once = 0
+    #     HideWindow = 0
+    #     FocusTop = 0
+    #     Fullscreen = 0
+    #     ForceDisplayMode = 0
+    #     PythonExe = ""
+    #     ConsoleMode = "New"
+    #     AllowMultiInstance = 0
+    #     KillTreeOnHang = 1
+    #     MinUpSeconds = 3
+    #     Browser = "auto"
     # }
     # "C:\Scripts\main.py" = @{
-    #     First = 1; Restart = 10; Arguments = ""
-    #     Once = $false; HideWindow = $false; FocusTop = $false
-    #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = "C:\Python311\python.exe"
-    #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
-    #     MinUpSeconds = 5; Browser = "auto"
+    #     First = 1
+    #     Restart = 10
+    #     Arguments = ""
+    #     Once = 0
+    #     HideWindow = 0
+    #     FocusTop = 0
+    #     Fullscreen = 0
+    #     ForceDisplayMode = 0
+    #     PythonExe = "C:\Python311\python.exe"
+    #     ConsoleMode = "New"
+    #     AllowMultiInstance = 0
+    #     KillTreeOnHang = 1
+    #     MinUpSeconds = 5
+    #     Browser = "auto"
     # }
 }
+'@
+$Apps = [ordered]@{}
 
 # =================== 1. 全局配置 ===================
 $WatchdogRoot    = "C:\Watchdog"
@@ -327,6 +357,36 @@ function WdEnsureDirectory {
     }
 }
 
+# 将用户配置中的布尔值规范化。
+# 接受 $true/$false、1/0（整数）、"1"/"0"/"true"/"false"/"yes"/"no"（字符串，大小写不敏感）。
+# 若值无法识别，使用 Default 并写入配置告警日志。
+function WdNormalizeBool {
+    param(
+        $Value,
+        [bool]$Default = $false,
+        [string]$FieldName = "",
+        [string]$AppPath = ""
+    )
+    if ($Value -is [bool]) { return $Value }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [byte] -or $Value -is [short]) {
+        return ([int]$Value -ne 0)
+    }
+    switch (([string]$Value).Trim().ToLowerInvariant()) {
+        "1"     { return $true  }
+        "true"  { return $true  }
+        "yes"   { return $true  }
+        "0"     { return $false }
+        "false" { return $false }
+        "no"    { return $false }
+        default {
+            if (-not [string]::IsNullOrWhiteSpace($FieldName)) {
+                WdWriteLog "CONFIG-WARN: [$AppPath] '$FieldName' has unrecognized value '$Value'; using default ($Default). Use 1/0, true/false, or `$true/`$false." "DarkYellow"
+            }
+            return $Default
+        }
+    }
+}
+
 function WdNormalizePathSafe {
     param([string]$Path)
     try {
@@ -368,6 +428,53 @@ function WdCleanupRestartStats {
     }
 }
 
+function WdLoadAppsConfigFromText {
+    param([string]$ConfigText)
+
+    if ([string]::IsNullOrWhiteSpace($ConfigText)) {
+        WdWriteLog "CONFIG-WARN: Apps config text is empty; no targets will be monitored." "DarkYellow"
+        return [ordered]@{}
+    }
+
+    $tokens = $null
+    $errors = $null
+    [System.Management.Automation.Language.Parser]::ParseInput($ConfigText, [ref]$tokens, [ref]$errors) | Out-Null
+    if ($errors.Count -gt 0) {
+        $lines = $ConfigText -split "`r?`n"
+        foreach ($e in $errors) {
+            $line = $e.Extent.StartLineNumber
+            $col  = $e.Extent.StartColumnNumber
+            WdWriteLog "CONFIG-ERROR: Apps config syntax error at line $line, col ${col}: $($e.Message)" "Red"
+            if ($line -ge 1 -and $line -le $lines.Count) {
+                WdWriteLog "CONFIG-ERROR: line $line => $($lines[$line - 1])" "Red"
+            }
+        }
+        WdWriteLog "CONFIG-ERROR: Apps config is invalid; watchdog will continue with empty monitor list." "Red"
+        return [ordered]@{}
+    }
+
+    try {
+        $loaded = & ([scriptblock]::Create($ConfigText))
+    }
+    catch {
+        WdWriteLog "CONFIG-ERROR: Failed to evaluate apps config: $($_.Exception.Message)" "Red"
+        WdWriteLog "CONFIG-ERROR: Watchdog will continue with empty monitor list." "Red"
+        return [ordered]@{}
+    }
+
+    if ($null -eq $loaded) {
+        WdWriteLog "CONFIG-WARN: Apps config evaluated to null; no targets will be monitored." "DarkYellow"
+        return [ordered]@{}
+    }
+    if (-not ($loaded -is [System.Collections.IDictionary])) {
+        WdWriteLog "CONFIG-ERROR: Apps config root must be a dictionary (@{...} or [ordered]@{...}); actual type: $($loaded.GetType().FullName)." "Red"
+        WdWriteLog "CONFIG-ERROR: Watchdog will continue with empty monitor list." "Red"
+        return [ordered]@{}
+    }
+
+    return $loaded
+}
+
 $Script:AppConfigDefaults = [ordered]@{
     First              = 1
     Restart            = 5
@@ -393,10 +500,26 @@ $Script:AppConfigMin = [ordered]@{
 function WdResolveAppConfig {
     param(
         [string]$Path,
-        [hashtable]$Config
+        $Config
     )
 
-    $rawConfig = if ($null -eq $Config) { @{} } else { $Config }
+    if ($null -eq $Config) {
+        $rawConfig = @{}
+    }
+    elseif ($Config -is [System.Collections.IDictionary]) {
+        $rawConfig = $Config
+    }
+    else {
+        WdWriteLog "CONFIG-ERROR: [$Path] app config must be a dictionary (@{...} or [ordered]@{...}); actual type: $($Config.GetType().FullName). Using defaults." "Red"
+        $rawConfig = @{}
+    }
+
+    foreach ($rawKey in @($rawConfig.Keys)) {
+        if (-not $Script:AppConfigDefaults.Contains($rawKey)) {
+            WdWriteLog "CONFIG-WARN: [$Path] unknown config key '$rawKey'; this key will be ignored." "DarkYellow"
+        }
+    }
+
     $resolved = [ordered]@{}
     foreach ($key in $Script:AppConfigDefaults.Keys) {
         $resolved[$key] = if ($rawConfig.ContainsKey($key)) { $rawConfig[$key] } else { $Script:AppConfigDefaults[$key] }
@@ -417,13 +540,13 @@ function WdResolveAppConfig {
 
     $resolved.Arguments          = [string]$resolved.Arguments
     $resolved.PythonExe          = [string]$resolved.PythonExe
-    $resolved.Once               = [bool]$resolved.Once
-    $resolved.HideWindow         = [bool]$resolved.HideWindow
-    $resolved.FocusTop           = [bool]$resolved.FocusTop
-    $resolved.Fullscreen         = [bool]$resolved.Fullscreen
-    $resolved.ForceDisplayMode   = [bool]$resolved.ForceDisplayMode
-    $resolved.AllowMultiInstance = [bool]$resolved.AllowMultiInstance
-    $resolved.KillTreeOnHang     = [bool]$resolved.KillTreeOnHang
+    $resolved.Once               = WdNormalizeBool -Value $resolved.Once               -Default $Script:AppConfigDefaults.Once               -FieldName "Once"               -AppPath $Path
+    $resolved.HideWindow         = WdNormalizeBool -Value $resolved.HideWindow         -Default $Script:AppConfigDefaults.HideWindow         -FieldName "HideWindow"         -AppPath $Path
+    $resolved.FocusTop           = WdNormalizeBool -Value $resolved.FocusTop           -Default $Script:AppConfigDefaults.FocusTop           -FieldName "FocusTop"           -AppPath $Path
+    $resolved.Fullscreen         = WdNormalizeBool -Value $resolved.Fullscreen         -Default $Script:AppConfigDefaults.Fullscreen         -FieldName "Fullscreen"         -AppPath $Path
+    $resolved.ForceDisplayMode   = WdNormalizeBool -Value $resolved.ForceDisplayMode   -Default $Script:AppConfigDefaults.ForceDisplayMode   -FieldName "ForceDisplayMode"   -AppPath $Path
+    $resolved.AllowMultiInstance = WdNormalizeBool -Value $resolved.AllowMultiInstance -Default $Script:AppConfigDefaults.AllowMultiInstance -FieldName "AllowMultiInstance" -AppPath $Path
+    $resolved.KillTreeOnHang     = WdNormalizeBool -Value $resolved.KillTreeOnHang     -Default $Script:AppConfigDefaults.KillTreeOnHang     -FieldName "KillTreeOnHang"     -AppPath $Path
 
     $consoleMode = [string]$resolved.ConsoleMode
     if ([string]::IsNullOrWhiteSpace($consoleMode)) { $consoleMode = [string]$Script:AppConfigDefaults.ConsoleMode }
@@ -1070,8 +1193,12 @@ function Start-App { return WdStartApp @PSBoundParameters }
 # =================== 6. 初始化 ===================
 WdEnsureDirectory -Path $WatchdogRoot
 WdOpenLogWriter
+$Apps = WdLoadAppsConfigFromText -ConfigText $AppsConfigText
 
 WdWriteLog "=== Watchdog Service Active (Monitor Count: $($Apps.Count)) ===" "Yellow"
+if ($Apps.Count -eq 0) {
+    WdWriteLog "CONFIG-WARN: Monitor list is empty. Please check Apps config." "DarkYellow"
+}
 WdWriteLog "INFO: Disable flag path = $DisableFlag" "DarkGray"
 WdWriteLog "INFO: Check interval = $CheckInterval sec, Max retry/hour = $MaxRetryInHour" "DarkGray"
 WdWriteLog "INFO: Log max size = ${MaxLogSizeMB}MB, Backups = $MaxLogBackups" "DarkGray"
