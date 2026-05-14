@@ -8,6 +8,7 @@
 #
 # 紧急停用：
 #   创建文件 C:\Watchdog\disable.flag
+#   或直接打开任务管理器
 #   Watchdog 检测到后将停止拉起目标程序，仅记录日志
 #
 # 启动程序列表字段说明：
@@ -338,8 +339,20 @@ function WdNormalizePathSafe {
     }
 }
 
+function WdGetDisableReason {
+    if (Test-Path $DisableFlag) {
+        return "disable.flag"
+    }
+
+    if (Get-Process -Name "Taskmgr" -ErrorAction SilentlyContinue | Select-Object -First 1) {
+        return "Task Manager"
+    }
+
+    return $null
+}
+
 function WdTestDisableFlag {
-    return (Test-Path $DisableFlag)
+    return [bool](WdGetDisableReason)
 }
 
 function WdInitializeCounter {
@@ -1063,6 +1076,7 @@ WdOpenLogWriter
 
 WdWriteLog "=== Watchdog Service Active (Monitor Count: $($Apps.Count)) ===" "Yellow"
 WdWriteLog "INFO: Disable flag path = $DisableFlag" "DarkGray"
+WdWriteLog "INFO: Task Manager open state is treated as disable flag" "DarkGray"
 WdWriteLog "INFO: Check interval = $CheckInterval sec, Max retry/hour = $MaxRetryInHour" "DarkGray"
 WdWriteLog "INFO: Log max size = ${MaxLogSizeMB}MB, Backups = $MaxLogBackups" "DarkGray"
 WdWriteLog "INFO: GC collect every $GCCollectEvery iterations (~$($GCCollectEvery * $CheckInterval) sec)" "DarkGray"
@@ -1089,8 +1103,9 @@ try {
             WdCleanupRestartStats -Table $RestartStats -CurrentHour $CurrentHour
             WdCleanupRestartStats -Table $ThrottleWarned -CurrentHour $CurrentHour
 
-            if (WdTestDisableFlag) {
-                WdWriteLog "SAFE-MODE: Disable flag detected. Monitoring paused; no app will be launched or restarted." "Yellow"
+            $disableReason = WdGetDisableReason
+            if ($disableReason) {
+                WdWriteLog "SAFE-MODE: $disableReason detected. Monitoring paused; no app will be launched or restarted." "Yellow"
                 $FirstRun = $false
                 Start-Sleep -Seconds $CheckInterval
                 continue
