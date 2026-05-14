@@ -1070,6 +1070,37 @@ function WdStartApp {
     }
 }
 
+# Internal helper: launch app via WdStartApp and update all tracking tables.
+# Hashtable args are reference types; mutations are visible in the caller's scope.
+function WdLaunchAndTrack {
+    param(
+        [string]$Path, $Config, [string]$FileName,
+        [string]$StatKey, [string]$OnceKey, [string]$BrowserName, [bool]$IsOnce,
+        $RestartStats, $LaunchTime, $DisplayRepairDone, $HangFailCount
+    )
+    $proc = WdStartApp `
+        -Path        $Path            `
+        -Arguments   $Config.Arguments `
+        -FileName    $FileName        `
+        -HideWindow  ([bool]$Config.HideWindow)  `
+        -FocusTop    ([bool]$Config.FocusTop)    `
+        -Fullscreen  ([bool]$Config.Fullscreen)  `
+        -PythonExe   ([string]$Config.PythonExe) `
+        -ConsoleMode (WdGetConsoleMode -Config $Config) `
+        -Browser     $BrowserName
+    if ($proc) {
+        $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
+        $LaunchTime[$Path] = Get-Date
+        $DisplayRepairDone[$Path] = $false
+        $HangFailCount[$Path] = 0
+        if ($Config.ContainsKey("ForceDisplayMode") -and [bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
+            WdRepairWindowDisplayMode -ProcessObj $proc -Fullscreen ([bool]$Config.Fullscreen)
+        }
+        if ($IsOnce) { $RestartStats[$OnceKey] = $true }
+        try { $proc.Dispose() } catch {}
+    }
+}
+
 # =================== 5.1 Compatibility layer (legacy -> Wd* APIs) ===================
 # Keep legacy function-name wrappers to preserve runtime compatibility.
 # New integrations should use Wd* interface names directly.
@@ -1119,6 +1150,7 @@ $Script:GCCounter  = 0
 # =================== 7. 主循环 ===================
 try {
     while ($true) {
+        Start-Sleep -Milliseconds 200  # preventive: guards against CPU spin if an exception bypasses the end-of-loop sleep
         try {
             WdRotateLog
             $CurrentHour = (Get-Date).Hour
@@ -1168,30 +1200,13 @@ try {
                     continue
                 }
 
-                $allowMultiInstance = $false
-                if ($Config.ContainsKey("AllowMultiInstance")) {
-                    $allowMultiInstance = [bool]$Config.AllowMultiInstance
-                }
-
-                $killTreeOnHang = $true
-                if ($Config.ContainsKey("KillTreeOnHang")) {
-                    $killTreeOnHang = [bool]$Config.KillTreeOnHang
-                }
-
-                $browserName = "auto"
-                if ($Config.ContainsKey("Browser") -and -not [string]::IsNullOrWhiteSpace([string]$Config.Browser)) {
-                    $browserName = [string]$Config.Browser
-                }
-
-                $minUpSeconds = 5
-                if ($Config.ContainsKey("MinUpSeconds") -and $null -ne $Config.MinUpSeconds) {
-                    $minUpSeconds = [Math]::Max(1, [int]$Config.MinUpSeconds)
-                }
-
-                $hideCursor = $false
-                if ($Config.ContainsKey("HideCursor") -and $isExe) {
-                    $hideCursor = [bool]$Config.HideCursor
-                }
+                $allowMultiInstance = if ($Config.ContainsKey("AllowMultiInstance")) { [bool]$Config.AllowMultiInstance } else { $false }
+                $killTreeOnHang     = if ($Config.ContainsKey("KillTreeOnHang"))     { [bool]$Config.KillTreeOnHang }     else { $true }
+                $browserName        = if ($Config.ContainsKey("Browser") -and
+                    -not [string]::IsNullOrWhiteSpace([string]$Config.Browser)) { [string]$Config.Browser } else { "auto" }
+                $minUpSeconds       = if ($Config.ContainsKey("MinUpSeconds") -and
+                    $null -ne $Config.MinUpSeconds) { [Math]::Max(1, [int]$Config.MinUpSeconds) } else { 5 }
+                $hideCursor         = if ($Config.ContainsKey("HideCursor") -and $isExe) { [bool]$Config.HideCursor } else { $false }
 
                 $procs     = WdGetTargetProcess -Path $Path
                 $procCount = if ($procs -is [array]) { $procs.Count } elseif ($procs) { 1 } else { 0 }
@@ -1226,34 +1241,10 @@ try {
 
                     $LastStartAttempt[$Path] = Get-Date
 
-                    $proc = WdStartApp `
-                        -Path        $Path `
-                        -Arguments   $Config.Arguments `
-                        -FileName    $FileName `
-                        -HideWindow  ([bool]$Config.HideWindow) `
-                        -FocusTop    ([bool]$Config.FocusTop) `
-                        -Fullscreen  ([bool]$Config.Fullscreen) `
-                        -PythonExe   ([string]$Config.PythonExe) `
-                        -ConsoleMode (WdGetConsoleMode -Config $Config) `
-                        -Browser     $browserName
-
-                    if ($proc) {
-                        $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
-                        $LaunchTime[$Path] = Get-Date
-                        $DisplayRepairDone[$Path] = $false
-                        $HangFailCount[$Path] = 0
-
-                        if ($Config.ContainsKey("ForceDisplayMode") -and [bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
-                            WdRepairWindowDisplayMode -ProcessObj $proc -Fullscreen ([bool]$Config.Fullscreen)
-                        }
-
-                        if ($Config.Once) {
-                            $RestartStats[$OnceKey] = $true
-                        }
-
-                        try { $proc.Dispose() } catch {}
-                        $proc = $null
-                    }
+                    WdLaunchAndTrack -Path $Path -Config $Config -FileName $FileName `
+                        -StatKey $StatKey -OnceKey $OnceKey -BrowserName $browserName -IsOnce $Config.Once `
+                        -RestartStats $RestartStats -LaunchTime $LaunchTime `
+                        -DisplayRepairDone $DisplayRepairDone -HangFailCount $HangFailCount
                 }
                 else {
                     $MissingLogged[$Path] = $false
@@ -1320,30 +1311,10 @@ try {
 
                             $LastStartAttempt[$Path] = Get-Date
 
-                            $proc = WdStartApp `
-                                -Path        $Path `
-                                -Arguments   $Config.Arguments `
-                                -FileName    $FileName `
-                                -HideWindow  ([bool]$Config.HideWindow) `
-                                -FocusTop    ([bool]$Config.FocusTop) `
-                                -Fullscreen  ([bool]$Config.Fullscreen) `
-                                -PythonExe   ([string]$Config.PythonExe) `
-                                -ConsoleMode (WdGetConsoleMode -Config $Config) `
-                                -Browser     $browserName
-
-                            if ($proc) {
-                                $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
-                                $LaunchTime[$Path] = Get-Date
-                                $DisplayRepairDone[$Path] = $false
-                                $HangFailCount[$Path] = 0
-
-                                if ($Config.ContainsKey("ForceDisplayMode") -and [bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
-                                    WdRepairWindowDisplayMode -ProcessObj $proc -Fullscreen ([bool]$Config.Fullscreen)
-                                }
-
-                                try { $proc.Dispose() } catch {}
-                                $proc = $null
-                            }
+                            WdLaunchAndTrack -Path $Path -Config $Config -FileName $FileName `
+                                -StatKey $StatKey -OnceKey $null -BrowserName $browserName -IsOnce $false `
+                                -RestartStats $RestartStats -LaunchTime $LaunchTime `
+                                -DisplayRepairDone $DisplayRepairDone -HangFailCount $HangFailCount
                             continue
                         }
                         elseif ($isExe -and $HangFailCount.ContainsKey($Path) -and [int]$HangFailCount[$Path] -gt 0) {
