@@ -28,6 +28,8 @@
 # AllowMultiInstance: $true=允许多实例并存  $false=仅保留一个
 # KillTreeOnHang:     $true=挂死时结束进程树  $false=仅结束主进程
 # MinUpSeconds:       启动后若很快退出，按失败重启节流处理
+# HideCursor:         $true=程序运行期间隐藏系统鼠标光标  $false=保持系统默认光标显示
+#                     （仅对 exe 类条目有效；适用于 Unity 等全屏 kiosk 程序）
 # Browser:            网页 URL 条目专用，指定打开浏览器
 #                     	auto=自动检测（优先 Chrome，其次 Edge）
 #                     	chrome=Google Chrome
@@ -45,21 +47,21 @@ $Apps = [ordered]@{
         Once = $false; HideWindow = $false; FocusTop = $true
         Fullscreen = $true; ForceDisplayMode = $true; PythonExe = ""
         ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
-        MinUpSeconds = 15; Browser = "auto"
+        MinUpSeconds = 15; Browser = "auto"; HideCursor = $false
     }
     # "C:\Scripts\test.bat" = @{
     #     First = 1; Restart = 5; Arguments = ""
     #     Once = $false; HideWindow = $false; FocusTop = $false
     #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = ""
     #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
-    #     MinUpSeconds = 3; Browser = "auto"
+    #     MinUpSeconds = 3; Browser = "auto"; HideCursor = $false
     # }
     # "C:\Scripts\main.py" = @{
     #     First = 1; Restart = 10; Arguments = ""
     #     Once = $false; HideWindow = $false; FocusTop = $false
     #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = "C:\Python311\python.exe"
     #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
-    #     MinUpSeconds = 5; Browser = "auto"
+    #     MinUpSeconds = 5; Browser = "auto"; HideCursor = $false
     # }
 }
 
@@ -180,6 +182,15 @@ namespace WatchdogWin32
 
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr CreateCursor(IntPtr hInst, int xHotSpot, int yHotSpot, int nWidth, int nHeight, byte[] pvANDPlane, byte[] pvXORPlane);
+
+        [DllImport("user32.dll")]
+        public static extern bool SetSystemCursor(IntPtr hcur, uint id);
+
+        [DllImport("user32.dll")]
+        public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
     }
 }
 "@
@@ -764,6 +775,48 @@ function WdRepairWindowDisplayMode {
     }
 }
 
+# =================== 5.0 光标可见性管理 ===================
+$Script:CursorHiddenApplied = $false
+
+function WdHideSystemCursor {
+    if ($Script:CursorHiddenApplied) { return }
+    try {
+        $OCR_NORMAL  = 32512
+        $curW        = 32
+        $curH        = 32
+        $planeSize   = $curW * ($curH / 8)  # bytes per bit-plane for 32x32
+
+        $andPlane = New-Object byte[] $planeSize
+        $xorPlane = New-Object byte[] $planeSize
+        for ($i = 0; $i -lt $planeSize; $i++) { $andPlane[$i] = [byte]0xFF }
+
+        $hCursor = [WatchdogWin32.DisplayAPI]::CreateCursor([IntPtr]::Zero, 0, 0, $curW, $curH, $andPlane, $xorPlane)
+        if ($hCursor -ne [IntPtr]::Zero) {
+            # SetSystemCursor takes ownership of hCursor; do not call DestroyCursor on it
+            if ([WatchdogWin32.DisplayAPI]::SetSystemCursor($hCursor, $OCR_NORMAL)) {
+                $Script:CursorHiddenApplied = $true
+                WdWriteLog "CURSOR: System cursor hidden." "DarkGray"
+            }
+        }
+    }
+    catch {
+        WdWriteLog "CURSOR: Failed to hide cursor - $($_.Exception.Message)" "DarkYellow"
+    }
+}
+
+function WdRestoreSystemCursor {
+    if (-not $Script:CursorHiddenApplied) { return }
+    try {
+        $SPI_SETCURSORS = 0x0057
+        [WatchdogWin32.DisplayAPI]::SystemParametersInfo($SPI_SETCURSORS, 0, [IntPtr]::Zero, 0) | Out-Null
+        $Script:CursorHiddenApplied = $false
+        WdWriteLog "CURSOR: System cursor restored." "DarkGray"
+    }
+    catch {
+        WdWriteLog "CURSOR: Failed to restore cursor - $($_.Exception.Message)" "DarkYellow"
+    }
+}
+
 function WdStopProcessTreeSafe {
     param(
         [int]$ProcessId,
@@ -1035,6 +1088,7 @@ try {
                 continue
             }
 
+            $anyCursorHideNeeded = $false
             foreach ($Path in $Apps.Keys) {
                 $Config   = $Apps[$Path]
                 if (WdIsBrowserUrl -Path $Path) {
@@ -1081,6 +1135,11 @@ try {
                 $minUpSeconds = 5
                 if ($Config.ContainsKey("MinUpSeconds") -and $null -ne $Config.MinUpSeconds) {
                     $minUpSeconds = [Math]::Max(1, [int]$Config.MinUpSeconds)
+                }
+
+                $hideCursor = $false
+                if ($Config.ContainsKey("HideCursor") -and $isExe) {
+                    $hideCursor = [bool]$Config.HideCursor
                 }
 
                 $procs     = WdGetTargetProcess -Path $Path
@@ -1280,6 +1339,10 @@ try {
                                 }
                             }
                         }
+
+                        if ($hideCursor) {
+                            $anyCursorHideNeeded = $true
+                        }
                     }
                     finally {
                         try { $mainProc.Dispose() } catch {}
@@ -1302,6 +1365,12 @@ try {
 
             $FirstRun = $false
 
+            if ($anyCursorHideNeeded) {
+                WdHideSystemCursor
+            } else {
+                WdRestoreSystemCursor
+            }
+
             $Script:GCCounter++
             if ($Script:GCCounter -ge $GCCollectEvery) {
                 [System.GC]::Collect()
@@ -1320,6 +1389,7 @@ try {
 finally {
     try { WdWriteLog "=== Watchdog shutting down. Releasing resources... ===" "Yellow" } catch {}
     WdCloseLogWriter
+    try { WdRestoreSystemCursor } catch {}
 
     if ($Script:MutexOwned) {
         try { $Script:Mutex.ReleaseMutex() } catch {}
