@@ -528,6 +528,14 @@ function WdIsScriptPathInCommandLine {
     return ($cmd -match "(^|[\s`"'])$escaped($|[\s`"'])")
 }
 
+# Returns the OS process ID regardless of whether the object is a
+# System.Diagnostics.Process (.Id) or a CIM Win32_Process (.ProcessId).
+function WdGetProcessId {
+    param($ProcessObj)
+    if ($ProcessObj -is [System.Diagnostics.Process]) { return $ProcessObj.Id }
+    return $ProcessObj.ProcessId
+}
+
 function WdGetTargetProcess {
     param(
         [string]$Path
@@ -539,7 +547,7 @@ function WdGetTargetProcess {
     if (WdIsBrowserUrl -Path $Path) {
         $profileBase = Join-Path $WatchdogRoot "browser_profiles"
         $profileDir  = (Join-Path $profileBase (WdSanitizeForPath -Url $Path)).ToLowerInvariant()
-        return Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        return Get-CimInstance Win32_Process -Filter "Name='chrome.exe' OR Name='msedge.exe'" -ErrorAction SilentlyContinue | Where-Object {
             $procName = $_.Name.ToLowerInvariant() -replace '\.exe$', ''
             $cmdLine  = if ($_.CommandLine) { $_.CommandLine.ToLowerInvariant() } else { "" }
             $_.ProcessId -ne $CurrentPID -and
@@ -597,8 +605,13 @@ function WdIsBrowserUrl {
     return ($Path -imatch '^https?://')
 }
 
+$Script:SanitizeForPathCache = @{}
+
 function WdSanitizeForPath {
     param([string]$Url)
+    if ($Script:SanitizeForPathCache.ContainsKey($Url)) {
+        return $Script:SanitizeForPathCache[$Url]
+    }
     # Use truncated human-readable prefix + 8-char MD5 suffix to guarantee uniqueness
     $md5    = [System.Security.Cryptography.MD5]::Create()
     $hash   = ($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Url)) |
@@ -607,7 +620,9 @@ function WdSanitizeForPath {
     $short  = $hash.Substring(0, 8)
     $prefix = ($Url -replace '^https?://', '' -replace '[^\w\-.]', '_')
     if ($prefix.Length -gt 40) { $prefix = $prefix.Substring(0, 40) }
-    return "${prefix}_${short}"
+    $result = "${prefix}_${short}"
+    $Script:SanitizeForPathCache[$Url] = $result
+    return $result
 }
 
 function WdResolveBrowserExe {
@@ -1025,29 +1040,24 @@ function WdStartApp {
         }
     }
 
-    $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $StartInfo.WorkingDirectory = $Dir
-    $StartInfo.UseShellExecute  = $false
-
-    if ($HideWindow) {
-        $StartInfo.CreateNoWindow = $true
-        $StartInfo.WindowStyle    = [System.Diagnostics.ProcessWindowStyle]::Hidden
-    }
-    else {
-        $StartInfo.CreateNoWindow = $false
-        $StartInfo.WindowStyle    = [System.Diagnostics.ProcessWindowStyle]::Normal
-    }
-
-    $StartInfo.FileName = $Path
-    $extraArgs = $Arguments
-    $StartInfo.Arguments = $extraArgs
+    $winStyle = if ($HideWindow) { 'Hidden' } else { 'Normal' }
 
     $proc = $null
     try {
-        $cmdLine = "$($StartInfo.FileName) $($StartInfo.Arguments)".Trim()
+        $cmdLine = if ([string]::IsNullOrWhiteSpace($Arguments)) { $Path } else { "$Path $Arguments" }
         WdWriteLog "START: Launching [$FileName] CMD=[$cmdLine]" "DarkCyan"
 
-        $proc = [System.Diagnostics.Process]::Start($StartInfo)
+        $splat = @{
+            FilePath         = $Path
+            WorkingDirectory = $Dir
+            WindowStyle      = $winStyle
+            PassThru         = $true
+            ErrorAction      = 'Stop'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Arguments)) {
+            $splat.ArgumentList = $Arguments
+        }
+        $proc = Start-Process @splat
 
         if ($proc) {
             WdWriteLog "SUCCESS: Started $FileName PID=$($proc.Id) (Hide=$HideWindow, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
@@ -1093,9 +1103,6 @@ function WdLaunchAndTrack {
         $LaunchTime[$Path] = Get-Date
         $DisplayRepairDone[$Path] = $false
         $HangFailCount[$Path] = 0
-        if ($Config.ContainsKey("ForceDisplayMode") -and [bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
-            WdRepairWindowDisplayMode -ProcessObj $proc -Fullscreen ([bool]$Config.Fullscreen)
-        }
         if ($IsOnce) { $RestartStats[$OnceKey] = $true }
         try { $proc.Dispose() } catch {}
     }
@@ -1145,6 +1152,7 @@ $LastStartAttempt  = @{}
 $ThrottleWarned    = @{}
 $MissingLogged     = @{}
 $HangFailCount     = @{}
+$ScheduledLaunch   = @{}   # Path -> [DateTime] of next permitted launch attempt
 $Script:GCCounter  = 0
 
 # =================== 7. 主循环 ===================
@@ -1225,13 +1233,21 @@ try {
                         }
                     }
 
-                    $WaitTime = if ($FirstRun) { [int]$Config.First } else { [int]$Config.Restart }
-                    if (-not $MissingLogged[$Path]) {
+                    # Schedule a launch if not already scheduled, then wait non-blocking
+                    if ($null -eq $ScheduledLaunch[$Path]) {
+                        $WaitTime = if ($FirstRun) { [int]$Config.First } else { [int]$Config.Restart }
+                        $ScheduledLaunch[$Path] = (Get-Date).AddSeconds($WaitTime)
                         WdWriteLog "MISSING: $FileName, launch scheduled in $WaitTime sec..." "Cyan"
                         $MissingLogged[$Path] = $true
+                        continue
                     }
-                    if ($hideCursor) { WdRestoreSystemCursor }
-                    Start-Sleep -Seconds $WaitTime
+
+                    if ((Get-Date) -lt $ScheduledLaunch[$Path]) {
+                        continue  # wait period not yet elapsed; check other apps
+                    }
+
+                    # Wait period elapsed — clear schedule and attempt launch
+                    $ScheduledLaunch[$Path] = $null
 
                     if (-not (WdIsProcessMissing -Path $Path)) {
                         $MissingLogged[$Path] = $false
@@ -1248,10 +1264,11 @@ try {
                 }
                 else {
                     $MissingLogged[$Path] = $false
+                    $ScheduledLaunch[$Path] = $null  # process is running; clear any pending launch schedule
                     if (-not $allowMultiInstance -and $procCount -gt 1) {
                         WdWriteLog "CONFLICT: $procCount instances of $FileName detected. Cleaning up extra instances..." "Magenta"
                         $procs | Select-Object -Skip 1 | ForEach-Object {
-                            $TargetID = if ($null -ne $_.Id) { $_.Id } else { $_.ProcessId }
+                            $TargetID = WdGetProcessId $_
                             try {
                                 WdStopProcessTreeSafe -ProcessId $TargetID -KillTree $true
                                 WdWriteLog "CLEANUP: Killed extra instance PID=$TargetID for $FileName" "DarkMagenta"
@@ -1274,7 +1291,7 @@ try {
                         continue
                     }
 
-                    $TargetID = if ($null -ne $FirstProc.Id) { $FirstProc.Id } else { $FirstProc.ProcessId }
+                    $TargetID = WdGetProcessId $FirstProc
                     $mainProc = Get-Process -Id $TargetID -ErrorAction SilentlyContinue
 
                     if ($null -eq $mainProc) {
@@ -1301,20 +1318,9 @@ try {
                             $HangFailCount[$Path] = 0
 
                             WdStopProcessTreeSafe -ProcessId $TargetID -KillTree $killTreeOnHang
-                            if ($hideCursor) { WdRestoreSystemCursor }
-                            Start-Sleep -Seconds ([int]$Config.Restart)
-
-                            if (-not (WdIsProcessMissing -Path $Path)) {
-                                WdWriteLog "SKIP: $FileName recovered or restarted externally after hang handling." "DarkYellow"
-                                continue
-                            }
-
-                            $LastStartAttempt[$Path] = Get-Date
-
-                            WdLaunchAndTrack -Path $Path -Config $Config -FileName $FileName `
-                                -StatKey $StatKey -OnceKey $null -BrowserName $browserName -IsOnce $false `
-                                -RestartStats $RestartStats -LaunchTime $LaunchTime `
-                                -DisplayRepairDone $DisplayRepairDone -HangFailCount $HangFailCount
+                            # Schedule relaunch after the configured Restart delay (non-blocking)
+                            $ScheduledLaunch[$Path] = (Get-Date).AddSeconds([int]$Config.Restart)
+                            WdWriteLog "HANG: $FileName relaunch scheduled in $([int]$Config.Restart) sec." "DarkYellow"
                             continue
                         }
                         elseif ($isExe -and $HangFailCount.ContainsKey($Path) -and [int]$HangFailCount[$Path] -gt 0) {
