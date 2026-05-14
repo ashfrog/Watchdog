@@ -355,6 +355,28 @@ function WdTestDisableFlag {
     return [bool](WdGetDisableReason)
 }
 
+$Script:LastDisableReason = $null
+
+function WdUpdateDisableState {
+    param([string]$Reason)
+
+    if ($Reason) {
+        WdRestoreSystemCursor
+        if ($Script:LastDisableReason -ne $Reason) {
+            WdWriteLog "SAFE-MODE: $Reason detected. Monitoring paused; no app will be launched or restarted." "Yellow"
+            $Script:LastDisableReason = $Reason
+        }
+        return $true
+    }
+
+    if ($Script:LastDisableReason) {
+        WdWriteLog "SAFE-MODE: $($Script:LastDisableReason) cleared. Monitoring resumed." "DarkGreen"
+        $Script:LastDisableReason = $null
+    }
+
+    return $false
+}
+
 function WdInitializeCounter {
     param(
         [hashtable]$Table,
@@ -1104,9 +1126,7 @@ try {
             WdCleanupRestartStats -Table $ThrottleWarned -CurrentHour $CurrentHour
 
             $disableReason = WdGetDisableReason
-            if ($disableReason) {
-                WdRestoreSystemCursor
-                WdWriteLog "SAFE-MODE: $disableReason detected. Monitoring paused; no app will be launched or restarted." "Yellow"
+            if (WdUpdateDisableState -Reason $disableReason) {
                 $FirstRun = $false
                 Start-Sleep -Seconds $CheckInterval
                 continue
@@ -1132,6 +1152,12 @@ try {
                 $OnceKey  = "${Path}::Once"
 
                 WdInitializeCounter -Table $RestartStats -Key $StatKey -DefaultValue 0
+
+                $disableReason = WdGetDisableReason
+                if ($disableReason) {
+                    WdUpdateDisableState -Reason $disableReason | Out-Null
+                    break
+                }
 
                 if ($RestartStats[$StatKey] -ge $MaxRetryInHour) {
                     if (-not $ThrottleWarned.ContainsKey($StatKey)) {
@@ -1390,6 +1416,11 @@ try {
             }
 
             $FirstRun = $false
+
+            if ($disableReason) {
+                Start-Sleep -Seconds $CheckInterval
+                continue
+            }
 
             if ($anyCursorHideNeeded) {
                 WdHideSystemCursor
