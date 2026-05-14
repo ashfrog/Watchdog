@@ -680,7 +680,7 @@ function WdPollManualExitHotkeys {
 
     if (-not $Script:ManualExitTargets -or $Script:ManualExitTargets.Count -eq 0) {
         $Script:ManualExitKeyState["Esc"] = $false
-        $Script:ManualExitKeyState["AltPlusF4"] = $false
+        $Script:ManualExitKeyState["Alt+F4"] = $false
         return $false
     }
 
@@ -688,7 +688,7 @@ function WdPollManualExitHotkeys {
     $targetKey = [string]$foregroundPid
     if ($foregroundPid -eq 0 -or -not $Script:ManualExitTargets.ContainsKey($targetKey)) {
         $Script:ManualExitKeyState["Esc"] = $false
-        $Script:ManualExitKeyState["AltPlusF4"] = $false
+        $Script:ManualExitKeyState["Alt+F4"] = $false
         return $false
     }
 
@@ -700,24 +700,27 @@ function WdPollManualExitHotkeys {
     if ($escDown -and -not $Script:ManualExitKeyState["Esc"]) {
         WdInvokeManualExitShutdown -Target $Script:ManualExitTargets[$targetKey] -Reason "Esc"
         $Script:ManualExitKeyState["Esc"] = $escDown
-        $Script:ManualExitKeyState["AltPlusF4"] = $altF4Down
+        $Script:ManualExitKeyState["Alt+F4"] = $altF4Down
         return $true
     }
 
-    if ($altF4Down -and -not $Script:ManualExitKeyState["AltPlusF4"]) {
+    if ($altF4Down -and -not $Script:ManualExitKeyState["Alt+F4"]) {
         WdInvokeManualExitShutdown -Target $Script:ManualExitTargets[$targetKey] -Reason "Alt+F4"
         $Script:ManualExitKeyState["Esc"] = $escDown
-        $Script:ManualExitKeyState["AltPlusF4"] = $altF4Down
+        $Script:ManualExitKeyState["Alt+F4"] = $altF4Down
         return $true
     }
 
     $Script:ManualExitKeyState["Esc"] = $escDown
-    $Script:ManualExitKeyState["AltPlusF4"] = $altF4Down
+    $Script:ManualExitKeyState["Alt+F4"] = $altF4Down
     return $false
 }
 
 function WdWaitInterruptible {
-    param([int]$Seconds)
+    param(
+        [ValidateRange(0, 2147483)]
+        [int]$Seconds
+    )
 
     if ($Script:ShutdownRequested) { return $false }
     if ($Seconds -le 0) {
@@ -1202,7 +1205,7 @@ $Script:ShutdownRequested = $false
 $Script:ManualExitTargets = @{}
 $Script:ManualExitKeyState = @{
     Esc = $false
-    AltPlusF4 = $false
+    "Alt+F4" = $false
 }
 
 # =================== 7. 主循环 ===================
