@@ -355,6 +355,28 @@ function WdTestDisableFlag {
     return [bool](WdGetDisableReason)
 }
 
+$Script:LastDisableReason = $null
+
+function WdUpdateDisableState {
+    param([string]$DisableReason)
+
+    if ($DisableReason) {
+        WdRestoreSystemCursor
+        if ($Script:LastDisableReason -ne $DisableReason) {
+            WdWriteLog "SAFE-MODE: $DisableReason detected. Monitoring paused; no app will be launched or restarted." "Yellow"
+            $Script:LastDisableReason = $DisableReason
+        }
+        return $true
+    }
+
+    if ($Script:LastDisableReason) {
+        WdWriteLog "SAFE-MODE: $($Script:LastDisableReason) cleared. Monitoring resumed." "DarkGreen"
+        $Script:LastDisableReason = $null
+    }
+
+    return $false
+}
+
 function WdInitializeCounter {
     param(
         [hashtable]$Table,
@@ -1104,15 +1126,14 @@ try {
             WdCleanupRestartStats -Table $ThrottleWarned -CurrentHour $CurrentHour
 
             $disableReason = WdGetDisableReason
-            if ($disableReason) {
-                WdRestoreSystemCursor
-                WdWriteLog "SAFE-MODE: $disableReason detected. Monitoring paused; no app will be launched or restarted." "Yellow"
+            if (WdUpdateDisableState -DisableReason $disableReason) {
                 $FirstRun = $false
                 Start-Sleep -Seconds $CheckInterval
                 continue
             }
 
             $anyCursorHideNeeded = $false
+            $monitoringPaused = $false
             foreach ($Path in $Apps.Keys) {
                 $Config   = $Apps[$Path]
                 if (WdIsBrowserUrl -Path $Path) {
@@ -1132,6 +1153,12 @@ try {
                 $OnceKey  = "${Path}::Once"
 
                 WdInitializeCounter -Table $RestartStats -Key $StatKey -DefaultValue 0
+
+                $disableReason = WdGetDisableReason
+                if (WdUpdateDisableState -DisableReason $disableReason) {
+                    $monitoringPaused = $true
+                    break
+                }
 
                 if ($RestartStats[$StatKey] -ge $MaxRetryInHour) {
                     if (-not $ThrottleWarned.ContainsKey($StatKey)) {
@@ -1387,6 +1414,19 @@ try {
                     }
                     $procs = $null
                 }
+            }
+
+            if ($monitoringPaused) {
+                $FirstRun = $false
+                Start-Sleep -Seconds $CheckInterval
+                continue
+            }
+
+            $disableReason = WdGetDisableReason
+            if (WdUpdateDisableState -DisableReason $disableReason) {
+                $FirstRun = $false
+                Start-Sleep -Seconds $CheckInterval
+                continue
             }
 
             $FirstRun = $false
