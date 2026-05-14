@@ -459,8 +459,8 @@ function WdStartByConsoleMode {
                 -PassThru
         }
         default {
-            $modeLabel = if ($modeLower -eq "new") { "new" } else { "auto" }
-            WdWriteLog "START: Launching [$FileName] in $modeLabel mode CMD=[$CommandPreview]" "DarkCyan"
+            $modeText = if ($modeLower -eq "new") { "new console" } else { "auto mode" }
+            WdWriteLog "START: Launching [$FileName] in $modeText CMD=[$CommandPreview]" "DarkCyan"
             return Start-Process -FilePath $LaunchPath `
                 -ArgumentList $LaunchArgs `
                 -WorkingDirectory $WorkingDirectory `
