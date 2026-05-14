@@ -187,6 +187,9 @@ namespace WatchdogWin32
         public static extern IntPtr CreateCursor(IntPtr hInst, int xHotSpot, int yHotSpot, int nWidth, int nHeight, byte[] pvANDPlane, byte[] pvXORPlane);
 
         [DllImport("user32.dll")]
+        public static extern bool DestroyCursor(IntPtr hCursor);
+
+        [DllImport("user32.dll")]
         public static extern bool SetSystemCursor(IntPtr hcur, uint id);
 
         [DllImport("user32.dll")]
@@ -784,7 +787,7 @@ function WdHideSystemCursor {
         $OCR_NORMAL  = 32512
         $curW        = 32
         $curH        = 32
-        $planeSize   = $curW * ($curH / 8)  # bytes per bit-plane for 32x32
+        $planeSize   = $curW * [int]($curH / 8)  # bytes per bit-plane for 32x32
 
         $andPlane = New-Object byte[] $planeSize
         $xorPlane = New-Object byte[] $planeSize
@@ -792,10 +795,15 @@ function WdHideSystemCursor {
 
         $hCursor = [WatchdogWin32.DisplayAPI]::CreateCursor([IntPtr]::Zero, 0, 0, $curW, $curH, $andPlane, $xorPlane)
         if ($hCursor -ne [IntPtr]::Zero) {
-            # SetSystemCursor takes ownership of hCursor; do not call DestroyCursor on it
+            # SetSystemCursor takes ownership of hCursor on success; do not call DestroyCursor after that
             if ([WatchdogWin32.DisplayAPI]::SetSystemCursor($hCursor, $OCR_NORMAL)) {
                 $Script:CursorHiddenApplied = $true
                 WdWriteLog "CURSOR: System cursor hidden." "DarkGray"
+            }
+            else {
+                # SetSystemCursor did not take ownership; free the handle to avoid a leak
+                [WatchdogWin32.DisplayAPI]::DestroyCursor($hCursor) | Out-Null
+                WdWriteLog "CURSOR: SetSystemCursor failed; cursor handle released." "DarkYellow"
             }
         }
     }
