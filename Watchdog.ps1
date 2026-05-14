@@ -1417,7 +1417,8 @@ try {
 
             $FirstRun = $false
 
-            if ($disableReason) {
+            $disableReason = WdGetDisableReason
+            if (WdUpdateDisableState -Reason $disableReason) {
                 Start-Sleep -Seconds $CheckInterval
                 continue
             }
