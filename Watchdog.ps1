@@ -1172,6 +1172,7 @@ try {
                         WdWriteLog "MISSING: $FileName, launch scheduled in $WaitTime sec..." "Cyan"
                         $MissingLogged[$Path] = $true
                     }
+                    if ($hideCursor) { WdRestoreSystemCursor }
                     Start-Sleep -Seconds $WaitTime
 
                     if (-not (WdIsProcessMissing -Path $Path)) {
@@ -1266,6 +1267,7 @@ try {
                             $HangFailCount[$Path] = 0
 
                             WdStopProcessTreeSafe -ProcessId $TargetID -KillTree $killTreeOnHang
+                            if ($hideCursor) { WdRestoreSystemCursor }
                             Start-Sleep -Seconds ([int]$Config.Restart)
 
                             if (-not (WdIsProcessMissing -Path $Path)) {
