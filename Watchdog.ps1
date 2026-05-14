@@ -77,7 +77,8 @@ $MaxRetryInHour  = 10
 $GCCollectEvery  = 100
 $MillisecondsPerSecond = 1000
 $HotkeyPollIntervalMs  = 100
-$MaxInterruptibleWaitSeconds = [int]::MaxValue / $MillisecondsPerSecond
+# Intentionally truncated to whole seconds so later millisecond conversion always stays within Int64 bounds.
+$MaxInterruptibleWaitSeconds = [int]([int]::MaxValue / $MillisecondsPerSecond)
 
 # 连续 N 次检测到不响应后才执行挂死重启，避免偶发卡顿触发误重启
 $HangConsecutiveFailuresToRestart = 3
@@ -639,15 +640,15 @@ function WdIsWindowForeground {
 function WdGetForegroundProcessId {
     try {
         $hwnd = [WatchdogWin32.DisplayAPI]::GetForegroundWindow()
-        if ($hwnd -eq [IntPtr]::Zero) { return 0 }
+        if ($hwnd -eq [IntPtr]::Zero) { return [uint32]0 }
 
         [uint32]$processId = 0
         $threadId = [WatchdogWin32.DisplayAPI]::GetWindowThreadProcessId($hwnd, [ref]$processId)
-        if ($threadId -eq 0) { return 0 }
-        return [int]$processId
+        if ($threadId -eq 0) { return [uint32]0 }
+        return $processId
     }
     catch {
-        return 0
+        return [uint32]0
     }
 }
 
@@ -702,15 +703,11 @@ function WdPollManualExitHotkeys {
 
     if ($escDown -and -not $Script:ManualExitKeyState["Esc"]) {
         WdInvokeManualExitShutdown -Target $Script:ManualExitTargets[$targetKey] -Reason "Esc"
-        $Script:ManualExitKeyState["Esc"] = $escDown
-        $Script:ManualExitKeyState["Alt+F4"] = $altF4Down
         return $true
     }
 
     if ($altF4Down -and -not $Script:ManualExitKeyState["Alt+F4"]) {
         WdInvokeManualExitShutdown -Target $Script:ManualExitTargets[$targetKey] -Reason "Alt+F4"
-        $Script:ManualExitKeyState["Esc"] = $escDown
-        $Script:ManualExitKeyState["Alt+F4"] = $altF4Down
         return $true
     }
 
@@ -732,7 +729,7 @@ function WdWaitInterruptible {
         return (-not $Script:ShutdownRequested)
     }
 
-    [int64]$remainingMs = [Math]::Max([int64]0, ([int64]$Seconds * [int64]$MillisecondsPerSecond))
+    [int64]$remainingMs = [int64]$Seconds * [int64]$MillisecondsPerSecond
     while ($remainingMs -gt 0) {
         if ($Script:ShutdownRequested) { return $false }
 
