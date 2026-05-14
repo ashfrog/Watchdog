@@ -834,7 +834,7 @@ function WdRestoreSystemCursor {
 function WdTestEscPressedGlobal {
     try {
         $keyState = [WatchdogWin32.DisplayAPI]::GetAsyncKeyState($Script:VK_ESCAPE)
-        # GetAsyncKeyState 高位（0x8000）为 1 表示按键当前处于按下状态
+        # GetAsyncKeyState high bit (0x8000) set means the key is currently pressed.
         $isDownNow = (($keyState -band $Script:KEYSTATE_DOWN_MASK) -ne 0)
         $isNewPress = $isDownNow -and -not $Script:EscKeyPreviouslyDown
         $Script:EscKeyPreviouslyDown = $isDownNow
@@ -864,7 +864,19 @@ function WdStopFullscreenTopmostTargets {
         $FileName = if (WdIsBrowserUrl -Path $Path) { $Path } else { [System.IO.Path]::GetFileName($Path) }
         $procsArr = if ($procs -is [array]) { $procs } else { @($procs) }
         foreach ($procItem in $procsArr) {
-            $targetId = if ($null -ne $procItem.Id) { $procItem.Id } else { $procItem.ProcessId }
+            $targetId = 0
+            try {
+                if ($null -ne $procItem.Id) {
+                    $targetId = [int]$procItem.Id
+                }
+                elseif ($null -ne $procItem.ProcessId) {
+                    $targetId = [int]$procItem.ProcessId
+                }
+            }
+            catch {
+                $targetId = 0
+            }
+            if ($targetId -le 0) { continue }
             WdStopProcessTreeSafe -ProcessId $targetId -KillTree $true
             WdWriteLog "ESC-EXIT: Stopped fullscreen topmost target $FileName (PID:$targetId)." "Yellow"
             if ($procItem -is [System.Diagnostics.Process]) {
