@@ -1133,6 +1133,7 @@ try {
             }
 
             $anyCursorHideNeeded = $false
+            $monitoringPaused = $false
             foreach ($Path in $Apps.Keys) {
                 $Config   = $Apps[$Path]
                 if (WdIsBrowserUrl -Path $Path) {
@@ -1155,6 +1156,7 @@ try {
 
                 $disableReason = WdGetDisableReason
                 if (WdUpdateDisableState -DisableReason $disableReason) {
+                    $monitoringPaused = $true
                     break
                 }
 
@@ -1412,6 +1414,12 @@ try {
                     }
                     $procs = $null
                 }
+            }
+
+            if ($monitoringPaused) {
+                $FirstRun = $false
+                Start-Sleep -Seconds $CheckInterval
+                continue
             }
 
             $disableReason = WdGetDisableReason
