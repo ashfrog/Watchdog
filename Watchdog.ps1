@@ -344,7 +344,7 @@ function WdGetDisableReason {
         return "disable.flag"
     }
 
-    if (Get-Process -Name "Taskmgr" -ErrorAction SilentlyContinue) {
+    if (Get-Process -Name "taskmgr" -ErrorAction SilentlyContinue) {
         return "Task Manager"
     }
 
