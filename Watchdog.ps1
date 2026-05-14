@@ -384,6 +384,11 @@ $Script:AppConfigDefaults = [ordered]@{
     MinUpSeconds       = 5
     Browser            = "auto"
 }
+$Script:AppConfigMin = [ordered]@{
+    First        = 1
+    Restart      = 1
+    MinUpSeconds = 1
+}
 
 function WdResolveAppConfig {
     param(
@@ -397,15 +402,15 @@ function WdResolveAppConfig {
         $resolved[$key] = if ($rawConfig.ContainsKey($key)) { $rawConfig[$key] } else { $Script:AppConfigDefaults[$key] }
     }
 
-    try { $resolved.First = [Math]::Max(1, [int]$resolved.First) } catch {
+    try { $resolved.First = [Math]::Max([int]$Script:AppConfigMin.First, [int]$resolved.First) } catch {
         $resolved.First = [int]$Script:AppConfigDefaults.First
         WdWriteLog "CONFIG-WARN: [$Path] invalid First value; fallback to $($resolved.First)." "DarkYellow"
     }
-    try { $resolved.Restart = [Math]::Max(1, [int]$resolved.Restart) } catch {
+    try { $resolved.Restart = [Math]::Max([int]$Script:AppConfigMin.Restart, [int]$resolved.Restart) } catch {
         $resolved.Restart = [int]$Script:AppConfigDefaults.Restart
         WdWriteLog "CONFIG-WARN: [$Path] invalid Restart value; fallback to $($resolved.Restart)." "DarkYellow"
     }
-    try { $resolved.MinUpSeconds = [Math]::Max(1, [int]$resolved.MinUpSeconds) } catch {
+    try { $resolved.MinUpSeconds = [Math]::Max([int]$Script:AppConfigMin.MinUpSeconds, [int]$resolved.MinUpSeconds) } catch {
         $resolved.MinUpSeconds = [int]$Script:AppConfigDefaults.MinUpSeconds
         WdWriteLog "CONFIG-WARN: [$Path] invalid MinUpSeconds value; fallback to $($resolved.MinUpSeconds)." "DarkYellow"
     }
