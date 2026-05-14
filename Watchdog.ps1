@@ -1105,6 +1105,7 @@ try {
 
             $disableReason = WdGetDisableReason
             if ($disableReason) {
+                WdRestoreSystemCursor
                 WdWriteLog "SAFE-MODE: $disableReason detected. Monitoring paused; no app will be launched or restarted." "Yellow"
                 $FirstRun = $false
                 Start-Sleep -Seconds $CheckInterval
