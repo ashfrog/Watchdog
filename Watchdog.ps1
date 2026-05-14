@@ -97,7 +97,7 @@ $StrictScriptPathBoundary = $false
 
 # =================== 2. 核心保护：防止 Watchdog 自身多开 ===================
 $Script:MutexOwned = $false
-$Script:MutexReleaseState = 0
+$Script:MutexReleasedFlag = 0
 $Script:Mutex = New-Object System.Threading.Mutex($false, "Global\WindowsWatchdogServiceMutex")
 try {
     $Script:MutexOwned = $Script:Mutex.WaitOne(0)
@@ -107,7 +107,7 @@ catch [System.Threading.AbandonedMutexException] {
 }
 
 function WdReleaseMutexSafe {
-    if ([System.Threading.Interlocked]::Exchange([ref]$Script:MutexReleaseState, 1) -eq 1) { return }
+    if ([System.Threading.Interlocked]::Exchange([ref]$Script:MutexReleasedFlag, 1) -eq 1) { return }
 
     if ($Script:Mutex) {
         if ($Script:MutexOwned) {
@@ -436,8 +436,8 @@ function WdResolveAppConfig {
     if (-not (WdIsBrowserUrl -Path $Path)) {
         if ($resolved.Browser -ne [string]$Script:AppConfigDefaults.Browser) {
             WdWriteLog "CONFIG-INFO: [$Path] Browser option is only used for URL entries and will be ignored." "DarkGray"
+            $resolved.Browser = [string]$Script:AppConfigDefaults.Browser
         }
-        $resolved.Browser = [string]$Script:AppConfigDefaults.Browser
     }
 
     return $resolved
