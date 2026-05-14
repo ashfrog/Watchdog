@@ -679,6 +679,7 @@ function WdPollManualExitHotkeys {
     $VK_ESCAPE = 0x1B
     $VK_MENU   = 0x12
     $VK_F4     = 0x73
+    $KEY_PRESSED_MASK = 0x8000
 
     if ($Script:ShutdownRequested) { return $true }
 
@@ -696,9 +697,9 @@ function WdPollManualExitHotkeys {
         return $false
     }
 
-    $escDown = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_ESCAPE) -band 0x8000) -ne 0)
-    $altDown = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_MENU) -band 0x8000) -ne 0)
-    $f4Down  = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_F4) -band 0x8000) -ne 0)
+    $escDown = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_ESCAPE) -band $KEY_PRESSED_MASK) -ne 0)
+    $altDown = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_MENU) -band $KEY_PRESSED_MASK) -ne 0)
+    $f4Down  = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_F4) -band $KEY_PRESSED_MASK) -ne 0)
     $altF4Down = ($altDown -and $f4Down)
     $escWasDown = [bool]$Script:ManualExitKeyState["Esc"]
     $altF4WasDown = [bool]$Script:ManualExitKeyState["Alt+F4"]
@@ -727,7 +728,7 @@ function WdWaitInterruptible {
     if ($Seconds -gt $MaxInterruptibleWaitSeconds) {
         $Seconds = $MaxInterruptibleWaitSeconds
     }
-    if ($Seconds -le 0) {
+    if ($Seconds -eq 0) {
         [void](WdPollManualExitHotkeys)
         return (-not $Script:ShutdownRequested)
     }
@@ -1214,7 +1215,7 @@ $Script:ManualExitKeyState = @{
 
 # =================== 7. 主循环 ===================
 try {
-    while (-not $Script:ShutdownRequested) {
+    :watchdogLoop while (-not $Script:ShutdownRequested) {
         try {
             WdRotateLog
             $CurrentHour = (Get-Date).Hour
@@ -1306,7 +1307,7 @@ try {
                         $MissingLogged[$Path] = $true
                     }
                     if ($hideCursor) { WdRestoreSystemCursor }
-                    if (-not (WdWaitInterruptible -Seconds $WaitTime)) { break }
+                    if (-not (WdWaitInterruptible -Seconds $WaitTime)) { break watchdogLoop }
 
                     if (-not (WdIsProcessMissing -Path $Path)) {
                         $MissingLogged[$Path] = $false
@@ -1401,7 +1402,7 @@ try {
 
                             WdStopProcessTreeSafe -ProcessId $TargetID -KillTree $killTreeOnHang
                             if ($hideCursor) { WdRestoreSystemCursor }
-                            if (-not (WdWaitInterruptible -Seconds ([int]$Config.Restart))) { break }
+                            if (-not (WdWaitInterruptible -Seconds ([int]$Config.Restart))) { break watchdogLoop }
 
                             if (-not (WdIsProcessMissing -Path $Path)) {
                                 WdWriteLog "SKIP: $FileName recovered or restarted externally after hang handling." "DarkYellow"
