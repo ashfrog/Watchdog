@@ -75,10 +75,6 @@ $MaxLogBackups   = 3
 $CheckInterval   = 3
 $MaxRetryInHour  = 10
 $GCCollectEvery  = 100
-$MillisecondsPerSecond = 1000
-$HotkeyPollIntervalMs  = 100
-# Intentionally truncated to whole seconds so later millisecond conversion always stays within Int64 bounds.
-$MaxInterruptibleWaitSeconds = [int]([int]::MaxValue / $MillisecondsPerSecond)
 
 # 连续 N 次检测到不响应后才执行挂死重启，避免偶发卡顿触发误重启
 $HangConsecutiveFailuresToRestart = 3
@@ -167,7 +163,7 @@ namespace WatchdogWin32
         public static extern bool SetForegroundWindow(IntPtr hWnd);
 
         [DllImport("user32.dll")]
-        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr ProcessId);
 
         [DllImport("kernel32.dll")]
         public static extern uint GetCurrentThreadId();
@@ -186,9 +182,6 @@ namespace WatchdogWin32
 
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
-
-        [DllImport("user32.dll")]
-        public static extern short GetAsyncKeyState(int vKey);
 
         [DllImport("user32.dll")]
         public static extern IntPtr CreateCursor(IntPtr hInst, int xHotSpot, int yHotSpot, int nWidth, int nHeight, byte[] pvANDPlane, byte[] pvXORPlane);
@@ -637,125 +630,6 @@ function WdIsWindowForeground {
     catch { return $false }
 }
 
-function WdGetForegroundProcessId {
-    try {
-        $hwnd = [WatchdogWin32.DisplayAPI]::GetForegroundWindow()
-        if ($hwnd -eq [IntPtr]::Zero) { return [uint32]0 }
-
-        [uint32]$processId = 0
-        $threadId = [WatchdogWin32.DisplayAPI]::GetWindowThreadProcessId($hwnd, [ref]$processId)
-        if ($threadId -eq 0) { return [uint32]0 }
-        return $processId
-    }
-    catch {
-        return [uint32]0
-    }
-}
-
-function WdInvokeManualExitShutdown {
-    param(
-        [hashtable]$Target,
-        [string]$Reason
-    )
-
-    if ($null -eq $Target) { return }
-
-    $processId = if ($Target.ContainsKey("ProcessId")) { [int]$Target.ProcessId } else { 0 }
-    $fileName  = if ($Target.ContainsKey("FileName")) { [string]$Target.FileName } else { "target app" }
-    $killTree  = $true
-    if ($Target.ContainsKey("KillTree")) {
-        $killTree = [bool]$Target.KillTree
-    }
-
-    WdWriteLog "MANUAL-EXIT: Detected $Reason for $fileName (PID:$processId). Stopping target and exiting Watchdog." "Yellow"
-    if ($processId -gt 0) {
-        WdStopProcessTreeSafe -ProcessId $processId -KillTree $killTree
-    }
-    try { WdRestoreSystemCursor } catch {}
-    $Script:ShutdownRequested = $true
-}
-
-function WdPollManualExitHotkeys {
-    $VK_ESCAPE = 0x1B
-    $VK_MENU   = 0x12
-    $VK_F4     = 0x73
-    $KEY_PRESSED_MASK = 0x8000
-
-    if ($Script:ShutdownRequested) { return $true }
-
-    if (-not $Script:ManualExitTargets -or $Script:ManualExitTargets.Count -eq 0) {
-        $Script:ManualExitKeyState["Esc"] = $false
-        $Script:ManualExitKeyState["Alt+F4"] = $false
-        return $false
-    }
-
-    $foregroundPid = WdGetForegroundProcessId
-    $targetKey = [string]$foregroundPid
-    if ($foregroundPid -eq 0 -or -not $Script:ManualExitTargets.ContainsKey($targetKey)) {
-        $Script:ManualExitKeyState["Esc"] = $false
-        $Script:ManualExitKeyState["Alt+F4"] = $false
-        return $false
-    }
-
-    $escDown = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_ESCAPE) -band $KEY_PRESSED_MASK) -ne 0)
-    $altDown = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_MENU) -band $KEY_PRESSED_MASK) -ne 0)
-    $f4Down  = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_F4) -band $KEY_PRESSED_MASK) -ne 0)
-    $altF4Down = ($altDown -and $f4Down)
-    $escWasDown = [bool]$Script:ManualExitKeyState["Esc"]
-    $altF4WasDown = [bool]$Script:ManualExitKeyState["Alt+F4"]
-
-    $Script:ManualExitKeyState["Esc"] = $escDown
-    $Script:ManualExitKeyState["Alt+F4"] = $altF4Down
-
-    if ($escDown -and -not $escWasDown) {
-        WdInvokeManualExitShutdown -Target $Script:ManualExitTargets[$targetKey] -Reason "Esc"
-        return $true
-    }
-
-    if ($altF4Down -and -not $altF4WasDown) {
-        WdInvokeManualExitShutdown -Target $Script:ManualExitTargets[$targetKey] -Reason "Alt+F4"
-        return $true
-    }
-
-    return $false
-}
-
-function WdWaitInterruptible {
-    param([int]$Seconds)
-
-    if ($Script:ShutdownRequested) { return $false }
-    if ($Seconds -lt 0) { $Seconds = 0 }
-    if ($Seconds -gt $MaxInterruptibleWaitSeconds) {
-        $Seconds = $MaxInterruptibleWaitSeconds
-    }
-    if ($Seconds -eq 0) {
-        [void](WdPollManualExitHotkeys)
-        return (-not $Script:ShutdownRequested)
-    }
-
-    [int64]$remainingMs = $Seconds * $MillisecondsPerSecond
-    while ($remainingMs -gt 0) {
-        if ($Script:ShutdownRequested) { return $false }
-
-        $chunkMs = [int][Math]::Min($HotkeyPollIntervalMs, $remainingMs)
-        Start-Sleep -Milliseconds $chunkMs
-        [void](WdPollManualExitHotkeys)
-        $remainingMs -= $chunkMs
-    }
-
-    return (-not $Script:ShutdownRequested)
-}
-
-function WdShouldMonitorManualExit {
-    param(
-        [bool]$FocusTop,
-        [bool]$HideWindow,
-        [bool]$IsExe
-    )
-
-    return ($FocusTop -and -not $HideWindow -and $IsExe)
-}
-
 function WdSetWindowToForeground {
     param($ProcessObj)
 
@@ -776,8 +650,7 @@ function WdSetWindowToForeground {
     if (WdIsWindowForeground -Hwnd $hwnd) { return $true }
 
     $currentThreadId = [WatchdogWin32.DisplayAPI]::GetCurrentThreadId()
-    [uint32]$windowProcessId = 0
-    $targetThreadId  = [WatchdogWin32.DisplayAPI]::GetWindowThreadProcessId($hwnd, [ref]$windowProcessId)
+    $targetThreadId  = [WatchdogWin32.DisplayAPI]::GetWindowThreadProcessId($hwnd, [IntPtr]::Zero)
     $attached = $false
     $success  = $false
 
@@ -1206,16 +1079,10 @@ $ThrottleWarned    = @{}
 $MissingLogged     = @{}
 $HangFailCount     = @{}
 $Script:GCCounter  = 0
-$Script:ShutdownRequested = $false
-$Script:ManualExitTargets = @{}
-$Script:ManualExitKeyState = @{
-    Esc = $false
-    "Alt+F4" = $false
-}
 
 # =================== 7. 主循环 ===================
 try {
-    :watchdogLoop while (-not $Script:ShutdownRequested) {
+    while ($true) {
         try {
             WdRotateLog
             $CurrentHour = (Get-Date).Hour
@@ -1225,12 +1092,11 @@ try {
             if (WdTestDisableFlag) {
                 WdWriteLog "SAFE-MODE: Disable flag detected. Monitoring paused; no app will be launched or restarted." "Yellow"
                 $FirstRun = $false
-                if (-not (WdWaitInterruptible -Seconds $CheckInterval)) { break }
+                Start-Sleep -Seconds $CheckInterval
                 continue
             }
 
             $anyCursorHideNeeded = $false
-            $activeManualExitTargets = @{}
             foreach ($Path in $Apps.Keys) {
                 $Config   = $Apps[$Path]
                 if (WdIsBrowserUrl -Path $Path) {
@@ -1307,7 +1173,7 @@ try {
                         $MissingLogged[$Path] = $true
                     }
                     if ($hideCursor) { WdRestoreSystemCursor }
-                    if (-not (WdWaitInterruptible -Seconds $WaitTime)) { break watchdogLoop }
+                    Start-Sleep -Seconds $WaitTime
 
                     if (-not (WdIsProcessMissing -Path $Path)) {
                         $MissingLogged[$Path] = $false
@@ -1402,7 +1268,7 @@ try {
 
                             WdStopProcessTreeSafe -ProcessId $TargetID -KillTree $killTreeOnHang
                             if ($hideCursor) { WdRestoreSystemCursor }
-                            if (-not (WdWaitInterruptible -Seconds ([int]$Config.Restart))) { break watchdogLoop }
+                            Start-Sleep -Seconds ([int]$Config.Restart)
 
                             if (-not (WdIsProcessMissing -Path $Path)) {
                                 WdWriteLog "SKIP: $FileName recovered or restarted externally after hang handling." "DarkYellow"
@@ -1461,14 +1327,6 @@ try {
                             }
                         }
 
-                        if (WdShouldMonitorManualExit -FocusTop ([bool]$Config.FocusTop) -HideWindow ([bool]$Config.HideWindow) -IsExe $isExe) {
-                            $activeManualExitTargets[[string]$TargetID] = @{
-                                ProcessId = [int]$TargetID
-                                FileName  = $FileName
-                                KillTree  = $killTreeOnHang
-                            }
-                        }
-
                         if ([bool]$Config.FocusTop -and -not [bool]$Config.HideWindow -and ($isExe -or $isUrl)) {
                             $allowFocus = $true
 
@@ -1515,9 +1373,6 @@ try {
                 }
             }
 
-            $Script:ManualExitTargets = $activeManualExitTargets
-            if ($Script:ShutdownRequested) { break }
-
             $FirstRun = $false
 
             if ($anyCursorHideNeeded) {
@@ -1538,7 +1393,7 @@ try {
             WdWriteLog "LOOP-ERROR: StackTrace: $($_.ScriptStackTrace)" "DarkRed"
         }
 
-        if (-not (WdWaitInterruptible -Seconds $CheckInterval)) { break }
+        Start-Sleep -Seconds $CheckInterval
     }
 }
 finally {
