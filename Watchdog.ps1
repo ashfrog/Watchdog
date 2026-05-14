@@ -441,8 +441,8 @@ function WdNewProcessSnapshot {
     try {
         $snapshot.Processes = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
             [pscustomobject]@{
-                Id   = $_.Id
-                Path = if ($_.Path) { WdNormalizePathSafe $_.Path } else { $null }
+                ProcessId = $_.Id
+                Path      = if ($_.Path) { WdNormalizePathSafe $_.Path } else { $null }
             }
         })
     }
@@ -753,19 +753,14 @@ function WdGetTargetProcess {
             if ($null -eq $processes) {
                 $processes = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
                     [pscustomobject]@{
-                        Id   = $_.Id
-                        Path = if ($_.Path) { WdNormalizePathSafe $_.Path } else { $null }
+                        ProcessId = $_.Id
+                        Path      = if ($_.Path) { WdNormalizePathSafe $_.Path } else { $null }
                     }
                 })
             }
 
             return $processes | Where-Object {
-                $_.Id -ne $CurrentPID -and $_.Path -and $_.Path -eq $NormalizedPath
-            } | ForEach-Object {
-                [pscustomobject]@{
-                    Id        = $_.Id
-                    ProcessId = $_.Id
-                }
+                $_.ProcessId -ne $CurrentPID -and $_.Path -and $_.Path -eq $NormalizedPath
             }
         }
         else {
