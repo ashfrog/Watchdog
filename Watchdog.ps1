@@ -1175,12 +1175,6 @@ try {
                     }
 
                     try {
-                        if ($LaunchTime.ContainsKey($Path) -and $LaunchTime[$Path]) {
-                            $uptime = ((Get-Date) - $LaunchTime[$Path]).TotalSeconds
-                            if ($uptime -ge $minUpSeconds) {
-                            }
-                        }
-
                         if ($isExe -and -not $mainProc.Responding) {
                             WdInitializeCounter -Table $HangFailCount -Key $Path -DefaultValue 0
                             $HangFailCount[$Path]++
