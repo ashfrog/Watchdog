@@ -40,24 +40,10 @@
 #   进程检测仅匹配该 Profile 的主进程，不会误杀子渲染进程。
 
 $Apps = [ordered]@{
-    "M:\GitHub\NetWorkBlockTest\TestNewBlock\Release\TestNewBlock.exe" = @{
+    "https://www.baidu.com" = @{
         First = 1; Restart = 5; Arguments = ""
         Once = $false; HideWindow = $false; FocusTop = $true
-        Fullscreen = $true; ForceDisplayMode = $false; PythonExe = ""
-        ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
-        MinUpSeconds = 15; Browser = "auto"
-    }
-    "https://www.google.com" = @{
-        First = 1; Restart = 5; Arguments = ""
-        Once = $false; HideWindow = $false; FocusTop = $false
-        Fullscreen = $false; ForceDisplayMode = $false; PythonExe = ""
-        ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
-        MinUpSeconds = 15; Browser = "auto"
-    }
-    "C:\WINDOWS\system32\notepad.exe" = @{
-        First = 1; Restart = 5; Arguments = ""
-        Once = $true; HideWindow = $false; FocusTop = $false
-        Fullscreen = $false; ForceDisplayMode = $false; PythonExe = ""
+        Fullscreen = $true; ForceDisplayMode = $true; PythonExe = ""
         ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
         MinUpSeconds = 15; Browser = "auto"
     }
