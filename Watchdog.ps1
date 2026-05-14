@@ -639,7 +639,8 @@ function WdGetForegroundProcessId {
         if ($hwnd -eq [IntPtr]::Zero) { return 0 }
 
         [uint32]$processId = 0
-        [void][WatchdogWin32.DisplayAPI]::GetWindowThreadProcessId($hwnd, [ref]$processId)
+        $threadId = [WatchdogWin32.DisplayAPI]::GetWindowThreadProcessId($hwnd, [ref]$processId)
+        if ($threadId -eq 0) { return 0 }
         return [int]$processId
     }
     catch {
@@ -720,11 +721,11 @@ function WdWaitInterruptible {
         return (-not $Script:ShutdownRequested)
     }
 
-    $remainingMs = [Math]::Max(0, $Seconds * 1000)
+    [int64]$remainingMs = [Math]::Max([int64]0, ([int64]$Seconds * 1000))
     while ($remainingMs -gt 0) {
         if ($Script:ShutdownRequested) { return $false }
 
-        $chunkMs = [Math]::Min(100, $remainingMs)
+        $chunkMs = [int][Math]::Min([int64]100, $remainingMs)
         Start-Sleep -Milliseconds $chunkMs
         [void](WdPollManualExitHotkeys)
         $remainingMs -= $chunkMs
