@@ -75,6 +75,9 @@ $MaxLogBackups   = 3
 $CheckInterval   = 3
 $MaxRetryInHour  = 10
 $GCCollectEvery  = 100
+$MillisecondsPerSecond = 1000
+$HotkeyPollIntervalMs  = 100
+$MaxInterruptibleWaitSeconds = [int]::MaxValue / $MillisecondsPerSecond
 
 # 连续 N 次检测到不响应后才执行挂死重启，避免偶发卡顿触发误重启
 $HangConsecutiveFailuresToRestart = 3
@@ -717,22 +720,23 @@ function WdPollManualExitHotkeys {
 }
 
 function WdWaitInterruptible {
-    param(
-        [ValidateRange(0, 2147483)]
-        [int]$Seconds
-    )
+    param([int]$Seconds)
 
     if ($Script:ShutdownRequested) { return $false }
+    if ($Seconds -lt 0) { $Seconds = 0 }
+    if ($Seconds -gt $MaxInterruptibleWaitSeconds) {
+        $Seconds = $MaxInterruptibleWaitSeconds
+    }
     if ($Seconds -le 0) {
         [void](WdPollManualExitHotkeys)
         return (-not $Script:ShutdownRequested)
     }
 
-    [int64]$remainingMs = [Math]::Max([int64]0, ([int64]$Seconds * [int64]1000))
+    [int64]$remainingMs = [Math]::Max([int64]0, ([int64]$Seconds * [int64]$MillisecondsPerSecond))
     while ($remainingMs -gt 0) {
         if ($Script:ShutdownRequested) { return $false }
 
-        $chunkMs = [int][Math]::Min([int64]100, $remainingMs)
+        $chunkMs = [int][Math]::Min([int64]$HotkeyPollIntervalMs, $remainingMs)
         Start-Sleep -Milliseconds $chunkMs
         [void](WdPollManualExitHotkeys)
         $remainingMs -= $chunkMs
