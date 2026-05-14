@@ -302,10 +302,16 @@ function WdCloseLogWriter {
 # =================== 5. 辅助函数 ===================
 
 function WdGetUtf8BomEncoding {
+    # Returns a UTF-8 encoding instance with BOM (Byte Order Mark) enabled,
+    # used consistently for all log file writes.
     return New-Object System.Text.UTF8Encoding($true)
 }
 
 function WdWriteProcessStartLog {
+    # Writes a SUCCESS log entry after a process is launched.
+    # FileName : display name of the started app
+    # Proc     : the Process object returned by Start-Process, or $null if unavailable
+    # Details  : additional context string appended to the log line (e.g. hide/focus flags)
     param(
         [string]$FileName,
         $Proc,
