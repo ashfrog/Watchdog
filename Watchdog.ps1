@@ -176,6 +176,9 @@ namespace WatchdogWin32
         public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
         [DllImport("user32.dll")]
+        public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
+
+        [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
     }
 }
@@ -618,13 +621,14 @@ function WdSetWindowToForeground {
 
     if ($null -eq $ProcessObj) { return $false }
 
-    $HWND_TOPMOST    = [IntPtr]-1
-    $HWND_NOTOPMOST  = [IntPtr]-2
-    $SWP_NOSIZE      = 0x0001
-    $SWP_NOMOVE      = 0x0002
-    $TOPMOST_FLAGS   = $SWP_NOSIZE -bor $SWP_NOMOVE
-    $VK_MENU         = 0x12
-    $KEYEVENTF_KEYUP = 0x0002
+    $HWND_TOPMOST      = [IntPtr]-1
+    $HWND_NOTOPMOST    = [IntPtr]-2
+    $SWP_NOSIZE        = 0x0001
+    $SWP_NOMOVE        = 0x0002
+    $TOPMOST_FLAGS     = $SWP_NOSIZE -bor $SWP_NOMOVE
+    $VK_MENU           = 0x12
+    $KEYEVENTF_KEYUP   = 0x0002
+    $MOUSEEVENTF_MOVE  = 0x0001
 
     $hwnd = WdWaitForWindowHandle -ProcessObj $ProcessObj
     if ($hwnd -eq [IntPtr]::Zero) { return $false }
@@ -634,6 +638,7 @@ function WdSetWindowToForeground {
     $currentThreadId = [WatchdogWin32.DisplayAPI]::GetCurrentThreadId()
     $targetThreadId  = [WatchdogWin32.DisplayAPI]::GetWindowThreadProcessId($hwnd, [IntPtr]::Zero)
     $attached = $false
+    $success  = $false
 
     try {
         if ($currentThreadId -ne $targetThreadId -and $targetThreadId -ne 0) {
@@ -651,9 +656,9 @@ function WdSetWindowToForeground {
         Start-Sleep -Milliseconds 150
         [WatchdogWin32.DisplayAPI]::SetWindowPos($hwnd, $HWND_NOTOPMOST, 0, 0, 0, 0, $TOPMOST_FLAGS) | Out-Null
 
-        return $true
+        $success = $true
     }
-    catch { return $false }
+    catch { $success = $false }
     finally {
         if ($attached) {
             try {
@@ -662,6 +667,20 @@ function WdSetWindowToForeground {
             catch {}
         }
     }
+
+    # SetForegroundWindow sends WM_ACTIVATE to the target window, which can cause Unity to
+    # reset its cursor visible state. Unity re-hides the cursor in its WM_SETCURSOR handler,
+    # but that message only fires when the mouse moves. Sending a zero-delta MOUSEEVENTF_MOVE
+    # generates a synthetic WM_MOUSEMOVE → WM_SETCURSOR so Unity immediately re-applies the
+    # hidden cursor without requiring physical mouse movement.
+    if ($success) {
+        try {
+            [WatchdogWin32.DisplayAPI]::mouse_event($MOUSEEVENTF_MOVE, 0, 0, 0, [UIntPtr]::Zero)
+        }
+        catch {}
+    }
+
+    return $success
 }
 
 function WdRepairWindowDisplayMode {
