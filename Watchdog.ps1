@@ -499,7 +499,8 @@ function WdGetTargetProcess {
 
     try {
         if ($Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
-            return Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            $exeName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+            return Get-Process -Name $exeName -ErrorAction SilentlyContinue | Where-Object {
                 $_.Id -ne $CurrentPID -and $_.Path -and (WdNormalizePathSafe $_.Path) -eq $NormalizedPath
             }
         }
