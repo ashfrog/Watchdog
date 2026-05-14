@@ -433,7 +433,14 @@ function WdStartByConsoleMode {
         [string]$CommandPreview
     )
 
-    if ($EffectiveMode -eq "Hidden") {
+    $modeLower = if ([string]::IsNullOrWhiteSpace($EffectiveMode)) {
+        "auto"
+    }
+    else {
+        $EffectiveMode.Trim().ToLowerInvariant()
+    }
+
+    if ($modeLower -eq "hidden") {
         WdWriteLog "START: Launching [$FileName] hidden CMD=[$CommandPreview]" "DarkCyan"
         return Start-Process -FilePath $LaunchPath `
             -ArgumentList $LaunchArgs `
@@ -442,7 +449,7 @@ function WdStartByConsoleMode {
             -PassThru
     }
 
-    switch ($EffectiveMode.ToLowerInvariant()) {
+    switch ($modeLower) {
         "shared" {
             WdWriteLog "START: Launching [$FileName] in shared console CMD=[$CommandPreview]" "DarkCyan"
             return Start-Process -FilePath $LaunchPath `
@@ -451,15 +458,9 @@ function WdStartByConsoleMode {
                 -NoNewWindow `
                 -PassThru
         }
-        "new" {
-            WdWriteLog "START: Launching [$FileName] in new console CMD=[$CommandPreview]" "DarkCyan"
-            return Start-Process -FilePath $LaunchPath `
-                -ArgumentList $LaunchArgs `
-                -WorkingDirectory $WorkingDirectory `
-                -PassThru
-        }
         default {
-            WdWriteLog "START: Launching [$FileName] in auto mode CMD=[$CommandPreview]" "DarkCyan"
+            $modeLabel = if ($modeLower -eq "new") { "new" } else { "auto" }
+            WdWriteLog "START: Launching [$FileName] in $modeLabel mode CMD=[$CommandPreview]" "DarkCyan"
             return Start-Process -FilePath $LaunchPath `
                 -ArgumentList $LaunchArgs `
                 -WorkingDirectory $WorkingDirectory `
