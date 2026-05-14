@@ -97,7 +97,7 @@ $StrictScriptPathBoundary = $false
 
 # =================== 2. 核心保护：防止 Watchdog 自身多开 ===================
 $Script:MutexOwned = $false
-$Script:MutexReleased = $false
+$Script:MutexReleaseState = 0
 $Script:Mutex = New-Object System.Threading.Mutex($false, "Global\WindowsWatchdogServiceMutex")
 try {
     $Script:MutexOwned = $Script:Mutex.WaitOne(0)
@@ -107,18 +107,21 @@ catch [System.Threading.AbandonedMutexException] {
 }
 
 function WdReleaseMutexSafe {
-    if ($Script:MutexReleased) { return }
+    if ([System.Threading.Interlocked]::Exchange([ref]$Script:MutexReleaseState, 1) -eq 1) { return }
 
     if ($Script:Mutex) {
         if ($Script:MutexOwned) {
-            try { $Script:Mutex.ReleaseMutex() } catch {}
+            try { $Script:Mutex.ReleaseMutex() } catch {
+                try { Write-Host "WARN: Failed to release mutex: $($_.Exception.Message)" } catch {}
+            }
         }
-        try { $Script:Mutex.Dispose() } catch {}
+        try { $Script:Mutex.Dispose() } catch {
+            try { Write-Host "WARN: Failed to dispose mutex: $($_.Exception.Message)" } catch {}
+        }
     }
 
     $Script:MutexOwned = $false
     $Script:Mutex = $null
-    $Script:MutexReleased = $true
 }
 
 if (-not $Script:MutexOwned) {
@@ -394,7 +397,7 @@ function WdResolveAppConfig {
         $resolved[$key] = if ($rawConfig.ContainsKey($key)) { $rawConfig[$key] } else { $Script:AppConfigDefaults[$key] }
     }
 
-    try { $resolved.First = [Math]::Max(0, [int]$resolved.First) } catch {
+    try { $resolved.First = [Math]::Max(1, [int]$resolved.First) } catch {
         $resolved.First = [int]$Script:AppConfigDefaults.First
         WdWriteLog "CONFIG-WARN: [$Path] invalid First value; fallback to $($resolved.First)." "DarkYellow"
     }
