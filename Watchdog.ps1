@@ -194,9 +194,6 @@ namespace WatchdogWin32
 
         [DllImport("user32.dll")]
         public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
-
-        [DllImport("user32.dll")]
-        public static extern short GetAsyncKeyState(int vKey);
     }
 }
 "@
@@ -783,9 +780,6 @@ function WdRepairWindowDisplayMode {
 
 # =================== 5.0 光标可见性管理 ===================
 $Script:CursorHiddenApplied = $false
-$Script:EscKeyPreviouslyDown = $false
-$Script:VK_ESCAPE = 0x1B
-$Script:KEYSTATE_DOWN_MASK = 0x8000
 
 function WdHideSystemCursor {
     if ($Script:CursorHiddenApplied) { return }
@@ -828,61 +822,6 @@ function WdRestoreSystemCursor {
     }
     catch {
         WdWriteLog "CURSOR: Failed to restore cursor - $($_.Exception.Message)" "DarkYellow"
-    }
-}
-
-function WdTestEscPressedGlobal {
-    try {
-        $keyState = [WatchdogWin32.DisplayAPI]::GetAsyncKeyState($Script:VK_ESCAPE)
-        # GetAsyncKeyState high bit (0x8000) set means the key is currently pressed.
-        $isDownNow = (($keyState -band $Script:KEYSTATE_DOWN_MASK) -ne 0)
-        $isNewPress = $isDownNow -and -not $Script:EscKeyPreviouslyDown
-        $Script:EscKeyPreviouslyDown = $isDownNow
-        return $isNewPress
-    }
-    catch {
-        return $false
-    }
-}
-
-function WdStopFullscreenTopmostTargets {
-    param(
-        [System.Collections.IDictionary]$AppsMap
-    )
-
-    foreach ($Path in $AppsMap.Keys) {
-        $Config = $AppsMap[$Path]
-        $isFullscreenTarget = $Config.ContainsKey("Fullscreen") -and [bool]$Config.Fullscreen
-        $isFocusTopTarget   = $Config.ContainsKey("FocusTop") -and [bool]$Config.FocusTop
-        if (-not $isFullscreenTarget -or -not $isFocusTopTarget) {
-            continue
-        }
-
-        $procs = WdGetTargetProcess -Path $Path
-        if (-not $procs) { continue }
-
-        $FileName = if (WdIsBrowserUrl -Path $Path) { $Path } else { [System.IO.Path]::GetFileName($Path) }
-        $procsArr = if ($procs -is [array]) { $procs } else { @($procs) }
-        foreach ($procItem in $procsArr) {
-            $targetId = 0
-            try {
-                if ($null -ne $procItem.Id) {
-                    $targetId = [int]$procItem.Id
-                }
-                elseif ($null -ne $procItem.ProcessId) {
-                    $targetId = [int]$procItem.ProcessId
-                }
-            }
-            catch {
-                $targetId = 0
-            }
-            if ($targetId -le 0) { continue }
-            WdStopProcessTreeSafe -ProcessId $targetId -KillTree $true
-            WdWriteLog "ESC-EXIT: Stopped fullscreen topmost target $FileName (PID:$targetId)." "Yellow"
-            if ($procItem -is [System.Diagnostics.Process]) {
-                try { $procItem.Dispose() } catch {}
-            }
-        }
     }
 }
 
@@ -1150,12 +1089,6 @@ try {
             WdCleanupRestartStats -Table $RestartStats -CurrentHour $CurrentHour
             WdCleanupRestartStats -Table $ThrottleWarned -CurrentHour $CurrentHour
 
-            if (WdTestEscPressedGlobal) {
-                WdWriteLog "ESC-EXIT: Detected global ESC. Stopping fullscreen topmost targets and exiting watchdog script." "Yellow"
-                WdStopFullscreenTopmostTargets -AppsMap $Apps
-                break
-            }
-
             if (WdTestDisableFlag) {
                 WdWriteLog "SAFE-MODE: Disable flag detected. Monitoring paused; no app will be launched or restarted." "Yellow"
                 $FirstRun = $false
@@ -1214,11 +1147,7 @@ try {
 
                 $hideCursor = $false
                 if ($Config.ContainsKey("HideCursor") -and $isExe) {
-                    $isFullscreenTarget = $Config.ContainsKey("Fullscreen") -and [bool]$Config.Fullscreen
-                    $isFocusTopTarget   = $Config.ContainsKey("FocusTop") -and [bool]$Config.FocusTop
-                    if ($isFullscreenTarget -and $isFocusTopTarget) {
-                        $hideCursor = [bool]$Config.HideCursor
-                    }
+                    $hideCursor = [bool]$Config.HideCursor
                 }
 
                 $procs     = WdGetTargetProcess -Path $Path
