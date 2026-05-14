@@ -98,6 +98,60 @@ $MatchFullPathForScripts = $true
 # 脚本类命令行匹配时是否需要严格引号边界（为兼容复杂场景默认 false）
 $StrictScriptPathBoundary = $false
 
+# =================== 1.5 Win32 / 时序常量 ===================
+# ShowWindow nCmdShow 命令
+$SW_RESTORE              = 9            # 若最小化则还原，否则激活并显示
+
+# SetWindowPos uFlags
+$SWP_NOSIZE              = 0x0001       # 保持当前大小
+$SWP_NOMOVE              = 0x0002       # 保持当前位置
+$SWP_NOZORDER            = 0x0004       # 保持当前 Z 序
+$SWP_FRAMECHANGED        = 0x0020       # 应用 SetWindowLong 的样式变更
+$SWP_SHOWWINDOW          = 0x0040       # 显示窗口
+$SWP_TOPMOST_FLAGS       = $SWP_NOSIZE -bor $SWP_NOMOVE   # 置顶/解除置顶时使用
+
+# SetWindowPos hWndInsertAfter 特殊句柄
+$HWND_TOP                = [IntPtr]::Zero   # Z 序最前（非置顶）
+$HWND_TOPMOST            = [IntPtr]-1       # 置顶（始终位于普通窗口之上）
+$HWND_NOTOPMOST          = [IntPtr]-2       # 解除置顶
+
+# GetWindowLong / SetWindowLong 索引
+$GWL_STYLE               = -16          # 窗口样式
+
+# 窗口样式位掩码
+$WS_CAPTION              = 0x00C00000   # 标题栏（含边框）
+$WS_THICKFRAME           = 0x00040000   # 可调大小边框
+$WS_SYSMENU              = 0x00080000   # 系统菜单
+$WS_MINIMIZEBOX          = 0x00020000   # 最小化按钮
+$WS_MAXIMIZEBOX          = 0x00010000   # 最大化按钮
+$WS_OVERLAPPEDWINDOW     = $WS_CAPTION -bor $WS_THICKFRAME -bor $WS_SYSMENU -bor $WS_MINIMIZEBOX -bor $WS_MAXIMIZEBOX
+
+# MonitorFromWindow dwFlags
+$MONITOR_NEAREST         = 0x00000002   # 返回与窗口距离最近的监视器
+
+# 键盘 / 鼠标事件常量
+$VK_MENU                 = 0x12         # Alt 键虚拟键码
+$KEYEVENTF_KEYUP         = 0x0002       # 键释放事件标志
+$MOUSEEVENTF_MOVE        = 0x0001       # 鼠标移动事件标志
+
+# 系统光标常量
+$OCR_NORMAL              = 32512        # 标准箭头光标资源 ID
+$SPI_SETCURSORS          = 0x0057       # SystemParametersInfo：重置光标方案
+$WD_CURSOR_SIZE          = 32           # 透明光标位图的宽高（像素，32x32）
+
+# 时序常量（毫秒）
+$WD_WINDOW_HANDLE_POLL_MS  = 100        # WdWaitForWindowHandle 的轮询间隔
+$WD_FOCUS_SETTLE_MS        = 150        # 置顶后等待窗口完成激活的延迟
+$WD_INITIAL_FOCUS_DELAY_MS = 500        # 进程启动后首次抢焦点前的等待时间
+
+# 全屏检测与窗口模式修复
+$WD_FULLSCREEN_TOLERANCE_PX = 4         # 全屏判定允许的像素误差
+$WD_WINDOWED_MAX_W       = 1280         # 窗口模式修复的最大默认宽度
+$WD_WINDOWED_MAX_H       = 720          # 窗口模式修复的最大默认高度
+$WD_WINDOWED_MIN_W       = 640          # 窗口模式修复的最小默认宽度
+$WD_WINDOWED_MIN_H       = 480          # 窗口模式修复的最小默认高度
+$WD_WINDOWED_MARGIN      = 100          # 窗口模式修复时距屏幕边缘的间距
+
 # =================== 2. 核心保护：防止 Watchdog 自身多开 ===================
 $Script:MutexOwned = $false
 $Script:Mutex = New-Object System.Threading.Mutex($false, "Global\WindowsWatchdogServiceMutex")
@@ -198,16 +252,22 @@ namespace WatchdogWin32
     }
 }
 "@
+    $_addTypeFailed = $false
     try {
         Add-Type -TypeDefinition $displayApiCode -Language CSharp -ErrorAction Stop
     }
     catch {
         Write-Host "FATAL: Failed to load Win32 API type: $($_.Exception.Message)"
-        if ($Script:MutexOwned) {
-            try { $Script:Mutex.ReleaseMutex() } catch {}
+        $_addTypeFailed = $true
+    }
+    finally {
+        if ($_addTypeFailed) {
+            if ($Script:MutexOwned) {
+                try { $Script:Mutex.ReleaseMutex() } catch {}
+            }
+            try { $Script:Mutex.Dispose() } catch {}
+            exit 1
         }
-        $Script:Mutex.Dispose()
-        exit 1
     }
 }
 
@@ -218,7 +278,7 @@ $Script:PathErrorLogged = @{}
 
 function WdOpenLogWriter {
     try {
-        $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+        $utf8Bom = WdGetUtf8BomEncoding
         $Script:LogWriter = New-Object System.IO.StreamWriter($LogPath, $true, $utf8Bom)
         $Script:LogWriter.AutoFlush = $true
     }
@@ -240,6 +300,24 @@ function WdCloseLogWriter {
 }
 
 # =================== 5. 辅助函数 ===================
+
+function WdGetUtf8BomEncoding {
+    return New-Object System.Text.UTF8Encoding($true)
+}
+
+function WdWriteProcessStartLog {
+    param(
+        [string]$FileName,
+        $Proc,
+        [string]$Details
+    )
+    if ($Proc) {
+        WdWriteLog "SUCCESS: Started $FileName PID=$($Proc.Id) ($Details)" "Green"
+    }
+    else {
+        WdWriteLog "SUCCESS: Started $FileName (PID unavailable) ($Details)" "Green"
+    }
+}
 
 function WdRotateLog {
     if (-not (Test-Path $LogPath)) { return }
@@ -265,7 +343,7 @@ function WdRotateLog {
 
         Move-Item $LogPath "${LogPath}.bak.1" -Force -ErrorAction Stop
 
-        $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+        $utf8Bom = WdGetUtf8BomEncoding
         [System.IO.File]::WriteAllText(
             $LogPath,
             "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] === Log rotated. Backup: ${LogPath}.bak.1 ===`r`n",
@@ -274,7 +352,7 @@ function WdRotateLog {
     }
     catch {
         try {
-            $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+            $utf8Bom = WdGetUtf8BomEncoding
             [System.IO.File]::WriteAllText(
                 $LogPath,
                 "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] === Log truncated (rotation failed: $($_.Exception.Message)) ===`r`n",
@@ -316,7 +394,7 @@ function WdWriteLog {
     }
 
     try {
-        $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+        $utf8Bom = WdGetUtf8BomEncoding
         [System.IO.File]::AppendAllText($LogPath, $Line + [Environment]::NewLine, $utf8Bom)
     }
     catch {}
@@ -662,9 +740,9 @@ function WdWaitForWindowHandle {
 
     $elapsed = 0
     while ($ProcessObj -and $ProcessObj.MainWindowHandle -eq [IntPtr]::Zero -and $elapsed -lt $TimeoutMs) {
-        Start-Sleep -Milliseconds 100
+        Start-Sleep -Milliseconds $WD_WINDOW_HANDLE_POLL_MS
         try { $ProcessObj.Refresh() } catch { break }
-        $elapsed += 100
+        $elapsed += $WD_WINDOW_HANDLE_POLL_MS
     }
 
     if ($ProcessObj) { return $ProcessObj.MainWindowHandle }
@@ -685,15 +763,6 @@ function WdSetWindowToForeground {
 
     if ($null -eq $ProcessObj) { return $false }
 
-    $HWND_TOPMOST      = [IntPtr]-1
-    $HWND_NOTOPMOST    = [IntPtr]-2
-    $SWP_NOSIZE        = 0x0001
-    $SWP_NOMOVE        = 0x0002
-    $TOPMOST_FLAGS     = $SWP_NOSIZE -bor $SWP_NOMOVE
-    $VK_MENU           = 0x12
-    $KEYEVENTF_KEYUP   = 0x0002
-    $MOUSEEVENTF_MOVE  = 0x0001
-
     $hwnd = WdWaitForWindowHandle -ProcessObj $ProcessObj
     if ($hwnd -eq [IntPtr]::Zero) { return $false }
 
@@ -713,12 +782,12 @@ function WdSetWindowToForeground {
         [WatchdogWin32.DisplayAPI]::keybd_event($VK_MENU, 0, 0, [UIntPtr]::Zero)
         [WatchdogWin32.DisplayAPI]::keybd_event($VK_MENU, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
 
-        [WatchdogWin32.DisplayAPI]::ShowWindow($hwnd, 9) | Out-Null
-        [WatchdogWin32.DisplayAPI]::SetWindowPos($hwnd, $HWND_TOPMOST, 0, 0, 0, 0, $TOPMOST_FLAGS) | Out-Null
+        [WatchdogWin32.DisplayAPI]::ShowWindow($hwnd, $SW_RESTORE) | Out-Null
+        [WatchdogWin32.DisplayAPI]::SetWindowPos($hwnd, $HWND_TOPMOST, 0, 0, 0, 0, $SWP_TOPMOST_FLAGS) | Out-Null
         [WatchdogWin32.DisplayAPI]::SetForegroundWindow($hwnd) | Out-Null
 
-        Start-Sleep -Milliseconds 150
-        [WatchdogWin32.DisplayAPI]::SetWindowPos($hwnd, $HWND_NOTOPMOST, 0, 0, 0, 0, $TOPMOST_FLAGS) | Out-Null
+        Start-Sleep -Milliseconds $WD_FOCUS_SETTLE_MS
+        [WatchdogWin32.DisplayAPI]::SetWindowPos($hwnd, $HWND_NOTOPMOST, 0, 0, 0, 0, $SWP_TOPMOST_FLAGS) | Out-Null
 
         $success = $true
     }
@@ -761,19 +830,6 @@ function WdRepairWindowDisplayMode {
         return
     }
 
-    $GWL_STYLE           = -16
-    $WS_CAPTION          = 0x00C00000
-    $WS_THICKFRAME       = 0x00040000
-    $WS_SYSMENU          = 0x00080000
-    $WS_MINIMIZEBOX      = 0x00020000
-    $WS_MAXIMIZEBOX      = 0x00010000
-    $WS_OVERLAPPEDWINDOW = $WS_CAPTION -bor $WS_THICKFRAME -bor $WS_SYSMENU -bor $WS_MINIMIZEBOX -bor $WS_MAXIMIZEBOX
-    $SWP_FRAMECHANGED    = 0x0020
-    $SWP_SHOWWINDOW      = 0x0040
-    $SWP_NOZORDER        = 0x0004
-    $MONITOR_NEAREST     = 0x00000002
-    $HWND_TOP            = [IntPtr]::Zero
-
     $winRect = New-Object WatchdogWin32.DisplayAPI+RECT
     [WatchdogWin32.DisplayAPI]::GetWindowRect($hwnd, [ref]$winRect) | Out-Null
 
@@ -788,10 +844,10 @@ function WdRepairWindowDisplayMode {
     $mHeight = $mi.rcMonitor.bottom - $mi.rcMonitor.top
 
     $isFullscreen = (
-        [Math]::Abs($winRect.left                     - $mLeft)   -le 4 -and
-        [Math]::Abs($winRect.top                      - $mTop)    -le 4 -and
-        [Math]::Abs(($winRect.right  - $winRect.left) - $mWidth)  -le 4 -and
-        [Math]::Abs(($winRect.bottom - $winRect.top)  - $mHeight) -le 4
+        [Math]::Abs($winRect.left                     - $mLeft)   -le $WD_FULLSCREEN_TOLERANCE_PX -and
+        [Math]::Abs($winRect.top                      - $mTop)    -le $WD_FULLSCREEN_TOLERANCE_PX -and
+        [Math]::Abs(($winRect.right  - $winRect.left) - $mWidth)  -le $WD_FULLSCREEN_TOLERANCE_PX -and
+        [Math]::Abs(($winRect.bottom - $winRect.top)  - $mHeight) -le $WD_FULLSCREEN_TOLERANCE_PX
     )
 
     if ($Fullscreen -and -not $isFullscreen) {
@@ -799,7 +855,7 @@ function WdRepairWindowDisplayMode {
         $curStyle = [WatchdogWin32.DisplayAPI]::GetWindowLong($hwnd, $GWL_STYLE)
         $newStyle = $curStyle -band (-bnot $WS_OVERLAPPEDWINDOW)
         [WatchdogWin32.DisplayAPI]::SetWindowLong($hwnd, $GWL_STYLE, $newStyle) | Out-Null
-        [WatchdogWin32.DisplayAPI]::ShowWindow($hwnd, 9) | Out-Null
+        [WatchdogWin32.DisplayAPI]::ShowWindow($hwnd, $SW_RESTORE) | Out-Null
         [WatchdogWin32.DisplayAPI]::SetWindowPos(
             $hwnd, $HWND_TOP,
             $mLeft, $mTop, $mWidth, $mHeight,
@@ -813,12 +869,12 @@ function WdRepairWindowDisplayMode {
         $newStyle = $curStyle -bor $WS_OVERLAPPEDWINDOW
         [WatchdogWin32.DisplayAPI]::SetWindowLong($hwnd, $GWL_STYLE, $newStyle) | Out-Null
 
-        $winW = [Math]::Min(1280, [Math]::Max(640, $mWidth - 100))
-        $winH = [Math]::Min(720,  [Math]::Max(480, $mHeight - 100))
+        $winW = [Math]::Min($WD_WINDOWED_MAX_W, [Math]::Max($WD_WINDOWED_MIN_W, $mWidth  - $WD_WINDOWED_MARGIN))
+        $winH = [Math]::Min($WD_WINDOWED_MAX_H, [Math]::Max($WD_WINDOWED_MIN_H, $mHeight - $WD_WINDOWED_MARGIN))
         $winX = $mLeft + [int](($mWidth  - $winW) / 2)
         $winY = $mTop  + [int](($mHeight - $winH) / 2)
 
-        [WatchdogWin32.DisplayAPI]::ShowWindow($hwnd, 9) | Out-Null
+        [WatchdogWin32.DisplayAPI]::ShowWindow($hwnd, $SW_RESTORE) | Out-Null
         [WatchdogWin32.DisplayAPI]::SetWindowPos(
             $hwnd, $HWND_TOP,
             $winX, $winY, $winW, $winH,
@@ -834,16 +890,13 @@ $Script:CursorHiddenApplied = $false
 function WdHideSystemCursor {
     if ($Script:CursorHiddenApplied) { return }
     try {
-        $OCR_NORMAL  = 32512
-        $curW        = 32
-        $curH        = 32
-        $planeSize   = $curW * [int]($curH / 8)  # bytes per bit-plane for 32x32
+        $planeSize = $WD_CURSOR_SIZE * [int]($WD_CURSOR_SIZE / 8)  # bytes per bit-plane
 
         $andPlane = New-Object byte[] $planeSize
         $xorPlane = New-Object byte[] $planeSize
         for ($i = 0; $i -lt $planeSize; $i++) { $andPlane[$i] = [byte]0xFF }
 
-        $hCursor = [WatchdogWin32.DisplayAPI]::CreateCursor([IntPtr]::Zero, 0, 0, $curW, $curH, $andPlane, $xorPlane)
+        $hCursor = [WatchdogWin32.DisplayAPI]::CreateCursor([IntPtr]::Zero, 0, 0, $WD_CURSOR_SIZE, $WD_CURSOR_SIZE, $andPlane, $xorPlane)
         if ($hCursor -ne [IntPtr]::Zero) {
             # SetSystemCursor takes ownership of hCursor on success; do not call DestroyCursor after that
             if ([WatchdogWin32.DisplayAPI]::SetSystemCursor($hCursor, $OCR_NORMAL)) {
@@ -865,7 +918,6 @@ function WdHideSystemCursor {
 function WdRestoreSystemCursor {
     if (-not $Script:CursorHiddenApplied) { return }
     try {
-        $SPI_SETCURSORS = 0x0057
         [WatchdogWin32.DisplayAPI]::SystemParametersInfo($SPI_SETCURSORS, 0, [IntPtr]::Zero, 0) | Out-Null
         $Script:CursorHiddenApplied = $false
         WdWriteLog "CURSOR: System cursor restored." "DarkGray"
@@ -947,20 +999,22 @@ function WdStartApp {
         $browserArgs += "`"$Path`""
         $argStr = $browserArgs -join " "
 
+        $proc = $null
+        $startSucceeded = $false
         try {
             WdWriteLog "START: Launching [$FileName] via [$browserExe] Args=[$argStr]" "DarkCyan"
             $proc = Start-Process -FilePath $browserExe -ArgumentList $argStr -PassThru -ErrorAction Stop
-            if ($proc) {
-                WdWriteLog "SUCCESS: Started $FileName PID=$($proc.Id) (Browser=$browserExe, Fullscreen=$Fullscreen)" "Green"
-            }
-            else {
-                WdWriteLog "SUCCESS: Started $FileName (PID unavailable) (Browser=$browserExe, Fullscreen=$Fullscreen)" "Green"
-            }
+            WdWriteProcessStartLog -FileName $FileName -Proc $proc `
+                -Details "Browser=$browserExe, Fullscreen=$Fullscreen"
+            $startSucceeded = $true
             return $proc
         }
         catch {
             WdWriteLog "FAILED: $FileName (browser) - $($_.Exception.Message)" "Red"
             return $null
+        }
+        finally {
+            if (-not $startSucceeded -and $proc) { try { $proc.Dispose() } catch {} }
         }
     }
 
@@ -979,6 +1033,8 @@ function WdStartApp {
     if ($Path.EndsWith(".bat", [System.StringComparison]::OrdinalIgnoreCase) -or
         $Path.EndsWith(".cmd", [System.StringComparison]::OrdinalIgnoreCase)) {
 
+        $proc = $null
+        $startSucceeded = $false
         try {
             $quotedPath = "`"$Path`""
             $argText    = if ([string]::IsNullOrWhiteSpace($Arguments)) { "" } else { " $Arguments" }
@@ -992,22 +1048,23 @@ function WdStartApp {
                 -EffectiveMode $effectiveMode `
                 -CommandPreview $cmdPreview
 
-            if ($proc) {
-                WdWriteLog "SUCCESS: Started $FileName PID=$($proc.Id) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
-            }
-            else {
-                WdWriteLog "SUCCESS: Started $FileName (PID unavailable) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
-            }
-
+            WdWriteProcessStartLog -FileName $FileName -Proc $proc `
+                -Details "Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen"
+            $startSucceeded = $true
             return $proc
         }
         catch {
             WdWriteLog "FAILED: $FileName - $($_.Exception.Message)" "Red"
             return $null
         }
+        finally {
+            if (-not $startSucceeded -and $proc) { try { $proc.Dispose() } catch {} }
+        }
     }
 
     if ($Path.EndsWith(".py", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $proc = $null
+        $startSucceeded = $false
         try {
             $pyExe  = WdGetPythonInterpreter -HideWindow:$HideWindow -PythonExe $PythonExe
             $pyArgs = if ([string]::IsNullOrWhiteSpace($Arguments)) {
@@ -1025,24 +1082,24 @@ function WdStartApp {
                 -EffectiveMode $effectiveMode `
                 -CommandPreview $cmdPreview
 
-            if ($proc) {
-                WdWriteLog "SUCCESS: Started $FileName PID=$($proc.Id) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
-            }
-            else {
-                WdWriteLog "SUCCESS: Started $FileName (PID unavailable) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
-            }
-
+            WdWriteProcessStartLog -FileName $FileName -Proc $proc `
+                -Details "Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen"
+            $startSucceeded = $true
             return $proc
         }
         catch {
             WdWriteLog "FAILED: $FileName - $($_.Exception.Message)" "Red"
             return $null
         }
+        finally {
+            if (-not $startSucceeded -and $proc) { try { $proc.Dispose() } catch {} }
+        }
     }
 
     $winStyle = if ($HideWindow) { 'Hidden' } else { 'Normal' }
 
     $proc = $null
+    $startSucceeded = $false
     try {
         $cmdLine = if ([string]::IsNullOrWhiteSpace($Arguments)) { $Path } else { "$Path $Arguments" }
         WdWriteLog "START: Launching [$FileName] CMD=[$cmdLine]" "DarkCyan"
@@ -1059,24 +1116,23 @@ function WdStartApp {
         }
         $proc = Start-Process @splat
 
-        if ($proc) {
-            WdWriteLog "SUCCESS: Started $FileName PID=$($proc.Id) (Hide=$HideWindow, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
-        }
-        else {
-            WdWriteLog "SUCCESS: Started $FileName (PID unavailable) (Hide=$HideWindow, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
-        }
+        WdWriteProcessStartLog -FileName $FileName -Proc $proc `
+            -Details "Hide=$HideWindow, FocusTop=$FocusTop, Fullscreen=$Fullscreen"
 
         if ($FocusTop -and -not $HideWindow -and $proc) {
-            Start-Sleep -Milliseconds 500
+            Start-Sleep -Milliseconds $WD_INITIAL_FOCUS_DELAY_MS
             [void](WdSetWindowToForeground -ProcessObj $proc)
         }
 
+        $startSucceeded = $true
         return $proc
     }
     catch {
         WdWriteLog "FAILED: $FileName - $($_.Exception.Message)" "Red"
-        if ($proc) { try { $proc.Dispose() } catch {} }
         return $null
+    }
+    finally {
+        if (-not $startSucceeded -and $proc) { try { $proc.Dispose() } catch {} }
     }
 }
 
@@ -1098,13 +1154,17 @@ function WdLaunchAndTrack {
         -PythonExe   ([string]$Config.PythonExe) `
         -ConsoleMode (WdGetConsoleMode -Config $Config) `
         -Browser     $BrowserName
-    if ($proc) {
-        $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
-        $LaunchTime[$Path] = Get-Date
-        $DisplayRepairDone[$Path] = $false
-        $HangFailCount[$Path] = 0
-        if ($IsOnce) { $RestartStats[$OnceKey] = $true }
-        try { $proc.Dispose() } catch {}
+    try {
+        if ($proc) {
+            $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
+            $LaunchTime[$Path] = Get-Date
+            $DisplayRepairDone[$Path] = $false
+            $HangFailCount[$Path] = 0
+            if ($IsOnce) { $RestartStats[$OnceKey] = $true }
+        }
+    }
+    finally {
+        if ($proc) { try { $proc.Dispose() } catch {} }
     }
 }
 
