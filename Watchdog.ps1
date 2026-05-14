@@ -466,8 +466,8 @@ function WdLoadAppsConfigFromText {
         WdWriteLog "CONFIG-WARN: Apps config evaluated to null; no targets will be monitored." "DarkYellow"
         return [ordered]@{}
     }
-    if (-not ($loaded -is [hashtable])) {
-        WdWriteLog "CONFIG-ERROR: Apps config root must be hashtable ([ordered]@{...}); actual type: $($loaded.GetType().FullName)." "Red"
+    if (-not ($loaded -is [System.Collections.IDictionary])) {
+        WdWriteLog "CONFIG-ERROR: Apps config root must be a dictionary (@{...} or [ordered]@{...}); actual type: $($loaded.GetType().FullName)." "Red"
         WdWriteLog "CONFIG-ERROR: Watchdog will continue with empty monitor list." "Red"
         return [ordered]@{}
     }
@@ -506,11 +506,11 @@ function WdResolveAppConfig {
     if ($null -eq $Config) {
         $rawConfig = @{}
     }
-    elseif ($Config -is [hashtable]) {
+    elseif ($Config -is [System.Collections.IDictionary]) {
         $rawConfig = $Config
     }
     else {
-        WdWriteLog "CONFIG-ERROR: [$Path] app config must be hashtable (@{...}); actual type: $($Config.GetType().FullName). Using defaults." "Red"
+        WdWriteLog "CONFIG-ERROR: [$Path] app config must be a dictionary (@{...} or [ordered]@{...}); actual type: $($Config.GetType().FullName). Using defaults." "Red"
         $rawConfig = @{}
     }
 
