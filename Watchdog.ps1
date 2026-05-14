@@ -1155,7 +1155,7 @@ try {
 
                 $disableReason = WdGetDisableReason
                 if ($disableReason) {
-                    WdUpdateDisableState -Reason $disableReason | Out-Null
+                    $null = WdUpdateDisableState -Reason $disableReason
                     break
                 }
 
