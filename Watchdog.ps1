@@ -163,10 +163,7 @@ namespace WatchdogWin32
         public static extern bool SetForegroundWindow(IntPtr hWnd);
 
         [DllImport("user32.dll")]
-        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr ProcessId);
-
-        [DllImport("user32.dll", EntryPoint="GetWindowThreadProcessId")]
-        public static extern uint GetWindowThreadProcessIdWithPid(IntPtr hWnd, out uint processId);
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
         [DllImport("kernel32.dll")]
         public static extern uint GetCurrentThreadId();
@@ -642,7 +639,7 @@ function WdGetForegroundProcessId {
         if ($hwnd -eq [IntPtr]::Zero) { return 0 }
 
         [uint32]$processId = 0
-        [void][WatchdogWin32.DisplayAPI]::GetWindowThreadProcessIdWithPid($hwnd, [ref]$processId)
+        [void][WatchdogWin32.DisplayAPI]::GetWindowThreadProcessId($hwnd, [ref]$processId)
         return [int]$processId
     }
     catch {
@@ -671,7 +668,6 @@ function WdInvokeManualExitShutdown {
     }
     try { WdRestoreSystemCursor } catch {}
     $Script:ShutdownRequested = $true
-    $Script:ManualExitTargets = @{}
 }
 
 function WdPollManualExitHotkeys {
@@ -685,7 +681,7 @@ function WdPollManualExitHotkeys {
 
     $foregroundPid = WdGetForegroundProcessId
     $targetKey = [string]$foregroundPid
-    if ($foregroundPid -le 0 -or -not $Script:ManualExitTargets.ContainsKey($targetKey)) {
+    if ($foregroundPid -eq 0 -or -not $Script:ManualExitTargets.ContainsKey($targetKey)) {
         $Script:ManualExitKeyState["Esc"] = $false
         $Script:ManualExitKeyState["AltF4"] = $false
         return $false
@@ -698,7 +694,7 @@ function WdPollManualExitHotkeys {
 
     if ($escDown -and -not $Script:ManualExitKeyState["Esc"]) {
         WdInvokeManualExitShutdown -Target $Script:ManualExitTargets[$targetKey] -Reason "Esc"
-        $Script:ManualExitKeyState["Esc"] = $true
+        $Script:ManualExitKeyState["Esc"] = $escDown
         $Script:ManualExitKeyState["AltF4"] = $altF4Down
         return $true
     }
@@ -706,7 +702,7 @@ function WdPollManualExitHotkeys {
     if ($altF4Down -and -not $Script:ManualExitKeyState["AltF4"]) {
         WdInvokeManualExitShutdown -Target $Script:ManualExitTargets[$targetKey] -Reason "Alt+F4"
         $Script:ManualExitKeyState["Esc"] = $escDown
-        $Script:ManualExitKeyState["AltF4"] = $true
+        $Script:ManualExitKeyState["AltF4"] = $altF4Down
         return $true
     }
 
@@ -737,6 +733,16 @@ function WdWaitInterruptible {
     return (-not $Script:ShutdownRequested)
 }
 
+function WdShouldMonitorManualExit {
+    param(
+        [bool]$FocusTop,
+        [bool]$HideWindow,
+        [bool]$IsExe
+    )
+
+    return ($FocusTop -and -not $HideWindow -and $IsExe)
+}
+
 function WdSetWindowToForeground {
     param($ProcessObj)
 
@@ -757,7 +763,8 @@ function WdSetWindowToForeground {
     if (WdIsWindowForeground -Hwnd $hwnd) { return $true }
 
     $currentThreadId = [WatchdogWin32.DisplayAPI]::GetCurrentThreadId()
-    $targetThreadId  = [WatchdogWin32.DisplayAPI]::GetWindowThreadProcessId($hwnd, [IntPtr]::Zero)
+    [uint32]$windowProcessId = 0
+    $targetThreadId  = [WatchdogWin32.DisplayAPI]::GetWindowThreadProcessId($hwnd, [ref]$windowProcessId)
     $attached = $false
     $success  = $false
 
@@ -1441,7 +1448,7 @@ try {
                             }
                         }
 
-                        if ([bool]$Config.FocusTop -and -not [bool]$Config.HideWindow -and $isExe) {
+                        if (WdShouldMonitorManualExit -FocusTop ([bool]$Config.FocusTop) -HideWindow ([bool]$Config.HideWindow) -IsExe $isExe) {
                             $activeManualExitTargets[[string]$TargetID] = @{
                                 ProcessId = [int]$TargetID
                                 FileName  = $FileName
