@@ -672,11 +672,15 @@ function WdInvokeManualExitShutdown {
 }
 
 function WdPollManualExitHotkeys {
+    $VK_ESCAPE = 0x1B
+    $VK_MENU   = 0x12
+    $VK_F4     = 0x73
+
     if ($Script:ShutdownRequested) { return $true }
 
     if (-not $Script:ManualExitTargets -or $Script:ManualExitTargets.Count -eq 0) {
         $Script:ManualExitKeyState["Esc"] = $false
-        $Script:ManualExitKeyState["AltF4"] = $false
+        $Script:ManualExitKeyState["AltPlusF4"] = $false
         return $false
     }
 
@@ -684,31 +688,31 @@ function WdPollManualExitHotkeys {
     $targetKey = [string]$foregroundPid
     if ($foregroundPid -eq 0 -or -not $Script:ManualExitTargets.ContainsKey($targetKey)) {
         $Script:ManualExitKeyState["Esc"] = $false
-        $Script:ManualExitKeyState["AltF4"] = $false
+        $Script:ManualExitKeyState["AltPlusF4"] = $false
         return $false
     }
 
-    $escDown = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0)
-    $altDown = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState(0x12) -band 0x8000) -ne 0)
-    $f4Down  = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState(0x73) -band 0x8000) -ne 0)
+    $escDown = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_ESCAPE) -band 0x8000) -ne 0)
+    $altDown = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_MENU) -band 0x8000) -ne 0)
+    $f4Down  = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_F4) -band 0x8000) -ne 0)
     $altF4Down = ($altDown -and $f4Down)
 
     if ($escDown -and -not $Script:ManualExitKeyState["Esc"]) {
         WdInvokeManualExitShutdown -Target $Script:ManualExitTargets[$targetKey] -Reason "Esc"
         $Script:ManualExitKeyState["Esc"] = $escDown
-        $Script:ManualExitKeyState["AltF4"] = $altF4Down
+        $Script:ManualExitKeyState["AltPlusF4"] = $altF4Down
         return $true
     }
 
-    if ($altF4Down -and -not $Script:ManualExitKeyState["AltF4"]) {
+    if ($altF4Down -and -not $Script:ManualExitKeyState["AltPlusF4"]) {
         WdInvokeManualExitShutdown -Target $Script:ManualExitTargets[$targetKey] -Reason "Alt+F4"
         $Script:ManualExitKeyState["Esc"] = $escDown
-        $Script:ManualExitKeyState["AltF4"] = $altF4Down
+        $Script:ManualExitKeyState["AltPlusF4"] = $altF4Down
         return $true
     }
 
     $Script:ManualExitKeyState["Esc"] = $escDown
-    $Script:ManualExitKeyState["AltF4"] = $altF4Down
+    $Script:ManualExitKeyState["AltPlusF4"] = $altF4Down
     return $false
 }
 
@@ -721,7 +725,7 @@ function WdWaitInterruptible {
         return (-not $Script:ShutdownRequested)
     }
 
-    [int64]$remainingMs = [Math]::Max([int64]0, ([int64]$Seconds * 1000))
+    [int64]$remainingMs = [Math]::Max([int64]0, ([int64]$Seconds * [int64]1000))
     while ($remainingMs -gt 0) {
         if ($Script:ShutdownRequested) { return $false }
 
@@ -1198,7 +1202,7 @@ $Script:ShutdownRequested = $false
 $Script:ManualExitTargets = @{}
 $Script:ManualExitKeyState = @{
     Esc = $false
-    AltF4 = $false
+    AltPlusF4 = $false
 }
 
 # =================== 7. 主循环 ===================
