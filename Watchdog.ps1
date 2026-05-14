@@ -428,6 +428,42 @@ function WdCleanupRestartStats {
     }
 }
 
+function WdNewProcessSnapshot {
+    param(
+        [bool]$IncludeCimProcesses = $true
+    )
+
+    $snapshot = @{
+        Processes = @()
+        CimProcesses = @()
+    }
+
+    $snapshot.Processes = WdGetProcessListSnapshot
+
+    if ($IncludeCimProcesses) {
+        try {
+            $snapshot.CimProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+        }
+        catch {}
+    }
+
+    return $snapshot
+}
+
+function WdGetProcessListSnapshot {
+    try {
+        return @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{
+                ProcessId = $_.Id
+                Path      = if ($_.Path) { WdNormalizePathSafe $_.Path } else { $null }
+            }
+        })
+    }
+    catch {
+        return @()
+    }
+}
+
 function WdLoadAppsConfigFromText {
     param([string]$ConfigText)
 
@@ -692,16 +728,23 @@ function WdIsScriptPathInCommandLine {
 
 function WdGetTargetProcess {
     param(
-        [string]$Path
+        [string]$Path,
+        [hashtable]$ProcessSnapshot = $null
     )
 
     $CurrentPID     = [System.Diagnostics.Process]::GetCurrentProcess().Id
     $NormalizedPath = WdNormalizePathSafe $Path
+    $processes      = if ($ProcessSnapshot -and $ProcessSnapshot.ContainsKey('Processes')) { $ProcessSnapshot.Processes } else { $null }
+    $cimProcesses   = if ($ProcessSnapshot -and $ProcessSnapshot.ContainsKey('CimProcesses')) { $ProcessSnapshot.CimProcesses } else { $null }
 
     if (WdIsBrowserUrl -Path $Path) {
         $profileBase = Join-Path $WatchdogRoot "browser_profiles"
         $profileDir  = (Join-Path $profileBase (WdSanitizeForPath -Url $Path)).ToLowerInvariant()
-        return Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        if ($null -eq $cimProcesses) {
+            $cimProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+        }
+
+        return $cimProcesses | Where-Object {
             $procName = $_.Name.ToLowerInvariant() -replace '\.exe$', ''
             $cmdLine  = if ($_.CommandLine) { $_.CommandLine.ToLowerInvariant() } else { "" }
             $_.ProcessId -ne $CurrentPID -and
@@ -713,8 +756,12 @@ function WdGetTargetProcess {
 
     try {
         if ($Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
-            return Get-Process -ErrorAction SilentlyContinue | Where-Object {
-                $_.Id -ne $CurrentPID -and $_.Path -and (WdNormalizePathSafe $_.Path) -eq $NormalizedPath
+            if ($null -eq $processes) {
+                $processes = WdGetProcessListSnapshot
+            }
+
+            return $processes | Where-Object {
+                $_.ProcessId -ne $CurrentPID -and $_.Path -and $_.Path -eq $NormalizedPath
             }
         }
         else {
@@ -729,9 +776,16 @@ function WdGetTargetProcess {
                 "powershell"
             }
 
-            $wmiFilter = "Name like '$SearchName%'"
-            $candidates = Get-CimInstance Win32_Process -Filter $wmiFilter -ErrorAction SilentlyContinue |
-                Where-Object { $_.ProcessId -ne $CurrentPID }
+            if ($null -eq $cimProcesses) {
+                $wmiFilter = "Name like '$SearchName%'"
+                $candidates = @(Get-CimInstance Win32_Process -Filter $wmiFilter -ErrorAction SilentlyContinue |
+                    Where-Object { $_.ProcessId -ne $CurrentPID })
+            }
+            else {
+                $candidates = @($cimProcesses | Where-Object {
+                    $_.ProcessId -ne $CurrentPID -and $_.Name -like "$SearchName*"
+                })
+            }
 
             if ($MatchFullPathForScripts) {
                 return $candidates | Where-Object {
@@ -1194,6 +1248,33 @@ function Start-App { return WdStartApp @PSBoundParameters }
 WdEnsureDirectory -Path $WatchdogRoot
 WdOpenLogWriter
 $Apps = WdLoadAppsConfigFromText -ConfigText $AppsConfigText
+$MonitoredApps = @(
+    foreach ($Path in $Apps.Keys) {
+        $Config = WdResolveAppConfig -Path $Path -Config $Apps[$Path]
+        if (WdIsBrowserUrl -Path $Path) {
+            try { $FileName = "[$(([System.Uri]$Path).Host)]" }
+            catch {
+                WdWriteLog "WARN: Could not parse URL [$Path] as URI; using raw string as display name." "DarkYellow"
+                $FileName = $Path
+            }
+        }
+        else {
+            $FileName = [System.IO.Path]::GetFileName($Path)
+        }
+
+        [pscustomobject]@{
+            Path               = $Path
+            Config             = $Config
+            FileName           = $FileName
+            IsExe              = $Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)
+            IsUrl              = WdIsBrowserUrl -Path $Path
+            AllowMultiInstance = [bool]$Config.AllowMultiInstance
+            KillTreeOnHang     = [bool]$Config.KillTreeOnHang
+            BrowserName        = [string]$Config.Browser
+        }
+    }
+)
+$NeedsCimProcessSnapshot = @($MonitoredApps | Where-Object { -not $_.IsExe }).Count -gt 0
 
 WdWriteLog "=== Watchdog Service Active (Monitor Count: $($Apps.Count)) ===" "Yellow"
 if ($Apps.Count -eq 0) {
@@ -1225,6 +1306,7 @@ try {
             $CurrentHour = (Get-Date).Hour
             WdCleanupRestartStats -Table $RestartStats -CurrentHour $CurrentHour
             WdCleanupRestartStats -Table $ThrottleWarned -CurrentHour $CurrentHour
+            $ProcessSnapshot = WdNewProcessSnapshot -IncludeCimProcesses:$NeedsCimProcessSnapshot
 
             if (WdTestDisableFlag) {
                 WdWriteLog "SAFE-MODE: Disable flag detected. Monitoring paused; no app will be launched or restarted." "Yellow"
@@ -1233,20 +1315,12 @@ try {
                 continue
             }
 
-            foreach ($Path in $Apps.Keys) {
-                $Config   = WdResolveAppConfig -Path $Path -Config $Apps[$Path]
-                if (WdIsBrowserUrl -Path $Path) {
-                    try { $FileName = "[$(([System.Uri]$Path).Host)]" }
-                    catch {
-                        WdWriteLog "WARN: Could not parse URL [$Path] as URI; using raw string as display name." "DarkYellow"
-                        $FileName = $Path
-                    }
-                }
-                else {
-                    $FileName = [System.IO.Path]::GetFileName($Path)
-                }
-                $isExe    = $Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)
-                $isUrl    = WdIsBrowserUrl -Path $Path
+            foreach ($App in $MonitoredApps) {
+                $Path     = $App.Path
+                $Config   = $App.Config
+                $FileName = $App.FileName
+                $isExe    = $App.IsExe
+                $isUrl    = $App.IsUrl
 
                 $StatKey  = "${Path}::H${CurrentHour}"
                 $OnceKey  = "${Path}::Once"
@@ -1261,12 +1335,11 @@ try {
                     continue
                 }
 
-                $allowMultiInstance = [bool]$Config.AllowMultiInstance
-                $killTreeOnHang = [bool]$Config.KillTreeOnHang
-                $browserName = [string]$Config.Browser
-                $minUpSeconds = [int]$Config.MinUpSeconds
+                $allowMultiInstance = $App.AllowMultiInstance
+                $killTreeOnHang = $App.KillTreeOnHang
+                $browserName = $App.BrowserName
 
-                $procs     = WdGetTargetProcess -Path $Path
+                $procs     = WdGetTargetProcess -Path $Path -ProcessSnapshot $ProcessSnapshot
                 $procCount = if ($procs -is [array]) { $procs.Count } elseif ($procs) { 1 } else { 0 }
 
                 if ($procCount -eq 0) {
