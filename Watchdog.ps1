@@ -423,6 +423,52 @@ function WdResolveConsoleMode {
     return $mode
 }
 
+function WdStartByConsoleMode {
+    param(
+        [string]$LaunchPath,
+        [string]$LaunchArgs,
+        [string]$WorkingDirectory,
+        [string]$FileName,
+        [string]$EffectiveMode,
+        [string]$CommandPreview
+    )
+
+    $modeLower = if ([string]::IsNullOrWhiteSpace($EffectiveMode)) {
+        "auto"
+    }
+    else {
+        $EffectiveMode.Trim().ToLowerInvariant()
+    }
+
+    if ($modeLower -eq "hidden") {
+        WdWriteLog "START: Launching [$FileName] hidden CMD=[$CommandPreview]" "DarkCyan"
+        return Start-Process -FilePath $LaunchPath `
+            -ArgumentList $LaunchArgs `
+            -WorkingDirectory $WorkingDirectory `
+            -WindowStyle Hidden `
+            -PassThru
+    }
+
+    switch ($modeLower) {
+        "shared" {
+            WdWriteLog "START: Launching [$FileName] in shared console CMD=[$CommandPreview]" "DarkCyan"
+            return Start-Process -FilePath $LaunchPath `
+                -ArgumentList $LaunchArgs `
+                -WorkingDirectory $WorkingDirectory `
+                -NoNewWindow `
+                -PassThru
+        }
+        default {
+            $modeText = if ($modeLower -eq "new") { "new console" } else { "auto mode" }
+            WdWriteLog "START: Launching [$FileName] in $modeText CMD=[$CommandPreview]" "DarkCyan"
+            return Start-Process -FilePath $LaunchPath `
+                -ArgumentList $LaunchArgs `
+                -WorkingDirectory $WorkingDirectory `
+                -PassThru
+        }
+    }
+}
+
 function WdIsScriptPathInCommandLine {
     param(
         [string]$CommandLine,
@@ -819,45 +865,15 @@ function WdStartApp {
         try {
             $quotedPath = "`"$Path`""
             $argText    = if ([string]::IsNullOrWhiteSpace($Arguments)) { "" } else { " $Arguments" }
-
-            if ($effectiveMode -eq "Hidden") {
-                $cmdArgs = "/c $quotedPath$argText"
-                WdWriteLog "START: Launching [$FileName] hidden CMD=[cmd.exe $cmdArgs]" "DarkCyan"
-                $proc = Start-Process -FilePath "cmd.exe" `
-                    -ArgumentList $cmdArgs `
-                    -WorkingDirectory $Dir `
-                    -WindowStyle Hidden `
-                    -PassThru
-            }
-            else {
-                switch ($effectiveMode.ToLowerInvariant()) {
-                    "shared" {
-                        $cmdArgs = "/c $quotedPath$argText"
-                        WdWriteLog "START: Launching [$FileName] in shared console CMD=[cmd.exe $cmdArgs]" "DarkCyan"
-                        $proc = Start-Process -FilePath "cmd.exe" `
-                            -ArgumentList $cmdArgs `
-                            -WorkingDirectory $Dir `
-                            -NoNewWindow `
-                            -PassThru
-                    }
-                    "new" {
-                        $cmdArgs = "/c $quotedPath$argText"
-                        WdWriteLog "START: Launching [$FileName] in new console CMD=[cmd.exe $cmdArgs]" "DarkCyan"
-                        $proc = Start-Process -FilePath "cmd.exe" `
-                            -ArgumentList $cmdArgs `
-                            -WorkingDirectory $Dir `
-                            -PassThru
-                    }
-                    default {
-                        $cmdArgs = "/c $quotedPath$argText"
-                        WdWriteLog "START: Launching [$FileName] in auto mode CMD=[cmd.exe $cmdArgs]" "DarkCyan"
-                        $proc = Start-Process -FilePath "cmd.exe" `
-                            -ArgumentList $cmdArgs `
-                            -WorkingDirectory $Dir `
-                            -PassThru
-                    }
-                }
-            }
+            $cmdArgs = "/c $quotedPath$argText"
+            $cmdPreview = "cmd.exe $cmdArgs"
+            $proc = WdStartByConsoleMode `
+                -LaunchPath "cmd.exe" `
+                -LaunchArgs $cmdArgs `
+                -WorkingDirectory $Dir `
+                -FileName $FileName `
+                -EffectiveMode $effectiveMode `
+                -CommandPreview $cmdPreview
 
             if ($proc) {
                 WdWriteLog "SUCCESS: Started $FileName PID=$($proc.Id) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
@@ -883,41 +899,14 @@ function WdStartApp {
             else {
                 "`"$Path`" $Arguments"
             }
-
-            if ($effectiveMode -eq "Hidden") {
-                WdWriteLog "START: Launching [$FileName] hidden CMD=[$pyExe $pyArgs]" "DarkCyan"
-                $proc = Start-Process -FilePath $pyExe `
-                    -ArgumentList $pyArgs `
-                    -WorkingDirectory $Dir `
-                    -WindowStyle Hidden `
-                    -PassThru
-            }
-            else {
-                switch ($effectiveMode.ToLowerInvariant()) {
-                    "shared" {
-                        WdWriteLog "START: Launching [$FileName] in shared console CMD=[$pyExe $pyArgs]" "DarkCyan"
-                        $proc = Start-Process -FilePath $pyExe `
-                            -ArgumentList $pyArgs `
-                            -WorkingDirectory $Dir `
-                            -NoNewWindow `
-                            -PassThru
-                    }
-                    "new" {
-                        WdWriteLog "START: Launching [$FileName] in new console CMD=[$pyExe $pyArgs]" "DarkCyan"
-                        $proc = Start-Process -FilePath $pyExe `
-                            -ArgumentList $pyArgs `
-                            -WorkingDirectory $Dir `
-                            -PassThru
-                    }
-                    default {
-                        WdWriteLog "START: Launching [$FileName] in auto mode CMD=[$pyExe $pyArgs]" "DarkCyan"
-                        $proc = Start-Process -FilePath $pyExe `
-                            -ArgumentList $pyArgs `
-                            -WorkingDirectory $Dir `
-                            -PassThru
-                    }
-                }
-            }
+            $cmdPreview = "$pyExe $pyArgs"
+            $proc = WdStartByConsoleMode `
+                -LaunchPath $pyExe `
+                -LaunchArgs $pyArgs `
+                -WorkingDirectory $Dir `
+                -FileName $FileName `
+                -EffectiveMode $effectiveMode `
+                -CommandPreview $cmdPreview
 
             if ($proc) {
                 WdWriteLog "SUCCESS: Started $FileName PID=$($proc.Id) (Hide=$HideWindow, ConsoleMode=$effectiveMode, FocusTop=$FocusTop, Fullscreen=$Fullscreen)" "Green"
