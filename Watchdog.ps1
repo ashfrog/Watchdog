@@ -700,19 +700,22 @@ function WdPollManualExitHotkeys {
     $altDown = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_MENU) -band 0x8000) -ne 0)
     $f4Down  = (([WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_F4) -band 0x8000) -ne 0)
     $altF4Down = ($altDown -and $f4Down)
+    $escWasDown = [bool]$Script:ManualExitKeyState["Esc"]
+    $altF4WasDown = [bool]$Script:ManualExitKeyState["Alt+F4"]
 
-    if ($escDown -and -not $Script:ManualExitKeyState["Esc"]) {
+    $Script:ManualExitKeyState["Esc"] = $escDown
+    $Script:ManualExitKeyState["Alt+F4"] = $altF4Down
+
+    if ($escDown -and -not $escWasDown) {
         WdInvokeManualExitShutdown -Target $Script:ManualExitTargets[$targetKey] -Reason "Esc"
         return $true
     }
 
-    if ($altF4Down -and -not $Script:ManualExitKeyState["Alt+F4"]) {
+    if ($altF4Down -and -not $altF4WasDown) {
         WdInvokeManualExitShutdown -Target $Script:ManualExitTargets[$targetKey] -Reason "Alt+F4"
         return $true
     }
 
-    $Script:ManualExitKeyState["Esc"] = $escDown
-    $Script:ManualExitKeyState["Alt+F4"] = $altF4Down
     return $false
 }
 
@@ -729,11 +732,11 @@ function WdWaitInterruptible {
         return (-not $Script:ShutdownRequested)
     }
 
-    [int64]$remainingMs = [int64]$Seconds * [int64]$MillisecondsPerSecond
+    [int64]$remainingMs = $Seconds * $MillisecondsPerSecond
     while ($remainingMs -gt 0) {
         if ($Script:ShutdownRequested) { return $false }
 
-        $chunkMs = [int][Math]::Min([int64]$HotkeyPollIntervalMs, $remainingMs)
+        $chunkMs = [int][Math]::Min($HotkeyPollIntervalMs, $remainingMs)
         Start-Sleep -Milliseconds $chunkMs
         [void](WdPollManualExitHotkeys)
         $remainingMs -= $chunkMs
