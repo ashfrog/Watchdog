@@ -39,29 +39,59 @@
 #   每个 URL 使用独立的浏览器 Profile（存于 $WatchdogRoot\browser_profiles\），
 #   进程检测仅匹配该 Profile 的主进程，不会误杀子渲染进程。
 
-$Apps = [ordered]@{
+$AppsConfigText = @'
+[ordered]@{
     "https://www.baidu.com" = @{
-        First = 1; Restart = 5; Arguments = ""
-        Once = $false; HideWindow = $false; FocusTop = $true
-        Fullscreen = $true; ForceDisplayMode = $true; PythonExe = ""
-        ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
-        MinUpSeconds = 15; Browser = "auto"
+        First = 1
+        Restart = 5
+        Arguments = ""
+        Once = 0
+        HideWindow = 0
+        FocusTop = 1
+        Fullscreen = 1
+        ForceDisplayMode = 1
+        PythonExe = ""
+        ConsoleMode = "Auto"
+        AllowMultiInstance = 0
+        KillTreeOnHang = 1
+        MinUpSeconds = 15
+        Browser = "auto"
     }
     # "C:\Scripts\test.bat" = @{
-    #     First = 1; Restart = 5; Arguments = ""
-    #     Once = $false; HideWindow = $false; FocusTop = $false
-    #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = ""
-    #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
-    #     MinUpSeconds = 3; Browser = "auto"
+    #     First = 1
+    #     Restart = 5
+    #     Arguments = ""
+    #     Once = 0
+    #     HideWindow = 0
+    #     FocusTop = 0
+    #     Fullscreen = 0
+    #     ForceDisplayMode = 0
+    #     PythonExe = ""
+    #     ConsoleMode = "New"
+    #     AllowMultiInstance = 0
+    #     KillTreeOnHang = 1
+    #     MinUpSeconds = 3
+    #     Browser = "auto"
     # }
     # "C:\Scripts\main.py" = @{
-    #     First = 1; Restart = 10; Arguments = ""
-    #     Once = $false; HideWindow = $false; FocusTop = $false
-    #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = "C:\Python311\python.exe"
-    #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
-    #     MinUpSeconds = 5; Browser = "auto"
+    #     First = 1
+    #     Restart = 10
+    #     Arguments = ""
+    #     Once = 0
+    #     HideWindow = 0
+    #     FocusTop = 0
+    #     Fullscreen = 0
+    #     ForceDisplayMode = 0
+    #     PythonExe = "C:\Python311\python.exe"
+    #     ConsoleMode = "New"
+    #     AllowMultiInstance = 0
+    #     KillTreeOnHang = 1
+    #     MinUpSeconds = 5
+    #     Browser = "auto"
     # }
 }
+'@
+$Apps = [ordered]@{}
 
 # =================== 1. 全局配置 ===================
 $WatchdogRoot    = "C:\Watchdog"
@@ -350,7 +380,7 @@ function WdNormalizeBool {
         "no"    { return $false }
         default {
             if (-not [string]::IsNullOrWhiteSpace($FieldName)) {
-                WdWriteLog "CONFIG-WARN: [$AppPath] '$FieldName' has unrecognized value '$Value'; using default ($Default). 请使用 1/0、true/false 或 `$true/`$false。" "DarkYellow"
+                WdWriteLog "CONFIG-WARN: [$AppPath] '$FieldName' has unrecognized value '$Value'; using default ($Default). Use 1/0, true/false, or `$true/`$false." "DarkYellow"
             }
             return $Default
         }
@@ -398,6 +428,53 @@ function WdCleanupRestartStats {
     }
 }
 
+function WdLoadAppsConfigFromText {
+    param([string]$ConfigText)
+
+    if ([string]::IsNullOrWhiteSpace($ConfigText)) {
+        WdWriteLog "CONFIG-WARN: Apps config text is empty; no targets will be monitored." "DarkYellow"
+        return [ordered]@{}
+    }
+
+    $tokens = $null
+    $errors = $null
+    [System.Management.Automation.Language.Parser]::ParseInput($ConfigText, [ref]$tokens, [ref]$errors) | Out-Null
+    if ($errors.Count -gt 0) {
+        $lines = $ConfigText -split "`r?`n"
+        foreach ($e in $errors) {
+            $line = $e.Extent.StartLineNumber
+            $col  = $e.Extent.StartColumnNumber
+            WdWriteLog "CONFIG-ERROR: Apps config syntax error at line $line, col ${col}: $($e.Message)" "Red"
+            if ($line -ge 1 -and $line -le $lines.Count) {
+                WdWriteLog "CONFIG-ERROR: line $line => $($lines[$line - 1])" "Red"
+            }
+        }
+        WdWriteLog "CONFIG-ERROR: Apps config is invalid; watchdog will continue with empty monitor list." "Red"
+        return [ordered]@{}
+    }
+
+    try {
+        $loaded = & ([scriptblock]::Create($ConfigText))
+    }
+    catch {
+        WdWriteLog "CONFIG-ERROR: Failed to evaluate apps config: $($_.Exception.Message)" "Red"
+        WdWriteLog "CONFIG-ERROR: Watchdog will continue with empty monitor list." "Red"
+        return [ordered]@{}
+    }
+
+    if ($null -eq $loaded) {
+        WdWriteLog "CONFIG-WARN: Apps config evaluated to null; no targets will be monitored." "DarkYellow"
+        return [ordered]@{}
+    }
+    if (-not ($loaded -is [hashtable])) {
+        WdWriteLog "CONFIG-ERROR: Apps config root must be hashtable ([ordered]@{...}); actual type: $($loaded.GetType().FullName)." "Red"
+        WdWriteLog "CONFIG-ERROR: Watchdog will continue with empty monitor list." "Red"
+        return [ordered]@{}
+    }
+
+    return $loaded
+}
+
 $Script:AppConfigDefaults = [ordered]@{
     First              = 1
     Restart            = 5
@@ -423,10 +500,26 @@ $Script:AppConfigMin = [ordered]@{
 function WdResolveAppConfig {
     param(
         [string]$Path,
-        [hashtable]$Config
+        $Config
     )
 
-    $rawConfig = if ($null -eq $Config) { @{} } else { $Config }
+    if ($null -eq $Config) {
+        $rawConfig = @{}
+    }
+    elseif ($Config -is [hashtable]) {
+        $rawConfig = $Config
+    }
+    else {
+        WdWriteLog "CONFIG-ERROR: [$Path] app config must be hashtable (@{...}); actual type: $($Config.GetType().FullName). Using defaults." "Red"
+        $rawConfig = @{}
+    }
+
+    foreach ($rawKey in @($rawConfig.Keys)) {
+        if (-not $Script:AppConfigDefaults.Contains($rawKey)) {
+            WdWriteLog "CONFIG-WARN: [$Path] unknown config key '$rawKey'; this key will be ignored." "DarkYellow"
+        }
+    }
+
     $resolved = [ordered]@{}
     foreach ($key in $Script:AppConfigDefaults.Keys) {
         $resolved[$key] = if ($rawConfig.ContainsKey($key)) { $rawConfig[$key] } else { $Script:AppConfigDefaults[$key] }
@@ -1100,8 +1193,12 @@ function Start-App { return WdStartApp @PSBoundParameters }
 # =================== 6. 初始化 ===================
 WdEnsureDirectory -Path $WatchdogRoot
 WdOpenLogWriter
+$Apps = WdLoadAppsConfigFromText -ConfigText $AppsConfigText
 
 WdWriteLog "=== Watchdog Service Active (Monitor Count: $($Apps.Count)) ===" "Yellow"
+if ($Apps.Count -eq 0) {
+    WdWriteLog "CONFIG-WARN: Monitor list is empty. Please check Apps config." "DarkYellow"
+}
 WdWriteLog "INFO: Disable flag path = $DisableFlag" "DarkGray"
 WdWriteLog "INFO: Check interval = $CheckInterval sec, Max retry/hour = $MaxRetryInHour" "DarkGray"
 WdWriteLog "INFO: Log max size = ${MaxLogSizeMB}MB, Backups = $MaxLogBackups" "DarkGray"
