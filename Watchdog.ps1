@@ -1415,13 +1415,14 @@ try {
                 }
             }
 
-            $FirstRun = $false
-
             $disableReason = WdGetDisableReason
             if (WdUpdateDisableState -Reason $disableReason) {
+                $FirstRun = $false
                 Start-Sleep -Seconds $CheckInterval
                 continue
             }
+
+            $FirstRun = $false
 
             if ($anyCursorHideNeeded) {
                 WdHideSystemCursor
