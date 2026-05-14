@@ -784,6 +784,8 @@ function WdRepairWindowDisplayMode {
 # =================== 5.0 光标可见性管理 ===================
 $Script:CursorHiddenApplied = $false
 $Script:EscKeyPreviouslyDown = $false
+$Script:VK_ESCAPE = 0x1B
+$Script:KEYSTATE_DOWN_MASK = 0x8000
 
 function WdHideSystemCursor {
     if ($Script:CursorHiddenApplied) { return }
@@ -831,9 +833,9 @@ function WdRestoreSystemCursor {
 
 function WdTestEscPressedGlobal {
     try {
-        $VK_ESCAPE = 0x1B
-        $keyState = [WatchdogWin32.DisplayAPI]::GetAsyncKeyState($VK_ESCAPE)
-        $isDownNow = (($keyState -band 0x8000) -ne 0)
+        $keyState = [WatchdogWin32.DisplayAPI]::GetAsyncKeyState($Script:VK_ESCAPE)
+        # GetAsyncKeyState 高位（0x8000）为 1 表示按键当前处于按下状态
+        $isDownNow = (($keyState -band $Script:KEYSTATE_DOWN_MASK) -ne 0)
         $isNewPress = $isDownNow -and -not $Script:EscKeyPreviouslyDown
         $Script:EscKeyPreviouslyDown = $isDownNow
         return $isNewPress
@@ -850,7 +852,9 @@ function WdStopFullscreenTopmostTargets {
 
     foreach ($Path in $AppsMap.Keys) {
         $Config = $AppsMap[$Path]
-        if (-not [bool]$Config.Fullscreen -or -not [bool]$Config.FocusTop) {
+        $isFullscreenTarget = $Config.ContainsKey("Fullscreen") -and [bool]$Config.Fullscreen
+        $isFocusTopTarget   = $Config.ContainsKey("FocusTop") -and [bool]$Config.FocusTop
+        if (-not $isFullscreenTarget -or -not $isFocusTopTarget) {
             continue
         }
 
@@ -1197,8 +1201,12 @@ try {
                 }
 
                 $hideCursor = $false
-                if ($Config.ContainsKey("HideCursor") -and $isExe -and [bool]$Config.Fullscreen -and [bool]$Config.FocusTop) {
-                    $hideCursor = [bool]$Config.HideCursor
+                if ($Config.ContainsKey("HideCursor") -and $isExe) {
+                    $isFullscreenTarget = $Config.ContainsKey("Fullscreen") -and [bool]$Config.Fullscreen
+                    $isFocusTopTarget   = $Config.ContainsKey("FocusTop") -and [bool]$Config.FocusTop
+                    if ($isFullscreenTarget -and $isFocusTopTarget) {
+                        $hideCursor = [bool]$Config.HideCursor
+                    }
                 }
 
                 $procs     = WdGetTargetProcess -Path $Path
