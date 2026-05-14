@@ -438,15 +438,7 @@ function WdNewProcessSnapshot {
         CimProcesses = @()
     }
 
-    try {
-        $snapshot.Processes = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
-            [pscustomobject]@{
-                ProcessId = $_.Id
-                Path      = if ($_.Path) { WdNormalizePathSafe $_.Path } else { $null }
-            }
-        })
-    }
-    catch {}
+    $snapshot.Processes = WdGetProcessListSnapshot
 
     if ($IncludeCimProcesses) {
         try {
@@ -456,6 +448,20 @@ function WdNewProcessSnapshot {
     }
 
     return $snapshot
+}
+
+function WdGetProcessListSnapshot {
+    try {
+        return @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{
+                ProcessId = $_.Id
+                Path      = if ($_.Path) { WdNormalizePathSafe $_.Path } else { $null }
+            }
+        })
+    }
+    catch {
+        return @()
+    }
 }
 
 function WdLoadAppsConfigFromText {
@@ -751,12 +757,7 @@ function WdGetTargetProcess {
     try {
         if ($Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
             if ($null -eq $processes) {
-                $processes = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
-                    [pscustomobject]@{
-                        ProcessId = $_.Id
-                        Path      = if ($_.Path) { WdNormalizePathSafe $_.Path } else { $null }
-                    }
-                })
+                $processes = WdGetProcessListSnapshot
             }
 
             return $processes | Where-Object {
