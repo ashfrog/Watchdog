@@ -168,6 +168,47 @@ if (-not $Script:MutexOwned) {
     exit 1
 }
 
+# =================== 2.5 退出清理钩子 ===================
+$Script:ShutdownCleanupDone = $false
+
+function WdInvokeShutdownCleanup {
+    if ($Script:ShutdownCleanupDone) { return }
+    $Script:ShutdownCleanupDone = $true
+
+    # 恢复系统光标（若之前被隐藏）
+    try {
+        if (Get-Command WdRestoreSystemCursor -ErrorAction SilentlyContinue) {
+            WdRestoreSystemCursor
+        }
+    }
+    catch {}
+
+    # 关闭日志写入器
+    try {
+        if (Get-Command WdCloseLogWriter -ErrorAction SilentlyContinue) {
+            WdCloseLogWriter
+        }
+    }
+    catch {}
+
+    # 释放单实例互斥体
+    try {
+        if ($Script:Mutex) {
+            if ($Script:MutexOwned) {
+                try { $Script:Mutex.ReleaseMutex() } catch {}
+                $Script:MutexOwned = $false
+            }
+            try { $Script:Mutex.Dispose() } catch {}
+            $Script:Mutex = $null
+        }
+    }
+    catch {}
+}
+
+Register-EngineEvent PowerShell.Exiting -Action {
+    try { WdInvokeShutdownCleanup } catch {}
+} -SupportEvent | Out-Null
+
 # =================== 3. 全局 Win32 API 注入 ===================
 if (-not ([System.Management.Automation.PSTypeName]'WatchdogWin32.DisplayAPI').Type) {
     $displayApiCode = @"
@@ -262,10 +303,7 @@ namespace WatchdogWin32
     }
     finally {
         if ($_addTypeFailed) {
-            if ($Script:MutexOwned) {
-                try { $Script:Mutex.ReleaseMutex() } catch {}
-            }
-            try { $Script:Mutex.Dispose() } catch {}
+            try { WdInvokeShutdownCleanup } catch {}
             exit 1
         }
     }
