@@ -67,15 +67,15 @@ $Apps = [ordered]@{
 }
 
 # =================== 1. 全局配置 ===================
-$WatchdogRoot    = "C:\Watchdog"
-$LogPath         = Join-Path $WatchdogRoot "watchdog_log.txt"
-$DisableFlag     = Join-Path $WatchdogRoot "disable.flag"
+$WatchdogRoot = "C:\Watchdog"
+$LogPath = Join-Path $WatchdogRoot "watchdog_log.txt"
+$DisableFlag = Join-Path $WatchdogRoot "disable.flag"
 
-$MaxLogSizeMB    = 10
-$MaxLogBackups   = 3
-$CheckInterval   = 3
-$MaxRetryInHour  = 10
-$GCCollectEvery  = 100
+$MaxLogSizeMB = 10
+$MaxLogBackups = 3
+$CheckInterval = 3
+$MaxRetryInHour = 10
+$GCCollectEvery = 100
 
 # 连续 N 次检测到不响应后才执行挂死重启，避免偶发卡顿触发误重启
 $HangConsecutiveFailuresToRestart = 3
@@ -100,57 +100,57 @@ $StrictScriptPathBoundary = $false
 
 # =================== 1.5 Win32 / 时序常量 ===================
 # ShowWindow nCmdShow 命令
-$SW_RESTORE              = 9            # 若最小化则还原，否则激活并显示
+$SW_RESTORE = 9            # 若最小化则还原，否则激活并显示
 
 # SetWindowPos uFlags
-$SWP_NOSIZE              = 0x0001       # 保持当前大小
-$SWP_NOMOVE              = 0x0002       # 保持当前位置
-$SWP_NOZORDER            = 0x0004       # 保持当前 Z 序
-$SWP_FRAMECHANGED        = 0x0020       # 应用 SetWindowLong 的样式变更
-$SWP_SHOWWINDOW          = 0x0040       # 显示窗口
-$SWP_TOPMOST_FLAGS       = $SWP_NOSIZE -bor $SWP_NOMOVE   # 置顶/解除置顶时使用
+$SWP_NOSIZE = 0x0001       # 保持当前大小
+$SWP_NOMOVE = 0x0002       # 保持当前位置
+$SWP_NOZORDER = 0x0004       # 保持当前 Z 序
+$SWP_FRAMECHANGED = 0x0020       # 应用 SetWindowLong 的样式变更
+$SWP_SHOWWINDOW = 0x0040       # 显示窗口
+$SWP_TOPMOST_FLAGS = $SWP_NOSIZE -bor $SWP_NOMOVE   # 置顶/解除置顶时使用
 
 # SetWindowPos hWndInsertAfter 特殊句柄
-$HWND_TOP                = [IntPtr]::Zero   # Z 序最前（非置顶）
-$HWND_TOPMOST            = [IntPtr]-1       # 置顶（始终位于普通窗口之上）
-$HWND_NOTOPMOST          = [IntPtr]-2       # 解除置顶
+$HWND_TOP = [IntPtr]::Zero   # Z 序最前（非置顶）
+$HWND_TOPMOST = [IntPtr]-1       # 置顶（始终位于普通窗口之上）
+$HWND_NOTOPMOST = [IntPtr]-2       # 解除置顶
 
 # GetWindowLong / SetWindowLong 索引
-$GWL_STYLE               = -16          # 窗口样式
+$GWL_STYLE = -16          # 窗口样式
 
 # 窗口样式位掩码
-$WS_CAPTION              = 0x00C00000   # 标题栏（含边框）
-$WS_THICKFRAME           = 0x00040000   # 可调大小边框
-$WS_SYSMENU              = 0x00080000   # 系统菜单
-$WS_MINIMIZEBOX          = 0x00020000   # 最小化按钮
-$WS_MAXIMIZEBOX          = 0x00010000   # 最大化按钮
-$WS_OVERLAPPEDWINDOW     = $WS_CAPTION -bor $WS_THICKFRAME -bor $WS_SYSMENU -bor $WS_MINIMIZEBOX -bor $WS_MAXIMIZEBOX
+$WS_CAPTION = 0x00C00000   # 标题栏（含边框）
+$WS_THICKFRAME = 0x00040000   # 可调大小边框
+$WS_SYSMENU = 0x00080000   # 系统菜单
+$WS_MINIMIZEBOX = 0x00020000   # 最小化按钮
+$WS_MAXIMIZEBOX = 0x00010000   # 最大化按钮
+$WS_OVERLAPPEDWINDOW = $WS_CAPTION -bor $WS_THICKFRAME -bor $WS_SYSMENU -bor $WS_MINIMIZEBOX -bor $WS_MAXIMIZEBOX
 
 # MonitorFromWindow dwFlags
-$MONITOR_NEAREST         = 0x00000002   # 返回与窗口距离最近的监视器
+$MONITOR_NEAREST = 0x00000002   # 返回与窗口距离最近的监视器
 
 # 键盘 / 鼠标事件常量
-$VK_MENU                 = 0x12         # Alt 键虚拟键码
-$KEYEVENTF_KEYUP         = 0x0002       # 键释放事件标志
-$MOUSEEVENTF_MOVE        = 0x0001       # 鼠标移动事件标志
+$VK_MENU = 0x12         # Alt 键虚拟键码
+$KEYEVENTF_KEYUP = 0x0002       # 键释放事件标志
+$MOUSEEVENTF_MOVE = 0x0001       # 鼠标移动事件标志
 
 # 系统光标常量
-$OCR_NORMAL              = 32512        # 标准箭头光标资源 ID
-$SPI_SETCURSORS          = 0x0057       # SystemParametersInfo：重置光标方案
-$WD_CURSOR_SIZE          = 32           # 透明光标位图的宽高（像素，32x32）
+$OCR_NORMAL = 32512        # 标准箭头光标资源 ID
+$SPI_SETCURSORS = 0x0057       # SystemParametersInfo：重置光标方案
+$WD_CURSOR_SIZE = 32           # 透明光标位图的宽高（像素，32x32）
 
 # 时序常量（毫秒）
-$WD_WINDOW_HANDLE_POLL_MS  = 100        # WdWaitForWindowHandle 的轮询间隔
-$WD_FOCUS_SETTLE_MS        = 150        # 置顶后等待窗口完成激活的延迟
+$WD_WINDOW_HANDLE_POLL_MS = 100        # WdWaitForWindowHandle 的轮询间隔
+$WD_FOCUS_SETTLE_MS = 150        # 置顶后等待窗口完成激活的延迟
 $WD_INITIAL_FOCUS_DELAY_MS = 500        # 进程启动后首次抢焦点前的等待时间
 
 # 全屏检测与窗口模式修复
 $WD_FULLSCREEN_TOLERANCE_PX = 4         # 全屏判定允许的像素误差
-$WD_WINDOWED_MAX_W       = 1280         # 窗口模式修复的最大默认宽度
-$WD_WINDOWED_MAX_H       = 720          # 窗口模式修复的最大默认高度
-$WD_WINDOWED_MIN_W       = 640          # 窗口模式修复的最小默认宽度
-$WD_WINDOWED_MIN_H       = 480          # 窗口模式修复的最小默认高度
-$WD_WINDOWED_MARGIN      = 100          # 窗口模式修复时距屏幕边缘的间距
+$WD_WINDOWED_MAX_W = 1280         # 窗口模式修复的最大默认宽度
+$WD_WINDOWED_MAX_H = 720          # 窗口模式修复的最大默认高度
+$WD_WINDOWED_MIN_W = 640          # 窗口模式修复的最小默认宽度
+$WD_WINDOWED_MIN_H = 480          # 窗口模式修复的最小默认高度
+$WD_WINDOWED_MARGIN = 100          # 窗口模式修复时距屏幕边缘的间距
 
 # =================== 2. 核心保护：防止 Watchdog 自身多开 ===================
 $Script:MutexOwned = $false
@@ -418,7 +418,7 @@ function WdWriteLog {
     )
 
     $Stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $Line  = "[$Stamp] $Message"
+    $Line = "[$Stamp] $Message"
 
     try {
         Write-Host $Line -ForegroundColor $Color
@@ -663,15 +663,15 @@ function WdGetTargetProcess {
         [string]$Path
     )
 
-    $CurrentPID     = [System.Diagnostics.Process]::GetCurrentProcess().Id
+    $CurrentPID = [System.Diagnostics.Process]::GetCurrentProcess().Id
     $NormalizedPath = WdNormalizePathSafe $Path
 
     if (WdIsBrowserUrl -Path $Path) {
         $profileBase = Join-Path $WatchdogRoot "browser_profiles"
-        $profileDir  = (Join-Path $profileBase (WdSanitizeForPath -Url $Path)).ToLowerInvariant()
+        $profileDir = (Join-Path $profileBase (WdSanitizeForPath -Url $Path)).ToLowerInvariant()
         return Get-CimInstance Win32_Process -Filter "Name='chrome.exe' OR Name='msedge.exe'" -ErrorAction SilentlyContinue | Where-Object {
             $procName = $_.Name.ToLowerInvariant() -replace '\.exe$', ''
-            $cmdLine  = if ($_.CommandLine) { $_.CommandLine.ToLowerInvariant() } else { "" }
+            $cmdLine = if ($_.CommandLine) { $_.CommandLine.ToLowerInvariant() } else { "" }
             $_.ProcessId -ne $CurrentPID -and
             ($procName -eq "chrome" -or $procName -eq "msedge") -and
             $cmdLine.Contains($profileDir) -and
@@ -691,7 +691,7 @@ function WdGetTargetProcess {
                 "python"
             }
             elseif ($Path.EndsWith(".bat", [System.StringComparison]::OrdinalIgnoreCase) -or
-                    $Path.EndsWith(".cmd", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $Path.EndsWith(".cmd", [System.StringComparison]::OrdinalIgnoreCase)) {
                 "cmd"
             }
             else {
@@ -700,7 +700,7 @@ function WdGetTargetProcess {
 
             $wmiFilter = "Name like '$SearchName%'"
             $candidates = Get-CimInstance Win32_Process -Filter $wmiFilter -ErrorAction SilentlyContinue |
-                Where-Object { $_.ProcessId -ne $CurrentPID }
+            Where-Object { $_.ProcessId -ne $CurrentPID }
 
             if ($MatchFullPathForScripts) {
                 return $candidates | Where-Object {
@@ -735,11 +735,11 @@ function WdSanitizeForPath {
         return $Script:SanitizeForPathCache[$Url]
     }
     # Use truncated human-readable prefix + 8-char MD5 suffix to guarantee uniqueness
-    $md5    = [System.Security.Cryptography.MD5]::Create()
-    $hash   = ($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Url)) |
-               ForEach-Object { $_.ToString("x2") }) -join ''
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    $hash = ($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Url)) |
+        ForEach-Object { $_.ToString("x2") }) -join ''
     $md5.Dispose()
-    $short  = $hash.Substring(0, 8)
+    $short = $hash.Substring(0, 8)
     $prefix = ($Url -replace '^https?://', '' -replace '[^\w\-.]', '_')
     if ($prefix.Length -gt 40) { $prefix = $prefix.Substring(0, 40) }
     $result = "${prefix}_${short}"
@@ -772,7 +772,7 @@ function WdResolveBrowserExe {
     }
     # auto: prefer Chrome, fall back to Edge
     foreach ($p in $chromePaths) { if (Test-Path $p) { return $p } }
-    foreach ($p in $edgePaths)   { if (Test-Path $p) { return $p } }
+    foreach ($p in $edgePaths) { if (Test-Path $p) { return $p } }
     return "chrome.exe"
 }
 
@@ -813,9 +813,9 @@ function WdSetWindowToForeground {
     if (WdIsWindowForeground -Hwnd $hwnd) { return $true }
 
     $currentThreadId = [WatchdogWin32.DisplayAPI]::GetCurrentThreadId()
-    $targetThreadId  = [WatchdogWin32.DisplayAPI]::GetWindowThreadProcessId($hwnd, [IntPtr]::Zero)
+    $targetThreadId = [WatchdogWin32.DisplayAPI]::GetWindowThreadProcessId($hwnd, [IntPtr]::Zero)
     $attached = $false
-    $success  = $false
+    $success = $false
 
     try {
         if ($currentThreadId -ne $targetThreadId -and $targetThreadId -ne 0) {
@@ -878,20 +878,20 @@ function WdRepairWindowDisplayMode {
     [WatchdogWin32.DisplayAPI]::GetWindowRect($hwnd, [ref]$winRect) | Out-Null
 
     $hMonitor = [WatchdogWin32.DisplayAPI]::MonitorFromWindow($hwnd, $MONITOR_NEAREST)
-    $mi       = New-Object WatchdogWin32.DisplayAPI+MONITORINFO
+    $mi = New-Object WatchdogWin32.DisplayAPI+MONITORINFO
     $mi.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($mi)
     [WatchdogWin32.DisplayAPI]::GetMonitorInfo($hMonitor, [ref]$mi) | Out-Null
 
-    $mLeft   = $mi.rcMonitor.left
-    $mTop    = $mi.rcMonitor.top
-    $mWidth  = $mi.rcMonitor.right  - $mi.rcMonitor.left
+    $mLeft = $mi.rcMonitor.left
+    $mTop = $mi.rcMonitor.top
+    $mWidth = $mi.rcMonitor.right - $mi.rcMonitor.left
     $mHeight = $mi.rcMonitor.bottom - $mi.rcMonitor.top
 
     $isFullscreen = (
-        [Math]::Abs($winRect.left                     - $mLeft)   -le $WD_FULLSCREEN_TOLERANCE_PX -and
-        [Math]::Abs($winRect.top                      - $mTop)    -le $WD_FULLSCREEN_TOLERANCE_PX -and
-        [Math]::Abs(($winRect.right  - $winRect.left) - $mWidth)  -le $WD_FULLSCREEN_TOLERANCE_PX -and
-        [Math]::Abs(($winRect.bottom - $winRect.top)  - $mHeight) -le $WD_FULLSCREEN_TOLERANCE_PX
+        [Math]::Abs($winRect.left - $mLeft) -le $WD_FULLSCREEN_TOLERANCE_PX -and
+        [Math]::Abs($winRect.top - $mTop) -le $WD_FULLSCREEN_TOLERANCE_PX -and
+        [Math]::Abs(($winRect.right - $winRect.left) - $mWidth) -le $WD_FULLSCREEN_TOLERANCE_PX -and
+        [Math]::Abs(($winRect.bottom - $winRect.top) - $mHeight) -le $WD_FULLSCREEN_TOLERANCE_PX
     )
 
     if ($Fullscreen -and -not $isFullscreen) {
@@ -913,10 +913,10 @@ function WdRepairWindowDisplayMode {
         $newStyle = $curStyle -bor $WS_OVERLAPPEDWINDOW
         [WatchdogWin32.DisplayAPI]::SetWindowLong($hwnd, $GWL_STYLE, $newStyle) | Out-Null
 
-        $winW = [Math]::Min($WD_WINDOWED_MAX_W, [Math]::Max($WD_WINDOWED_MIN_W, $mWidth  - $WD_WINDOWED_MARGIN))
+        $winW = [Math]::Min($WD_WINDOWED_MAX_W, [Math]::Max($WD_WINDOWED_MIN_W, $mWidth - $WD_WINDOWED_MARGIN))
         $winH = [Math]::Min($WD_WINDOWED_MAX_H, [Math]::Max($WD_WINDOWED_MIN_H, $mHeight - $WD_WINDOWED_MARGIN))
-        $winX = $mLeft + [int](($mWidth  - $winW) / 2)
-        $winY = $mTop  + [int](($mHeight - $winH) / 2)
+        $winX = $mLeft + [int](($mWidth - $winW) / 2)
+        $winY = $mTop + [int](($mHeight - $winH) / 2)
 
         [WatchdogWin32.DisplayAPI]::ShowWindow($hwnd, $SW_RESTORE) | Out-Null
         [WatchdogWin32.DisplayAPI]::SetWindowPos(
@@ -1021,9 +1021,9 @@ function WdStartApp {
 
     # ---- 网页 URL 处理 ----
     if (WdIsBrowserUrl -Path $Path) {
-        $browserExe  = WdResolveBrowserExe -Browser $Browser
+        $browserExe = WdResolveBrowserExe -Browser $Browser
         $profileBase = Join-Path $WatchdogRoot "browser_profiles"
-        $profileDir  = Join-Path $profileBase (WdSanitizeForPath -Url $Path)
+        $profileDir = Join-Path $profileBase (WdSanitizeForPath -Url $Path)
 
         $browserArgs = @(
             "--user-data-dir=`"$profileDir`"",
@@ -1081,7 +1081,7 @@ function WdStartApp {
         $startSucceeded = $false
         try {
             $quotedPath = "`"$Path`""
-            $argText    = if ([string]::IsNullOrWhiteSpace($Arguments)) { "" } else { " $Arguments" }
+            $argText = if ([string]::IsNullOrWhiteSpace($Arguments)) { "" } else { " $Arguments" }
             $cmdArgs = "/c $quotedPath$argText"
             $cmdPreview = "cmd.exe $cmdArgs"
             $proc = WdStartByConsoleMode `
@@ -1110,7 +1110,7 @@ function WdStartApp {
         $proc = $null
         $startSucceeded = $false
         try {
-            $pyExe  = WdGetPythonInterpreter -HideWindow:$HideWindow -PythonExe $PythonExe
+            $pyExe = WdGetPythonInterpreter -HideWindow:$HideWindow -PythonExe $PythonExe
             $pyArgs = if ([string]::IsNullOrWhiteSpace($Arguments)) {
                 "`"$Path`""
             }
@@ -1247,17 +1247,17 @@ WdWriteLog "INFO: GC collect every $GCCollectEvery iterations (~$($GCCollectEver
 WdWriteLog "INFO: Min restart gap = $MinRestartGapSeconds sec, Display loop repair = $DisplayLoopRepair" "DarkGray"
 WdWriteLog "INFO: Hang restart threshold = $HangConsecutiveFailuresToRestart consecutive failures" "DarkGray"
 
-$FirstRun          = $true
-$RestartStats      = @{}
-$LaunchTime        = @{}
+$FirstRun = $true
+$RestartStats = @{}
+$LaunchTime = @{}
 $DisplayRepairDone = @{}
-$FocusLastTime     = @{}
-$LastStartAttempt  = @{}
-$ThrottleWarned    = @{}
-$MissingLogged     = @{}
-$HangFailCount     = @{}
-$ScheduledLaunch   = @{}   # Path -> [DateTime] of next permitted launch attempt
-$Script:GCCounter  = 0
+$FocusLastTime = @{}
+$LastStartAttempt = @{}
+$ThrottleWarned = @{}
+$MissingLogged = @{}
+$HangFailCount = @{}
+$ScheduledLaunch = @{}   # Path -> [DateTime] of next permitted launch attempt
+$Script:GCCounter = 0
 
 # =================== 7. 主循环 ===================
 try {
@@ -1279,7 +1279,7 @@ try {
             $anyCursorHideNeeded = $false
             $monitoringPaused = $false
             foreach ($Path in $Apps.Keys) {
-                $Config   = $Apps[$Path]
+                $Config = $Apps[$Path]
                 if (WdIsBrowserUrl -Path $Path) {
                     try { $FileName = "[$(([System.Uri]$Path).Host)]" }
                     catch {
@@ -1290,11 +1290,11 @@ try {
                 else {
                     $FileName = [System.IO.Path]::GetFileName($Path)
                 }
-                $isExe    = $Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)
-                $isUrl    = WdIsBrowserUrl -Path $Path
+                $isExe = $Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)
+                $isUrl = WdIsBrowserUrl -Path $Path
 
-                $StatKey  = "${Path}::H${CurrentHour}"
-                $OnceKey  = "${Path}::Once"
+                $StatKey = "${Path}::H${CurrentHour}"
+                $OnceKey = "${Path}::Once"
 
                 WdInitializeCounter -Table $RestartStats -Key $StatKey -DefaultValue 0
 
@@ -1313,14 +1313,14 @@ try {
                 }
 
                 $allowMultiInstance = if ($Config.ContainsKey("AllowMultiInstance")) { [bool]$Config.AllowMultiInstance } else { $false }
-                $killTreeOnHang     = if ($Config.ContainsKey("KillTreeOnHang"))     { [bool]$Config.KillTreeOnHang }     else { $true }
-                $browserName        = if ($Config.ContainsKey("Browser") -and
+                $killTreeOnHang = if ($Config.ContainsKey("KillTreeOnHang")) { [bool]$Config.KillTreeOnHang }     else { $true }
+                $browserName = if ($Config.ContainsKey("Browser") -and
                     -not [string]::IsNullOrWhiteSpace([string]$Config.Browser)) { [string]$Config.Browser } else { "auto" }
-                $minUpSeconds       = if ($Config.ContainsKey("MinUpSeconds") -and
+                $minUpSeconds = if ($Config.ContainsKey("MinUpSeconds") -and
                     $null -ne $Config.MinUpSeconds) { [Math]::Max(1, [int]$Config.MinUpSeconds) } else { 5 }
-                $hideCursor         = if ($Config.ContainsKey("HideCursor") -and $isExe) { [bool]$Config.HideCursor } else { $false }
+                $hideCursor = if ($Config.ContainsKey("HideCursor") -and $isExe) { [bool]$Config.HideCursor } else { $false }
 
-                $procs     = WdGetTargetProcess -Path $Path
+                $procs = WdGetTargetProcess -Path $Path
                 $procCount = if ($procs -is [array]) { $procs.Count } elseif ($procs) { 1 } else { 0 }
 
                 if ($procCount -eq 0) {
@@ -1467,7 +1467,8 @@ try {
                                 if ($fgHwnd -ne [IntPtr]::Zero -and (WdIsWindowForeground -Hwnd $fgHwnd)) {
                                     # Already in foreground; reset cooldown to skip redundant attempts
                                     $FocusLastTime[$Path] = Get-Date
-                                } elseif (WdSetWindowToForeground -ProcessObj $mainProc) {
+                                }
+                                elseif (WdSetWindowToForeground -ProcessObj $mainProc) {
                                     $FocusLastTime[$Path] = Get-Date
                                     WdWriteLog "FOCUS: Brought $FileName (PID:$TargetID) to foreground." "DarkCyan"
                                 }
@@ -1514,7 +1515,8 @@ try {
 
             if ($anyCursorHideNeeded) {
                 WdHideSystemCursor
-            } else {
+            }
+            else {
                 WdRestoreSystemCursor
             }
 
