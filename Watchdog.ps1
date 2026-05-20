@@ -10,7 +10,7 @@
 #   创建文件 C:\Watchdog\disable.flag
 #   或直接打开任务管理器
 #   Watchdog 检测到后将停止拉起目标程序，仅记录日志
-#
+# 权限问题powershell管理员方式运行 Set-ExecutionPolicy RemoteSigned
 # 启动程序列表字段说明：
 # First:              首次启动延迟秒数
 # Restart:            异常重启前等待秒数
