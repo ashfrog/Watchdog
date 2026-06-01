@@ -1,10 +1,29 @@
-﻿# Watchdog (Production Hardened)
-# 编码要求：UTF-8 with BOM
-#
+﻿# powershell权限问题 先运行一次（管理员方式） Set-ExecutionPolicy Unrestricted -Scope CurrentUser
+
 # 配置无桌面启动：Win + R -> regedit
 # 路径：HKEY_CURRENT_USER\Software\Microsoft\Windows NT\CurrentVersion\Winlogon
 # 键名：Shell (右键新建 字符串值)
 # 数值：powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Watchdog\watchdog.ps1"
+# 也可创建快捷方式保留桌面环境： 将数值填入目标
+
+$Apps = [ordered]@{
+    "M:\GitHub\MediaPlay\MediaPlayerAVProUtil_water\Release\ADIENT.exe" = @{
+        First = 1; Restart = 5; Arguments = ""
+        Once = $false; HideWindow = $false; FocusTop = $true
+        Fullscreen = $true; ForceDisplayMode = $true; PythonExe = ""
+        ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
+        MinUpSeconds = 15; Browser = "auto"; HideCursor = $false
+        RestartOnDisplayChange = $true
+    }
+    # "C:\Scripts\main.py" = @{
+    #     First = 1; Restart = 10; Arguments = ""
+    #     Once = $false; HideWindow = $false; FocusTop = $false
+    #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = "C:\Python311\python.exe"
+    #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
+    #     MinUpSeconds = 5; Browser = "auto"; HideCursor = $false
+    #     RestartOnDisplayChange = $false
+    # }
+}
 #
 # 紧急停用：
 #   创建文件 C:\Watchdog\disable.flag
@@ -38,40 +57,6 @@
 #                     	auto=自动检测（优先 Chrome，其次 Edge）
 #                     	chrome=Google Chrome
 #                     	msedge=Microsoft Edge
-#
-# 【网页 URL 支持】
-#   将 http:// 或 https:// 开头的 URL 作为 Key，Watchdog 会通过 Chrome/Edge 打开并持续守护。
-#   Fullscreen=$true 时以 --kiosk 模式启动（真正无边框全屏），$false 时最大化窗口。
-#   每个 URL 使用独立的浏览器 Profile（存于 $WatchdogRoot\browser_profiles\），
-#   进程检测仅匹配该 Profile 的主进程，不会误杀子渲染进程。
-
-$Apps = [ordered]@{
-    "M:\GitHub\MediaPlay\MediaPlayerAVProUtil_water\Release\ADIENT.exe" = @{
-        First = 1; Restart = 5; Arguments = ""
-        Once = $false; HideWindow = $false; FocusTop = $true
-        Fullscreen = $true; ForceDisplayMode = $true; PythonExe = ""
-        ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
-        MinUpSeconds = 15; Browser = "auto"; HideCursor = $false
-        RestartOnDisplayChange = $true
-    }
-    # "C:\Scripts\test.bat" = @{
-    #     First = 1; Restart = 5; Arguments = ""
-    #     Once = $false; HideWindow = $false; FocusTop = $false
-    #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = ""
-    #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
-    #     MinUpSeconds = 3; Browser = "auto"; HideCursor = $false
-    #     RestartOnDisplayChange = $false
-    # }
-    # "C:\Scripts\main.py" = @{
-    #     First = 1; Restart = 10; Arguments = ""
-    #     Once = $false; HideWindow = $false; FocusTop = $false
-    #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = "C:\Python311\python.exe"
-    #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
-    #     MinUpSeconds = 5; Browser = "auto"; HideCursor = $false
-    #     RestartOnDisplayChange = $false
-    # }
-    # Unity 多屏 exe 示例：投影/外接屏热插拔或开机慢枚举时，可设置 RestartOnDisplayChange = $true
-}
 
 # =================== 1. 全局配置 ===================
 $WatchdogRoot = "C:\Watchdog"
