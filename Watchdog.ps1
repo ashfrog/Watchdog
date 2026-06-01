@@ -99,6 +99,18 @@ $DisplayLoopRepair = $false
 # 显示器拓扑变化后等待系统稳定 N 秒，再重启显式启用的目标程序
 $DisplayChangeDebounceSeconds = 10
 
+# 结束进程后等待其真正退出的最长秒数
+$ProcessStopTimeoutSeconds = 10
+
+# 显示器变化重启时，旧进程长时间不退出后的放弃秒数
+$DisplayRestartGiveUpSeconds = 30
+
+# 显示器变化重启等待旧进程退出期间，重新尝试结束进程的间隔秒数
+$DisplayRestartRetrySeconds = 5
+
+# 快速崩溃退避重启的最大等待秒数
+$FastExitMaxBackoffSeconds = 300
+
 # 同一程序两次抢焦点之间最短间隔秒数
 $FocusCooldownSeconds = 30
 
@@ -153,6 +165,8 @@ $WD_CURSOR_SIZE = 32           # 透明光标位图的宽高（像素，32x32）
 $WD_WINDOW_HANDLE_POLL_MS = 100        # WdWaitForWindowHandle 的轮询间隔
 $WD_FOCUS_SETTLE_MS = 150        # 置顶后等待窗口完成激活的延迟
 $WD_INITIAL_FOCUS_DELAY_MS = 500        # 进程启动后首次抢焦点前的等待时间
+$WD_FOCUS_WINDOW_HANDLE_TIMEOUT_MS = 1200       # 抢焦点等待窗口句柄的最长时间
+$WD_REPAIR_WINDOW_HANDLE_TIMEOUT_MS = 1500      # 修复窗口模式等待窗口句柄的最长时间
 
 # 全屏检测与窗口模式修复
 $WD_FULLSCREEN_TOLERANCE_PX = 4         # 全屏判定允许的像素误差
@@ -335,24 +349,20 @@ namespace WatchdogWin32
                 if (GetMonitorInfo(hMonitor, ref info))
                 {
                     parts.Add(String.Format(
-                        "{0}|{1}|{2}|{3},{4},{5},{6}|{7},{8},{9},{10}",
+                        "{0}|{1}|{2}|{3},{4},{5},{6}",
                         index,
                         info.szDevice,
                         info.dwFlags,
                         info.rcMonitor.left,
                         info.rcMonitor.top,
                         info.rcMonitor.right - info.rcMonitor.left,
-                        info.rcMonitor.bottom - info.rcMonitor.top,
-                        info.rcWork.left,
-                        info.rcWork.top,
-                        info.rcWork.right - info.rcWork.left,
-                        info.rcWork.bottom - info.rcWork.top
+                        info.rcMonitor.bottom - info.rcMonitor.top
                     ));
                 }
                 else
                 {
                     parts.Add(String.Format(
-                        "{0}|UNKNOWN|0|{1},{2},{3},{4}|NO_WORK",
+                        "{0}|UNKNOWN|0|{1},{2},{3},{4}",
                         index,
                         lprcMonitor.left,
                         lprcMonitor.top,
@@ -632,6 +642,87 @@ function WdIsDisplayChangeRestartEnabled {
     return [bool]$Config.RestartOnDisplayChange
 }
 
+function WdGetConfigInt {
+    param(
+        $Config,
+        [string]$Name,
+        [int]$DefaultValue,
+        [int]$Minimum = 0
+    )
+
+    if ($Config -and $Config.ContainsKey($Name) -and $null -ne $Config[$Name]) {
+        try { return [Math]::Max($Minimum, [int]$Config[$Name]) }
+        catch {}
+    }
+
+    return [Math]::Max($Minimum, $DefaultValue)
+}
+
+function WdTestProcessIdAlive {
+    param([int]$ProcessId)
+
+    if ($ProcessId -le 0) { return $false }
+    $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($proc) {
+        try { $proc.Dispose() } catch {}
+        return $true
+    }
+
+    return $false
+}
+
+function WdGetProcessStartTimeSafe {
+    param($ProcessObj)
+
+    try {
+        if ($ProcessObj -is [System.Diagnostics.Process]) {
+            return $ProcessObj.StartTime
+        }
+
+        if ($ProcessObj.PSObject.Properties.Name -contains "CreationDate" -and $ProcessObj.CreationDate) {
+            if ($ProcessObj.CreationDate -is [DateTime]) {
+                return $ProcessObj.CreationDate
+            }
+            return [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$ProcessObj.CreationDate)
+        }
+    }
+    catch {}
+
+    return [DateTime]::MaxValue
+}
+
+function WdGetPreferredProcess {
+    param(
+        $Processes,
+        [int]$PreferredProcessId = 0
+    )
+
+    if (-not $Processes) { return $null }
+    $items = @($Processes)
+    if ($items.Count -eq 0) { return $null }
+
+    if ($PreferredProcessId -gt 0) {
+        $preferred = $items | Where-Object { (WdGetProcessId $_) -eq $PreferredProcessId } | Select-Object -First 1
+        if ($preferred) { return $preferred }
+    }
+
+    return $items |
+        Sort-Object @{ Expression = { WdGetProcessStartTimeSafe $_ } }, @{ Expression = { WdGetProcessId $_ } } |
+        Select-Object -First 1
+}
+
+function WdGetFastExitBackoffSeconds {
+    param(
+        [int]$FailureCount,
+        [int]$BaseDelaySeconds
+    )
+
+    $base = [Math]::Max(1, $BaseDelaySeconds)
+    $power = [Math]::Min(8, [Math]::Max(0, $FailureCount - 1))
+    $delay = $base * [Math]::Pow(2, $power)
+    return [int][Math]::Min($FastExitMaxBackoffSeconds, [Math]::Max($base, $delay))
+}
+
 function WdScheduleDisplayChangeRestart {
     param(
         [string]$Path,
@@ -641,26 +732,33 @@ function WdScheduleDisplayChangeRestart {
         [hashtable]$ScheduledLaunch,
         [hashtable]$LaunchTime,
         [hashtable]$DisplayRepairDone,
-        [hashtable]$HangFailCount
+        [hashtable]$HangFailCount,
+        [hashtable]$DisplayChangeRestartInProgress
     )
 
     if ($ProcessId -le 0) { return $false }
 
-    $restartDelay = if ($Config.ContainsKey("Restart") -and $null -ne $Config.Restart) {
-        [Math]::Max(0, [int]$Config.Restart)
-    }
-    else {
-        0
-    }
+    $restartDelay = WdGetConfigInt -Config $Config -Name "Restart" -DefaultValue 0 -Minimum 0
     $killTree = if ($Config.ContainsKey("KillTreeOnHang")) { [bool]$Config.KillTreeOnHang } else { $true }
+    $now = Get-Date
 
     WdWriteLog "DISPLAY-CHANGE: Restarting $FileName (PID:$ProcessId); relaunch scheduled in $restartDelay sec." "Yellow"
-    WdStopProcessTreeSafe -ProcessId $ProcessId -KillTree $killTree
+    $stopSucceeded = WdStopProcessTreeSafe -ProcessId $ProcessId -KillTree $killTree
 
     $ScheduledLaunch[$Path] = (Get-Date).AddSeconds($restartDelay)
     if ($LaunchTime.ContainsKey($Path)) { $LaunchTime.Remove($Path) }
     if ($DisplayRepairDone.ContainsKey($Path)) { $DisplayRepairDone.Remove($Path) }
     $HangFailCount[$Path] = 0
+
+    $DisplayChangeRestartInProgress[$Path] = @{
+        ProcessId    = $ProcessId
+        StartedAt    = $now
+        LastKillAt   = $now
+        Attempts     = 1
+        KillTree     = $killTree
+        FileName     = $FileName
+        StopSucceeded = $stopSucceeded
+    }
 
     return $true
 }
@@ -961,7 +1059,7 @@ function WdSetWindowToForeground {
 
     if ($null -eq $ProcessObj) { return $false }
 
-    $hwnd = WdWaitForWindowHandle -ProcessObj $ProcessObj
+    $hwnd = WdWaitForWindowHandle -ProcessObj $ProcessObj -TimeoutMs $WD_FOCUS_WINDOW_HANDLE_TIMEOUT_MS
     if ($null -eq $hwnd -or $hwnd -eq [IntPtr]::Zero) { return $false }
 
     if (WdIsWindowForeground -Hwnd $hwnd) { return $true }
@@ -1022,7 +1120,7 @@ function WdRepairWindowDisplayMode {
 
     if ($null -eq $ProcessObj) { return }
 
-    $hwnd = WdWaitForWindowHandle -ProcessObj $ProcessObj -TimeoutMs 3000
+    $hwnd = WdWaitForWindowHandle -ProcessObj $ProcessObj -TimeoutMs $WD_REPAIR_WINDOW_HANDLE_TIMEOUT_MS
     if ($hwnd -eq [IntPtr]::Zero) {
         WdWriteLog "DISPLAY: Window handle not ready, skipping repair." "DarkGray"
         return
@@ -1128,20 +1226,51 @@ function WdRestoreSystemCursor {
 function WdStopProcessTreeSafe {
     param(
         [int]$ProcessId,
-        [bool]$KillTree
+        [bool]$KillTree,
+        [int]$TimeoutSeconds = $ProcessStopTimeoutSeconds,
+        [int]$PollMilliseconds = 250
     )
 
-    if ($ProcessId -le 0) { return }
+    if ($ProcessId -le 0) { return $false }
+
+    if (-not (WdTestProcessIdAlive -ProcessId $ProcessId)) {
+        return $true
+    }
 
     try {
         if ($KillTree) {
-            & taskkill.exe /PID $ProcessId /T /F | Out-Null
+            $output = & taskkill.exe /PID $ProcessId /T /F 2>&1
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -ne 0) {
+                $message = (($output | ForEach-Object { [string]$_ }) -join " ").Trim()
+                if ([string]::IsNullOrWhiteSpace($message)) { $message = "exit code $exitCode" }
+                WdWriteLog "STOP: taskkill failed for PID=$ProcessId - $message" "DarkYellow"
+            }
         }
         else {
-            Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+            Stop-Process -Id $ProcessId -Force -ErrorAction Stop
         }
     }
-    catch {}
+    catch {
+        WdWriteLog "STOP: Failed to request stop for PID=$ProcessId - $($_.Exception.Message)" "DarkYellow"
+    }
+
+    $deadline = (Get-Date).AddSeconds([Math]::Max(0, $TimeoutSeconds))
+    while ((Get-Date) -lt $deadline) {
+        if (-not (WdTestProcessIdAlive -ProcessId $ProcessId)) {
+            WdWriteLog "STOP: PID=$ProcessId exited." "DarkGray"
+            return $true
+        }
+        Start-Sleep -Milliseconds ([Math]::Max(50, $PollMilliseconds))
+    }
+
+    if (-not (WdTestProcessIdAlive -ProcessId $ProcessId)) {
+        WdWriteLog "STOP: PID=$ProcessId exited." "DarkGray"
+        return $true
+    }
+
+    WdWriteLog "STOP: PID=$ProcessId still running after $TimeoutSeconds sec." "Red"
+    return $false
 }
 
 function WdIsProcessMissing {
@@ -1340,7 +1469,7 @@ function WdLaunchAndTrack {
     param(
         [string]$Path, $Config, [string]$FileName,
         [string]$StatKey, [string]$OnceKey, [string]$BrowserName, [bool]$IsOnce,
-        $RestartStats, $LaunchTime, $DisplayRepairDone, $HangFailCount
+        $RestartStats, $LaunchTime, $DisplayRepairDone, $HangFailCount, $LastStartedProcessId, $FastExitHandledLaunch
     )
     $proc = WdStartApp `
         -Path        $Path            `
@@ -1358,6 +1487,8 @@ function WdLaunchAndTrack {
             $LaunchTime[$Path] = Get-Date
             $DisplayRepairDone[$Path] = $false
             $HangFailCount[$Path] = 0
+            $LastStartedProcessId[$Path] = $proc.Id
+            if ($FastExitHandledLaunch) { $FastExitHandledLaunch[$Path] = $false }
             if ($IsOnce) { $RestartStats[$OnceKey] = $true }
         }
     }
@@ -1401,6 +1532,27 @@ WdWriteLog "INFO: GC collect every $GCCollectEvery iterations (~$($GCCollectEver
 WdWriteLog "INFO: Min restart gap = $MinRestartGapSeconds sec, Display loop repair = $DisplayLoopRepair" "DarkGray"
 WdWriteLog "INFO: Hang restart threshold = $HangConsecutiveFailuresToRestart consecutive failures" "DarkGray"
 WdWriteLog "INFO: Display change debounce = $DisplayChangeDebounceSeconds sec" "DarkGray"
+WdWriteLog "INFO: Process stop timeout = $ProcessStopTimeoutSeconds sec, Fast-exit max backoff = $FastExitMaxBackoffSeconds sec" "DarkGray"
+
+$startupCursorRestoreNeeded = $false
+foreach ($startupPath in $Apps.Keys) {
+    $startupConfig = $Apps[$startupPath]
+    if ($startupPath.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase) -and
+        $startupConfig.ContainsKey("HideCursor") -and [bool]$startupConfig.HideCursor) {
+        $startupCursorRestoreNeeded = $true
+        break
+    }
+}
+if ($startupCursorRestoreNeeded) {
+    WdWriteLog "CURSOR: HideCursor is configured; restoring cursor once at startup." "DarkGray"
+    try {
+        [WatchdogWin32.DisplayAPI]::SystemParametersInfo($SPI_SETCURSORS, 0, [IntPtr]::Zero, 0) | Out-Null
+        $Script:CursorHiddenApplied = $false
+    }
+    catch {
+        WdWriteLog "CURSOR: Startup cursor restore failed - $($_.Exception.Message)" "DarkYellow"
+    }
+}
 
 $FirstRun = $true
 $RestartStats = @{}
@@ -1408,9 +1560,12 @@ $LaunchTime = @{}
 $DisplayRepairDone = @{}
 $FocusLastTime = @{}
 $LastStartAttempt = @{}
+$LastStartedProcessId = @{}
 $ThrottleWarned = @{}
 $MissingLogged = @{}
 $HangFailCount = @{}
+$FastExitFailCount = @{}
+$FastExitHandledLaunch = @{}
 $ScheduledLaunch = @{}   # Path -> [DateTime] of next permitted launch attempt
 $Script:GCCounter = 0
 $DisplayTopologyFingerprint = WdGetDisplayTopologyFingerprint
@@ -1496,9 +1651,9 @@ try {
                                     -ScheduledLaunch $ScheduledLaunch `
                                     -LaunchTime $LaunchTime `
                                     -DisplayRepairDone $DisplayRepairDone `
-                                    -HangFailCount $HangFailCount) {
+                                    -HangFailCount $HangFailCount `
+                                    -DisplayChangeRestartInProgress $DisplayChangeRestartInProgress) {
                                 $restartCount++
-                                $DisplayChangeRestartInProgress[$RestartPath] = $true
                             }
 
                             if ($restartProcs) {
@@ -1522,19 +1677,23 @@ try {
             }
 
             foreach ($Path in $Apps.Keys) {
-                $Config = $Apps[$Path]
-                if (WdIsBrowserUrl -Path $Path) {
-                    try { $FileName = "[$(([System.Uri]$Path).Host)]" }
-                    catch {
-                        WdWriteLog "WARN: Could not parse URL [$Path] as URI; using raw string as display name." "DarkYellow"
-                        $FileName = $Path
+                $procs = $null
+                $FirstProc = $null
+                $mainProc = $null
+                try {
+                    $Config = $Apps[$Path]
+                    if (WdIsBrowserUrl -Path $Path) {
+                        try { $FileName = "[$(([System.Uri]$Path).Host)]" }
+                        catch {
+                            WdWriteLog "WARN: Could not parse URL [$Path] as URI; using raw string as display name." "DarkYellow"
+                            $FileName = $Path
+                        }
                     }
-                }
-                else {
-                    $FileName = [System.IO.Path]::GetFileName($Path)
-                }
-                $isExe = $Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)
-                $isUrl = WdIsBrowserUrl -Path $Path
+                    else {
+                        $FileName = [System.IO.Path]::GetFileName($Path)
+                    }
+                    $isExe = $Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)
+                    $isUrl = WdIsBrowserUrl -Path $Path
 
                 $StatKey = "${Path}::H${CurrentHour}"
                 $OnceKey = "${Path}::Once"
@@ -1566,20 +1725,80 @@ try {
                 $killTreeOnHang = if ($Config.ContainsKey("KillTreeOnHang")) { [bool]$Config.KillTreeOnHang }     else { $true }
                 $browserName = if ($Config.ContainsKey("Browser") -and
                     -not [string]::IsNullOrWhiteSpace([string]$Config.Browser)) { [string]$Config.Browser } else { "auto" }
-                $minUpSeconds = if ($Config.ContainsKey("MinUpSeconds") -and
-                    $null -ne $Config.MinUpSeconds) { [Math]::Max(1, [int]$Config.MinUpSeconds) } else { 5 }
+                $minUpSeconds = WdGetConfigInt -Config $Config -Name "MinUpSeconds" -DefaultValue 5 -Minimum 1
                 $hideCursor = if ($Config.ContainsKey("HideCursor") -and $isExe) { [bool]$Config.HideCursor } else { $false }
 
                 $procs = WdGetTargetProcess -Path $Path
                 $procCount = if ($procs -is [array]) { $procs.Count } elseif ($procs) { 1 } else { 0 }
 
-                if ($procCount -eq 0) {
-                    if ($DisplayChangeRestartInProgress.ContainsKey($Path)) {
+                if ($DisplayChangeRestartInProgress.ContainsKey($Path)) {
+                    $displayRestartState = $DisplayChangeRestartInProgress[$Path]
+                    $displayRestartPid = [int]$displayRestartState.ProcessId
+                    $displayRestartName = if ($displayRestartState.FileName) { [string]$displayRestartState.FileName } else { $FileName }
+
+                    if ($displayRestartPid -le 0 -or -not (WdTestProcessIdAlive -ProcessId $displayRestartPid)) {
+                        WdWriteLog "DISPLAY-CHANGE: $displayRestartName old process exited; normal relaunch flow can continue." "DarkGreen"
                         $DisplayChangeRestartInProgress.Remove($Path)
+                        if ($procs) {
+                            $procs | ForEach-Object {
+                                if ($_ -is [System.Diagnostics.Process]) { try { $_.Dispose() } catch {} }
+                            }
+                            $procs = $null
+                        }
+                        $procs = WdGetTargetProcess -Path $Path
+                        $procCount = if ($procs -is [array]) { $procs.Count } elseif ($procs) { 1 } else { 0 }
                     }
+                    else {
+                        $now = Get-Date
+                        $elapsedDisplayRestart = ($now - [DateTime]$displayRestartState.StartedAt).TotalSeconds
+                        if ($elapsedDisplayRestart -ge $DisplayRestartGiveUpSeconds) {
+                            WdWriteLog "CRITICAL: DISPLAY-CHANGE: $displayRestartName PID=$displayRestartPid still running after $([int]$elapsedDisplayRestart)s; giving up pending restart state." "Red"
+                            $DisplayChangeRestartInProgress.Remove($Path)
+                        }
+                        else {
+                            $lastKillAt = [DateTime]$displayRestartState.LastKillAt
+                            if (($now - $lastKillAt).TotalSeconds -ge $DisplayRestartRetrySeconds) {
+                                $displayRestartState.Attempts = [int]$displayRestartState.Attempts + 1
+                                $displayRestartState.LastKillAt = $now
+                                WdWriteLog "DISPLAY-CHANGE: $displayRestartName PID=$displayRestartPid still running; retrying stop attempt $($displayRestartState.Attempts)." "DarkYellow"
+                                $stopAgain = WdStopProcessTreeSafe -ProcessId $displayRestartPid -KillTree ([bool]$displayRestartState.KillTree)
+                                $displayRestartState.StopSucceeded = $stopAgain
+                                $DisplayChangeRestartInProgress[$Path] = $displayRestartState
+                            }
+                            else {
+                                WdWriteLog "DISPLAY-CHANGE: Waiting for $displayRestartName PID=$displayRestartPid to exit after scheduled restart." "DarkGray"
+                            }
+
+                            if ($procs) {
+                                $procs | ForEach-Object {
+                                    if ($_ -is [System.Diagnostics.Process]) { try { $_.Dispose() } catch {} }
+                                }
+                                $procs = $null
+                            }
+                            continue
+                        }
+                    }
+                }
+
+                if ($procCount -eq 0) {
                     $HangFailCount[$Path] = 0
                     if ($Config.Once -and $RestartStats.ContainsKey($OnceKey) -and $RestartStats[$OnceKey]) {
                         continue
+                    }
+
+                    if ($LaunchTime.ContainsKey($Path) -and $LaunchTime[$Path] -and
+                        (-not $FastExitHandledLaunch.ContainsKey($Path) -or -not $FastExitHandledLaunch[$Path])) {
+                        $upSeconds = ((Get-Date) - $LaunchTime[$Path]).TotalSeconds
+                        if ($upSeconds -ge 0 -and $upSeconds -lt $minUpSeconds) {
+                            WdInitializeCounter -Table $FastExitFailCount -Key $Path -DefaultValue 0
+                            $FastExitFailCount[$Path] = [int]$FastExitFailCount[$Path] + 1
+                            $FastExitHandledLaunch[$Path] = $true
+                            $baseRestartDelay = WdGetConfigInt -Config $Config -Name "Restart" -DefaultValue 1 -Minimum 1
+                            $backoffSeconds = WdGetFastExitBackoffSeconds -FailureCount ([int]$FastExitFailCount[$Path]) -BaseDelaySeconds $baseRestartDelay
+                            $ScheduledLaunch[$Path] = (Get-Date).AddSeconds($backoffSeconds)
+                            WdWriteLog "FAST-EXIT: $FileName exited after $([int]$upSeconds)s (< ${minUpSeconds}s). Backoff restart in $backoffSeconds sec (failure #$($FastExitFailCount[$Path]))." "Red"
+                            continue
+                        }
                     }
 
                     if ($LastStartAttempt.ContainsKey($Path) -and $LastStartAttempt[$Path]) {
@@ -1592,7 +1811,12 @@ try {
 
                     # Schedule a launch if not already scheduled, then wait non-blocking
                     if ($null -eq $ScheduledLaunch[$Path]) {
-                        $WaitTime = if ($FirstRun) { [int]$Config.First } else { [int]$Config.Restart }
+                        $WaitTime = if ($FirstRun) {
+                            WdGetConfigInt -Config $Config -Name "First" -DefaultValue 0 -Minimum 0
+                        }
+                        else {
+                            WdGetConfigInt -Config $Config -Name "Restart" -DefaultValue 0 -Minimum 0
+                        }
                         $ScheduledLaunch[$Path] = (Get-Date).AddSeconds($WaitTime)
                         WdWriteLog "MISSING: $FileName, launch scheduled in $WaitTime sec..." "Cyan"
                         $MissingLogged[$Path] = $true
@@ -1617,39 +1841,46 @@ try {
                     WdLaunchAndTrack -Path $Path -Config $Config -FileName $FileName `
                         -StatKey $StatKey -OnceKey $OnceKey -BrowserName $browserName -IsOnce $Config.Once `
                         -RestartStats $RestartStats -LaunchTime $LaunchTime `
-                        -DisplayRepairDone $DisplayRepairDone -HangFailCount $HangFailCount
+                        -DisplayRepairDone $DisplayRepairDone -HangFailCount $HangFailCount `
+                        -LastStartedProcessId $LastStartedProcessId -FastExitHandledLaunch $FastExitHandledLaunch
                 }
                 else {
-                    if ($DisplayChangeRestartInProgress.ContainsKey($Path)) {
-                        WdWriteLog "DISPLAY-CHANGE: Waiting for $FileName to exit after scheduled restart." "DarkGray"
-                        if ($procs) {
-                            $procs | ForEach-Object {
-                                if ($_ -is [System.Diagnostics.Process]) { try { $_.Dispose() } catch {} }
-                            }
-                            $procs = $null
+                    if ($LaunchTime.ContainsKey($Path) -and $LaunchTime[$Path] -and
+                        ((Get-Date) - $LaunchTime[$Path]).TotalSeconds -ge $minUpSeconds) {
+                        if ($FastExitFailCount.ContainsKey($Path) -and [int]$FastExitFailCount[$Path] -gt 0) {
+                            WdWriteLog "FAST-EXIT-RECOVERED: $FileName has stayed up for at least ${minUpSeconds}s; reset fast-exit counter." "DarkGreen"
                         }
-                        continue
+                        $FastExitFailCount[$Path] = 0
+                        $FastExitHandledLaunch[$Path] = $true
                     }
 
                     $MissingLogged[$Path] = $false
                     $ScheduledLaunch[$Path] = $null  # process is running; clear any pending launch schedule
                     if (-not $allowMultiInstance -and $procCount -gt 1) {
                         WdWriteLog "CONFLICT: $procCount instances of $FileName detected. Cleaning up extra instances..." "Magenta"
-                        $procs | Select-Object -Skip 1 | ForEach-Object {
+                        $preferredPid = if ($LastStartedProcessId.ContainsKey($Path)) { [int]$LastStartedProcessId[$Path] } else { 0 }
+                        $keepProc = WdGetPreferredProcess -Processes $procs -PreferredProcessId $preferredPid
+                        $keepPid = if ($keepProc) { WdGetProcessId $keepProc } else { 0 }
+                        if ($keepPid -gt 0) {
+                            WdWriteLog "CONFLICT: Keeping PID=$keepPid for $FileName." "DarkMagenta"
+                        }
+
+                        @($procs) | Where-Object { (WdGetProcessId $_) -ne $keepPid } | ForEach-Object {
                             $TargetID = WdGetProcessId $_
                             try {
-                                WdStopProcessTreeSafe -ProcessId $TargetID -KillTree $true
-                                WdWriteLog "CLEANUP: Killed extra instance PID=$TargetID for $FileName" "DarkMagenta"
+                                if (WdStopProcessTreeSafe -ProcessId $TargetID -KillTree $true) {
+                                    WdWriteLog "CLEANUP: Killed extra instance PID=$TargetID for $FileName" "DarkMagenta"
+                                }
+                                else {
+                                    WdWriteLog "CLEANUP: Failed to confirm extra instance PID=$TargetID stopped for $FileName" "Red"
+                                }
                             }
                             catch {}
-
-                            if ($_ -is [System.Diagnostics.Process]) {
-                                try { $_.Dispose() } catch {}
-                            }
                         }
                     }
 
-                    $FirstProc = if ($procs -is [array]) { $procs[0] } else { $procs }
+                    $preferredPid = if ($LastStartedProcessId.ContainsKey($Path)) { [int]$LastStartedProcessId[$Path] } else { 0 }
+                    $FirstProc = WdGetPreferredProcess -Processes $procs -PreferredProcessId $preferredPid
                     if ($null -eq $FirstProc) {
                         if ($procs) {
                             $procs | ForEach-Object {
@@ -1685,10 +1916,16 @@ try {
                             WdWriteLog "HANG: $FileName (PID:$TargetID) not responding for $hangFailTimes consecutive checks. Restarting..." "Red"
                             $HangFailCount[$Path] = 0
 
-                            WdStopProcessTreeSafe -ProcessId $TargetID -KillTree $killTreeOnHang
+                            $hangStopSucceeded = WdStopProcessTreeSafe -ProcessId $TargetID -KillTree $killTreeOnHang
                             # Schedule relaunch after the configured Restart delay (non-blocking)
-                            $ScheduledLaunch[$Path] = (Get-Date).AddSeconds([int]$Config.Restart)
-                            WdWriteLog "HANG: $FileName relaunch scheduled in $([int]$Config.Restart) sec." "DarkYellow"
+                            $hangRestartDelay = WdGetConfigInt -Config $Config -Name "Restart" -DefaultValue 0 -Minimum 0
+                            $ScheduledLaunch[$Path] = (Get-Date).AddSeconds($hangRestartDelay)
+                            if ($hangStopSucceeded) {
+                                WdWriteLog "HANG: $FileName relaunch scheduled in $hangRestartDelay sec." "DarkYellow"
+                            }
+                            else {
+                                WdWriteLog "HANG: Stop for $FileName PID=$TargetID did not confirm exit; relaunch remains scheduled in $hangRestartDelay sec." "Red"
+                            }
                             continue
                         }
                         elseif ($isExe -and $HangFailCount.ContainsKey($Path) -and [int]$HangFailCount[$Path] -gt 0) {
@@ -1759,11 +1996,22 @@ try {
                     $FirstProc = $null
                 }
 
-                if ($procs) {
-                    $procs | ForEach-Object {
-                        if ($_ -is [System.Diagnostics.Process]) { try { $_.Dispose() } catch {} }
+                }
+                finally {
+                    if ($mainProc) {
+                        try { $mainProc.Dispose() } catch {}
+                        $mainProc = $null
                     }
-                    $procs = $null
+                    if ($FirstProc -is [System.Diagnostics.Process]) {
+                        try { $FirstProc.Dispose() } catch {}
+                        $FirstProc = $null
+                    }
+                    if ($procs) {
+                        $procs | ForEach-Object {
+                            if ($_ -is [System.Diagnostics.Process]) { try { $_.Dispose() } catch {} }
+                        }
+                        $procs = $null
+                    }
                 }
             }
 
