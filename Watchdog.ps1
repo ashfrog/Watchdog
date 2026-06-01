@@ -31,6 +31,9 @@
 # MinUpSeconds:       启动后若很快退出，按失败重启节流处理
 # HideCursor:         $true=程序运行期间隐藏系统鼠标光标  $false=保持系统默认光标显示
 #                     （仅对 exe 类条目有效；适用于 Unity 等全屏 kiosk 程序）
+# RestartOnDisplayChange:
+#                     $true=显示器数量/分辨率/主屏/排列顺序变化并稳定后重启
+#                     $false=显示器变化时不重启（推荐仅 Unity 多屏 kiosk 程序启用）
 # Browser:            网页 URL 条目专用，指定打开浏览器
 #                     	auto=自动检测（优先 Chrome，其次 Edge）
 #                     	chrome=Google Chrome
@@ -43,12 +46,13 @@
 #   进程检测仅匹配该 Profile 的主进程，不会误杀子渲染进程。
 
 $Apps = [ordered]@{
-    "https://www.baidu.com" = @{
+    "M:\GitHub\MediaPlay\MediaPlayerAVProUtil_water\Release\ADIENT.exe" = @{
         First = 1; Restart = 5; Arguments = ""
         Once = $false; HideWindow = $false; FocusTop = $true
         Fullscreen = $true; ForceDisplayMode = $true; PythonExe = ""
         ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
         MinUpSeconds = 15; Browser = "auto"; HideCursor = $false
+        RestartOnDisplayChange = $true
     }
     # "C:\Scripts\test.bat" = @{
     #     First = 1; Restart = 5; Arguments = ""
@@ -56,6 +60,7 @@ $Apps = [ordered]@{
     #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = ""
     #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
     #     MinUpSeconds = 3; Browser = "auto"; HideCursor = $false
+    #     RestartOnDisplayChange = $false
     # }
     # "C:\Scripts\main.py" = @{
     #     First = 1; Restart = 10; Arguments = ""
@@ -63,7 +68,9 @@ $Apps = [ordered]@{
     #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = "C:\Python311\python.exe"
     #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
     #     MinUpSeconds = 5; Browser = "auto"; HideCursor = $false
+    #     RestartOnDisplayChange = $false
     # }
+    # Unity 多屏 exe 示例：投影/外接屏热插拔或开机慢枚举时，可设置 RestartOnDisplayChange = $true
 }
 
 # =================== 1. 全局配置 ===================
@@ -88,6 +95,9 @@ $FullscreenRepairDelay = 4
 
 # 是否每轮巡检都持续修复窗口模式（生产默认建议 false）
 $DisplayLoopRepair = $false
+
+# 显示器拓扑变化后等待系统稳定 N 秒，再重启显式启用的目标程序
+$DisplayChangeDebounceSeconds = 10
 
 # 同一程序两次抢焦点之间最短间隔秒数
 $FocusCooldownSeconds = 30
@@ -213,7 +223,9 @@ Register-EngineEvent PowerShell.Exiting -Action {
 if (-not ([System.Management.Automation.PSTypeName]'WatchdogWin32.DisplayAPI').Type) {
     $displayApiCode = @"
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace WatchdogWin32
 {
@@ -232,6 +244,17 @@ namespace WatchdogWin32
             public RECT rcMonitor;
             public RECT rcWork;
             public int dwFlags;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct MONITORINFOEX
+        {
+            public int cbSize;
+            public RECT rcMonitor;
+            public RECT rcWork;
+            public int dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string szDevice;
         }
 
         [DllImport("user32.dll")]
@@ -254,6 +277,14 @@ namespace WatchdogWin32
 
         [DllImport("user32.dll")]
         public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+        public delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
+
+        [DllImport("user32.dll")]
+        public static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProc lpfnEnum, IntPtr dwData);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
 
         [DllImport("user32.dll")]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -290,6 +321,62 @@ namespace WatchdogWin32
 
         [DllImport("user32.dll")]
         public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
+
+        public static string GetActiveMonitorFingerprint()
+        {
+            List<string> parts = new List<string>();
+            int index = 0;
+
+            MonitorEnumProc callback = delegate(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData)
+            {
+                MONITORINFOEX info = new MONITORINFOEX();
+                info.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+
+                if (GetMonitorInfo(hMonitor, ref info))
+                {
+                    parts.Add(String.Format(
+                        "{0}|{1}|{2}|{3},{4},{5},{6}|{7},{8},{9},{10}",
+                        index,
+                        info.szDevice,
+                        info.dwFlags,
+                        info.rcMonitor.left,
+                        info.rcMonitor.top,
+                        info.rcMonitor.right - info.rcMonitor.left,
+                        info.rcMonitor.bottom - info.rcMonitor.top,
+                        info.rcWork.left,
+                        info.rcWork.top,
+                        info.rcWork.right - info.rcWork.left,
+                        info.rcWork.bottom - info.rcWork.top
+                    ));
+                }
+                else
+                {
+                    parts.Add(String.Format(
+                        "{0}|UNKNOWN|0|{1},{2},{3},{4}|NO_WORK",
+                        index,
+                        lprcMonitor.left,
+                        lprcMonitor.top,
+                        lprcMonitor.right - lprcMonitor.left,
+                        lprcMonitor.bottom - lprcMonitor.top
+                    ));
+                }
+
+                index++;
+                return true;
+            };
+
+            if (!EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, callback, IntPtr.Zero))
+            {
+                return null;
+            }
+
+            if (parts.Count == 0)
+            {
+                return "NO_ACTIVE_MONITORS";
+            }
+
+            return String.Join("||", parts.ToArray());
+        }
     }
 }
 "@
@@ -524,6 +611,58 @@ function WdCleanupRestartStats {
             }
         }
     }
+}
+
+function WdGetDisplayTopologyFingerprint {
+    try {
+        return [WatchdogWin32.DisplayAPI]::GetActiveMonitorFingerprint()
+    }
+    catch {
+        WdWriteLog "DISPLAY-CHANGE: Failed to read display topology - $($_.Exception.Message)" "DarkYellow"
+        return $null
+    }
+}
+
+function WdIsDisplayChangeRestartEnabled {
+    param($Config)
+
+    if ($null -eq $Config) { return $false }
+    if ($Config.ContainsKey("Once") -and [bool]$Config.Once) { return $false }
+    if (-not $Config.ContainsKey("RestartOnDisplayChange")) { return $false }
+    return [bool]$Config.RestartOnDisplayChange
+}
+
+function WdScheduleDisplayChangeRestart {
+    param(
+        [string]$Path,
+        $Config,
+        [string]$FileName,
+        [int]$ProcessId,
+        [hashtable]$ScheduledLaunch,
+        [hashtable]$LaunchTime,
+        [hashtable]$DisplayRepairDone,
+        [hashtable]$HangFailCount
+    )
+
+    if ($ProcessId -le 0) { return $false }
+
+    $restartDelay = if ($Config.ContainsKey("Restart") -and $null -ne $Config.Restart) {
+        [Math]::Max(0, [int]$Config.Restart)
+    }
+    else {
+        0
+    }
+    $killTree = if ($Config.ContainsKey("KillTreeOnHang")) { [bool]$Config.KillTreeOnHang } else { $true }
+
+    WdWriteLog "DISPLAY-CHANGE: Restarting $FileName (PID:$ProcessId); relaunch scheduled in $restartDelay sec." "Yellow"
+    WdStopProcessTreeSafe -ProcessId $ProcessId -KillTree $killTree
+
+    $ScheduledLaunch[$Path] = (Get-Date).AddSeconds($restartDelay)
+    if ($LaunchTime.ContainsKey($Path)) { $LaunchTime.Remove($Path) }
+    if ($DisplayRepairDone.ContainsKey($Path)) { $DisplayRepairDone.Remove($Path) }
+    $HangFailCount[$Path] = 0
+
+    return $true
 }
 
 function WdGetPythonInterpreter {
@@ -783,14 +922,29 @@ function WdWaitForWindowHandle {
     )
 
     $elapsed = 0
-    while ($ProcessObj -and $ProcessObj.MainWindowHandle -eq [IntPtr]::Zero -and $elapsed -lt $TimeoutMs) {
+    $hwnd = [IntPtr]::Zero
+
+    while ($ProcessObj -and $elapsed -lt $TimeoutMs) {
+        try {
+            $ProcessObj.Refresh()
+            if ($null -ne $ProcessObj.MainWindowHandle) {
+                $hwnd = [IntPtr]$ProcessObj.MainWindowHandle
+            }
+        }
+        catch {
+            $hwnd = [IntPtr]::Zero
+            break
+        }
+
+        if ($hwnd -ne [IntPtr]::Zero) {
+            return $hwnd
+        }
+
         Start-Sleep -Milliseconds $WD_WINDOW_HANDLE_POLL_MS
-        try { $ProcessObj.Refresh() } catch { break }
         $elapsed += $WD_WINDOW_HANDLE_POLL_MS
     }
 
-    if ($ProcessObj) { return $ProcessObj.MainWindowHandle }
-    return [IntPtr]::Zero
+    return $hwnd
 }
 
 function WdIsWindowForeground {
@@ -808,7 +962,7 @@ function WdSetWindowToForeground {
     if ($null -eq $ProcessObj) { return $false }
 
     $hwnd = WdWaitForWindowHandle -ProcessObj $ProcessObj
-    if ($hwnd -eq [IntPtr]::Zero) { return $false }
+    if ($null -eq $hwnd -or $hwnd -eq [IntPtr]::Zero) { return $false }
 
     if (WdIsWindowForeground -Hwnd $hwnd) { return $true }
 
@@ -1246,6 +1400,7 @@ WdWriteLog "INFO: Log max size = ${MaxLogSizeMB}MB, Backups = $MaxLogBackups" "D
 WdWriteLog "INFO: GC collect every $GCCollectEvery iterations (~$($GCCollectEvery * $CheckInterval) sec)" "DarkGray"
 WdWriteLog "INFO: Min restart gap = $MinRestartGapSeconds sec, Display loop repair = $DisplayLoopRepair" "DarkGray"
 WdWriteLog "INFO: Hang restart threshold = $HangConsecutiveFailuresToRestart consecutive failures" "DarkGray"
+WdWriteLog "INFO: Display change debounce = $DisplayChangeDebounceSeconds sec" "DarkGray"
 
 $FirstRun = $true
 $RestartStats = @{}
@@ -1258,6 +1413,13 @@ $MissingLogged = @{}
 $HangFailCount = @{}
 $ScheduledLaunch = @{}   # Path -> [DateTime] of next permitted launch attempt
 $Script:GCCounter = 0
+$DisplayTopologyFingerprint = WdGetDisplayTopologyFingerprint
+$PendingDisplayTopologyFingerprint = $null
+$DisplayChangeDetectedAt = $null
+$DisplayChangeRestartInProgress = @{}
+if ($DisplayTopologyFingerprint) {
+    WdWriteLog "DISPLAY-CHANGE: Initial topology fingerprint = [$DisplayTopologyFingerprint]" "DarkGray"
+}
 
 # =================== 7. 主循环 ===================
 try {
@@ -1271,6 +1433,13 @@ try {
 
             $disableReason = WdGetDisableReason
             if (WdUpdateDisableState -DisableReason $disableReason) {
+                $currentDisplayTopology = WdGetDisplayTopologyFingerprint
+                if ($currentDisplayTopology) {
+                    $DisplayTopologyFingerprint = $currentDisplayTopology
+                    $PendingDisplayTopologyFingerprint = $null
+                    $DisplayChangeDetectedAt = $null
+                    $DisplayChangeRestartInProgress.Clear()
+                }
                 $FirstRun = $false
                 Start-Sleep -Seconds $CheckInterval
                 continue
@@ -1278,6 +1447,80 @@ try {
 
             $anyCursorHideNeeded = $false
             $monitoringPaused = $false
+
+            $currentDisplayTopology = WdGetDisplayTopologyFingerprint
+            if ($currentDisplayTopology) {
+                if ([string]::IsNullOrWhiteSpace($DisplayTopologyFingerprint)) {
+                    $DisplayTopologyFingerprint = $currentDisplayTopology
+                    WdWriteLog "DISPLAY-CHANGE: Topology baseline captured = [$DisplayTopologyFingerprint]" "DarkGray"
+                }
+                elseif ($currentDisplayTopology -ne $DisplayTopologyFingerprint) {
+                    if ($PendingDisplayTopologyFingerprint -ne $currentDisplayTopology) {
+                        $PendingDisplayTopologyFingerprint = $currentDisplayTopology
+                        $DisplayChangeDetectedAt = Get-Date
+                        WdWriteLog "DISPLAY-CHANGE: Topology changed; waiting $DisplayChangeDebounceSeconds sec for stability. Old=[$DisplayTopologyFingerprint] New=[$currentDisplayTopology]" "Yellow"
+                    }
+                    elseif ($DisplayChangeDetectedAt -and
+                        ((Get-Date) - $DisplayChangeDetectedAt).TotalSeconds -ge $DisplayChangeDebounceSeconds) {
+
+                        WdWriteLog "DISPLAY-CHANGE: Topology stable; restarting enabled targets." "Yellow"
+                        $restartCount = 0
+
+                        foreach ($RestartPath in $Apps.Keys) {
+                            $RestartConfig = $Apps[$RestartPath]
+                            if (-not (WdIsDisplayChangeRestartEnabled -Config $RestartConfig)) {
+                                continue
+                            }
+
+                            if (WdIsBrowserUrl -Path $RestartPath) {
+                                try { $RestartFileName = "[$(([System.Uri]$RestartPath).Host)]" }
+                                catch { $RestartFileName = $RestartPath }
+                            }
+                            else {
+                                $RestartFileName = [System.IO.Path]::GetFileName($RestartPath)
+                            }
+
+                            $restartProcs = WdGetTargetProcess -Path $RestartPath
+                            if (-not $restartProcs) {
+                                WdWriteLog "DISPLAY-CHANGE: $RestartFileName is not running; existing monitor flow will launch it if needed." "DarkGray"
+                                continue
+                            }
+
+                            $restartFirstProc = if ($restartProcs -is [array]) { $restartProcs[0] } else { $restartProcs }
+                            $restartPid = WdGetProcessId $restartFirstProc
+                            if (WdScheduleDisplayChangeRestart `
+                                    -Path $RestartPath `
+                                    -Config $RestartConfig `
+                                    -FileName $RestartFileName `
+                                    -ProcessId $restartPid `
+                                    -ScheduledLaunch $ScheduledLaunch `
+                                    -LaunchTime $LaunchTime `
+                                    -DisplayRepairDone $DisplayRepairDone `
+                                    -HangFailCount $HangFailCount) {
+                                $restartCount++
+                                $DisplayChangeRestartInProgress[$RestartPath] = $true
+                            }
+
+                            if ($restartProcs) {
+                                $restartProcs | ForEach-Object {
+                                    if ($_ -is [System.Diagnostics.Process]) { try { $_.Dispose() } catch {} }
+                                }
+                            }
+                        }
+
+                        WdWriteLog "DISPLAY-CHANGE: Restart scheduling complete. Targets restarted=$restartCount." "DarkGreen"
+                        $DisplayTopologyFingerprint = $currentDisplayTopology
+                        $PendingDisplayTopologyFingerprint = $null
+                        $DisplayChangeDetectedAt = $null
+                    }
+                }
+                elseif ($PendingDisplayTopologyFingerprint) {
+                    WdWriteLog "DISPLAY-CHANGE: Topology returned to baseline before debounce elapsed; restart canceled." "DarkGray"
+                    $PendingDisplayTopologyFingerprint = $null
+                    $DisplayChangeDetectedAt = $null
+                }
+            }
+
             foreach ($Path in $Apps.Keys) {
                 $Config = $Apps[$Path]
                 if (WdIsBrowserUrl -Path $Path) {
@@ -1300,6 +1543,13 @@ try {
 
                 $disableReason = WdGetDisableReason
                 if (WdUpdateDisableState -DisableReason $disableReason) {
+                    $currentDisplayTopology = WdGetDisplayTopologyFingerprint
+                    if ($currentDisplayTopology) {
+                        $DisplayTopologyFingerprint = $currentDisplayTopology
+                        $PendingDisplayTopologyFingerprint = $null
+                        $DisplayChangeDetectedAt = $null
+                        $DisplayChangeRestartInProgress.Clear()
+                    }
                     $monitoringPaused = $true
                     break
                 }
@@ -1324,6 +1574,9 @@ try {
                 $procCount = if ($procs -is [array]) { $procs.Count } elseif ($procs) { 1 } else { 0 }
 
                 if ($procCount -eq 0) {
+                    if ($DisplayChangeRestartInProgress.ContainsKey($Path)) {
+                        $DisplayChangeRestartInProgress.Remove($Path)
+                    }
                     $HangFailCount[$Path] = 0
                     if ($Config.Once -and $RestartStats.ContainsKey($OnceKey) -and $RestartStats[$OnceKey]) {
                         continue
@@ -1367,6 +1620,17 @@ try {
                         -DisplayRepairDone $DisplayRepairDone -HangFailCount $HangFailCount
                 }
                 else {
+                    if ($DisplayChangeRestartInProgress.ContainsKey($Path)) {
+                        WdWriteLog "DISPLAY-CHANGE: Waiting for $FileName to exit after scheduled restart." "DarkGray"
+                        if ($procs) {
+                            $procs | ForEach-Object {
+                                if ($_ -is [System.Diagnostics.Process]) { try { $_.Dispose() } catch {} }
+                            }
+                            $procs = $null
+                        }
+                        continue
+                    }
+
                     $MissingLogged[$Path] = $false
                     $ScheduledLaunch[$Path] = $null  # process is running; clear any pending launch schedule
                     if (-not $allowMultiInstance -and $procCount -gt 1) {
@@ -1463,7 +1727,12 @@ try {
 
                             if ($allowFocus) {
                                 $fgHwnd = [IntPtr]::Zero
-                                try { $fgHwnd = $mainProc.MainWindowHandle } catch {} # process may have just exited; leave fgHwnd as Zero
+                                try {
+                                    if ($null -ne $mainProc.MainWindowHandle) {
+                                        $fgHwnd = [IntPtr]$mainProc.MainWindowHandle
+                                    }
+                                }
+                                catch {} # process may have just exited; leave fgHwnd as Zero
                                 if ($fgHwnd -ne [IntPtr]::Zero -and (WdIsWindowForeground -Hwnd $fgHwnd)) {
                                     # Already in foreground; reset cooldown to skip redundant attempts
                                     $FocusLastTime[$Path] = Get-Date
