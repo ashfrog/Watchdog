@@ -7,7 +7,7 @@
 # 也可创建快捷方式保留桌面环境： 将数值填入目标
 
 $Apps = [ordered]@{
-    "M:\GitHub\MediaPlay\MediaPlayerAVProUtil_water\Release\ADIENT.exe" = @{
+    "M:\GitHub\shanxi_yangquan\shanxi_yangquan\sha_pan\Release\sha_pan.exe" = @{
         First = 1; Restart = 5; Arguments = ""
         Once = $false; HideWindow = $false; FocusTop = $true
         Fullscreen = $true; ForceDisplayMode = $true; PythonExe = ""
@@ -105,6 +105,23 @@ $MatchFullPathForScripts = $true
 # 脚本类命令行匹配时是否需要严格引号边界（为兼容复杂场景默认 false）
 $StrictScriptPathBoundary = $false
 
+# TCP / UDP 远程控制。两种协议可使用相同端口号。
+# 支持的 UTF-8 纯文本指令：reboot、shutdown、restart；心跳：ping、heartbeat
+$ControlEnabled = $true
+$ControlListenAddress = "0.0.0.0"
+$ControlPort = 19099
+$ControlMaxMessageBytes = 256
+
+# TCP 空闲连接超时秒数；0 表示 Watchdog 不主动断开空闲连接。
+$ControlTcpIdleTimeoutSeconds = 0
+
+# 未带换行符的 TCP 数据若只是已知指令的前缀，最多等待这么久；之后静默丢弃。
+$ControlTcpPartialCommandTimeoutMilliseconds = 500
+
+# 允许发送控制指令的远端 IP。空数组表示允许所有来源；生产环境建议填写固定管理端 IP。
+# 示例：@("127.0.0.1", "192.168.1.10")
+$ControlAllowedRemoteAddresses = @()
+
 # =================== 1.5 Win32 / 时序常量 ===================
 # ShowWindow nCmdShow 命令
 $SW_RESTORE = 9            # 若最小化则还原，否则激活并显示
@@ -188,6 +205,14 @@ function WdInvokeShutdownCleanup {
     try {
         if (Get-Command WdRestoreSystemCursor -ErrorAction SilentlyContinue) {
             WdRestoreSystemCursor
+        }
+    }
+    catch {}
+
+    # 关闭 TCP / UDP 控制监听器
+    try {
+        if (Get-Command WdStopControlListeners -ErrorAction SilentlyContinue) {
+            WdStopControlListeners
         }
     }
     catch {}
@@ -1482,7 +1507,411 @@ function WdLaunchAndTrack {
     }
 }
 
-# =================== 5.1 Compatibility layer (legacy -> Wd* APIs) ===================
+# =================== 5.1 TCP / UDP 控制 ===================
+$Script:ControlTcpListener = $null
+$Script:ControlUdpClient = $null
+$Script:ControlTcpClients = New-Object System.Collections.ArrayList
+$Script:PendingControlRestart = $false
+$Script:PendingSystemPowerAction = $null
+
+function WdTestControlRemoteAllowed {
+    param([System.Net.IPAddress]$RemoteAddress)
+
+    if ($null -eq $RemoteAddress) { return $false }
+    if (@($ControlAllowedRemoteAddresses).Count -eq 0) { return $true }
+
+    $remoteText = $RemoteAddress.ToString()
+    foreach ($allowedAddress in @($ControlAllowedRemoteAddresses)) {
+        if ($remoteText.Equals(([string]$allowedAddress).Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function WdGetControlResponse {
+    param(
+        [string]$Command,
+        [string]$Protocol,
+        [System.Net.IPAddress]$RemoteAddress
+    )
+
+    $source = if ($RemoteAddress) { $RemoteAddress.ToString() } else { "unknown" }
+    if (-not (WdTestControlRemoteAllowed -RemoteAddress $RemoteAddress)) {
+        WdWriteLog "CONTROL: Rejected $Protocol command from unauthorized source [$source]." "Red"
+        return "ERR source not allowed"
+    }
+
+    $normalizedCommand = if ($null -eq $Command) { "" } else { $Command.Trim().ToLowerInvariant() }
+    switch ($normalizedCommand) {
+        { $_ -in @("ping", "heartbeat") } {
+            return "pong"
+        }
+        "restart" {
+            $Script:PendingControlRestart = $true
+            WdWriteLog "CONTROL: Accepted restart command via $Protocol from [$source]." "Yellow"
+            return "OK restart accepted"
+        }
+        "reboot" {
+            if ($Script:PendingSystemPowerAction) {
+                return "ERR system power action already pending"
+            }
+            $Script:PendingSystemPowerAction = "reboot"
+            WdWriteLog "CONTROL: Accepted reboot command via $Protocol from [$source]." "Red"
+            return "OK reboot accepted"
+        }
+        "shutdown" {
+            if ($Script:PendingSystemPowerAction) {
+                return "ERR system power action already pending"
+            }
+            $Script:PendingSystemPowerAction = "shutdown"
+            WdWriteLog "CONTROL: Accepted shutdown command via $Protocol from [$source]." "Red"
+            return "OK shutdown accepted"
+        }
+        default {
+            return $null
+        }
+    }
+}
+
+function WdSendTcpControlResponse {
+    param($State, [string]$Response)
+
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Response + "`r`n")
+        $State.Stream.Write($bytes, 0, $bytes.Length)
+        $State.Stream.Flush()
+    }
+    catch {
+        WdWriteLog "CONTROL: Failed to send TCP response - $($_.Exception.Message)" "DarkYellow"
+    }
+}
+
+function WdCloseTcpControlClient {
+    param($State)
+
+    if ($null -eq $State) { return }
+    try { $State.Stream.Dispose() } catch {}
+    try { $State.Client.Close() } catch {}
+    try { $State.Client.Dispose() } catch {}
+    [void]$Script:ControlTcpClients.Remove($State)
+}
+
+function WdPollControlListeners {
+    if (-not $ControlEnabled) { return }
+
+    if ($Script:ControlUdpClient) {
+        try {
+            while ($Script:ControlUdpClient.Available -gt 0) {
+                $remoteEndpoint = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+                $payload = $Script:ControlUdpClient.Receive([ref]$remoteEndpoint)
+                $response = if ($payload.Length -gt $ControlMaxMessageBytes) {
+                    "ERR message too large"
+                }
+                else {
+                    $command = [System.Text.Encoding]::UTF8.GetString($payload)
+                    WdGetControlResponse -Command $command -Protocol "UDP" -RemoteAddress $remoteEndpoint.Address
+                }
+
+                if ($null -ne $response) {
+                    try {
+                        $responseBytes = [System.Text.Encoding]::UTF8.GetBytes($response + "`r`n")
+                        [void]$Script:ControlUdpClient.Send($responseBytes, $responseBytes.Length, $remoteEndpoint)
+                    }
+                    catch {
+                        WdWriteLog "CONTROL: Failed to send UDP response to [$remoteEndpoint] - $($_.Exception.Message)" "DarkYellow"
+                    }
+                }
+            }
+        }
+        catch {
+            WdWriteLog "CONTROL: UDP polling failed - $($_.Exception.Message)" "Red"
+        }
+    }
+
+    if (-not $Script:ControlTcpListener) { return }
+
+    try {
+        while ($Script:ControlTcpListener.Pending()) {
+            $client = $Script:ControlTcpListener.AcceptTcpClient()
+            if ($Script:ControlTcpClients.Count -ge 32) {
+                try { $client.Close() } catch {}
+                WdWriteLog "CONTROL: Rejected TCP connection because the client limit was reached." "DarkYellow"
+                continue
+            }
+
+            $client.NoDelay = $true
+            $client.Client.SetSocketOption(
+                [System.Net.Sockets.SocketOptionLevel]::Socket,
+                [System.Net.Sockets.SocketOptionName]::KeepAlive,
+                $true
+            )
+            $remoteEndpoint = $client.Client.RemoteEndPoint
+            $state = [PSCustomObject]@{
+                Client        = $client
+                Stream        = $client.GetStream()
+                Buffer        = New-Object System.Text.StringBuilder
+                ConnectedAt   = Get-Date
+                LastActivity  = Get-Date
+                RemoteAddress = $remoteEndpoint.Address
+                TooLarge      = $false
+            }
+            [void]$Script:ControlTcpClients.Add($state)
+        }
+    }
+    catch {
+        WdWriteLog "CONTROL: TCP accept failed - $($_.Exception.Message)" "Red"
+    }
+
+    foreach ($state in @($Script:ControlTcpClients)) {
+        $shouldClose = $false
+        try {
+            # SelectRead + Available=0 means the peer closed the connection gracefully.
+            if ($state.Client.Client.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead) -and
+                $state.Client.Client.Available -eq 0) {
+                $shouldClose = $true
+            }
+
+            while ($state.Stream.DataAvailable) {
+                $readBuffer = [byte[]]::new(256)
+                $readCount = $state.Stream.Read($readBuffer, 0, $readBuffer.Length)
+                if ($readCount -le 0) {
+                    $shouldClose = $true
+                    break
+                }
+
+                $state.LastActivity = Get-Date
+                [void]$state.Buffer.Append([System.Text.Encoding]::UTF8.GetString($readBuffer, 0, $readCount))
+                if ($state.Buffer.Length -gt $ControlMaxMessageBytes) {
+                    $state.TooLarge = $true
+                    break
+                }
+            }
+
+            if ($state.TooLarge) {
+                WdSendTcpControlResponse -State $state -Response "ERR message too large"
+                [void]$state.Buffer.Clear()
+                $state.TooLarge = $false
+            }
+
+            # TCP 是字节流：按 CR/LF 拆分多条消息，并保留尚未完整的尾部数据。
+            $messages = New-Object System.Collections.ArrayList
+            $bufferText = $state.Buffer.ToString()
+            $delimiterIndex = $bufferText.IndexOfAny([char[]]"`r`n")
+            while ($delimiterIndex -ge 0) {
+                $message = $bufferText.Substring(0, $delimiterIndex)
+                if (-not [string]::IsNullOrWhiteSpace($message)) {
+                    [void]$messages.Add($message)
+                }
+
+                $nextIndex = $delimiterIndex + 1
+                while ($nextIndex -lt $bufferText.Length -and
+                    ($bufferText[$nextIndex] -eq "`r" -or $bufferText[$nextIndex] -eq "`n")) {
+                    $nextIndex++
+                }
+                $bufferText = $bufferText.Substring($nextIndex)
+                $delimiterIndex = $bufferText.IndexOfAny([char[]]"`r`n")
+            }
+            [void]$state.Buffer.Clear()
+            [void]$state.Buffer.Append($bufferText)
+
+            # 保持兼容：单条完整的已知指令无需换行符也会立即执行。
+            $candidate = $state.Buffer.ToString().Trim().ToLowerInvariant()
+            $knownCommands = @("ping", "heartbeat", "reboot", "shutdown", "restart")
+            if ($candidate -in $knownCommands) {
+                [void]$messages.Add($state.Buffer.ToString())
+                [void]$state.Buffer.Clear()
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                # TCP 可能把上一段未知数据与心跳粘在一起。仅允许安全的心跳做后缀恢复，
+                # reboot/shutdown/restart 必须完整、独立匹配，避免任意数据误触发系统操作。
+                $heartbeatSuffix = @("heartbeat", "ping") |
+                    Where-Object { $candidate.EndsWith($_, [System.StringComparison]::OrdinalIgnoreCase) } |
+                    Select-Object -First 1
+
+                if ($heartbeatSuffix) {
+                    [void]$messages.Add($heartbeatSuffix)
+                    [void]$state.Buffer.Clear()
+                }
+                else {
+                    $isKnownPrefix = $false
+                    foreach ($knownCommand in $knownCommands) {
+                        if ($knownCommand.StartsWith($candidate, [System.StringComparison]::OrdinalIgnoreCase)) {
+                            $isKnownPrefix = $true
+                            break
+                        }
+                    }
+
+                    if (-not $isKnownPrefix -or
+                        ((Get-Date) - $state.LastActivity).TotalMilliseconds -ge $ControlTcpPartialCommandTimeoutMilliseconds) {
+                        # 不能识别的数据直接丢弃，不能污染下一条指令。
+                        [void]$state.Buffer.Clear()
+                    }
+                }
+            }
+
+            foreach ($message in $messages) {
+                $response = WdGetControlResponse -Command $message -Protocol "TCP" -RemoteAddress $state.RemoteAddress
+                if ($null -ne $response) {
+                    WdSendTcpControlResponse -State $state -Response $response
+                }
+            }
+
+            if ($ControlTcpIdleTimeoutSeconds -gt 0 -and
+                ((Get-Date) - $state.LastActivity).TotalSeconds -ge $ControlTcpIdleTimeoutSeconds) {
+                WdWriteLog "CONTROL: Closing idle TCP client [$($state.RemoteAddress)] after $ControlTcpIdleTimeoutSeconds sec." "DarkGray"
+                $shouldClose = $true
+            }
+        }
+        catch {
+            WdWriteLog "CONTROL: TCP client processing failed - $($_.Exception.Message)" "DarkYellow"
+            $shouldClose = $true
+        }
+
+        if ($shouldClose) {
+            WdCloseTcpControlClient -State $state
+        }
+    }
+}
+
+function WdStartControlListeners {
+    if (-not $ControlEnabled) {
+        WdWriteLog "CONTROL: TCP / UDP control is disabled." "DarkGray"
+        return $true
+    }
+
+    try {
+        $bindAddress = [System.Net.IPAddress]::Parse($ControlListenAddress)
+        $tcpListener = [System.Net.Sockets.TcpListener]::new($bindAddress, $ControlPort)
+        $tcpListener.Server.ExclusiveAddressUse = $true
+        $tcpListener.Start()
+
+        $udpEndpoint = [System.Net.IPEndPoint]::new($bindAddress, $ControlPort)
+        $udpClient = [System.Net.Sockets.UdpClient]::new($bindAddress.AddressFamily)
+        $udpClient.Client.ExclusiveAddressUse = $true
+        $udpClient.Client.Bind($udpEndpoint)
+
+        $Script:ControlTcpListener = $tcpListener
+        $Script:ControlUdpClient = $udpClient
+        WdWriteLog "CONTROL: TCP and UDP listening on ${ControlListenAddress}:$ControlPort." "Green"
+        if (@($ControlAllowedRemoteAddresses).Count -eq 0) {
+            WdWriteLog "CONTROL: WARNING - all remote IP addresses are allowed." "DarkYellow"
+        }
+        return $true
+    }
+    catch {
+        WdWriteLog "CONTROL: Failed to start TCP / UDP listeners on ${ControlListenAddress}:$ControlPort - $($_.Exception.Message)" "Red"
+        WdStopControlListeners
+        return $false
+    }
+}
+
+function WdStopControlListeners {
+    foreach ($state in @($Script:ControlTcpClients)) {
+        WdCloseTcpControlClient -State $state
+    }
+    try { $Script:ControlTcpClients.Clear() } catch {}
+
+    if ($Script:ControlTcpListener) {
+        try { $Script:ControlTcpListener.Stop() } catch {}
+        $Script:ControlTcpListener = $null
+    }
+    if ($Script:ControlUdpClient) {
+        try { $Script:ControlUdpClient.Close() } catch {}
+        try { $Script:ControlUdpClient.Dispose() } catch {}
+        $Script:ControlUdpClient = $null
+    }
+}
+
+function WdRestartTopmostApps {
+    $restartCount = 0
+
+    foreach ($path in $Apps.Keys) {
+        $config = $Apps[$path]
+        if (-not $config.ContainsKey("FocusTop") -or -not [bool]$config.FocusTop) { continue }
+
+        if (WdIsBrowserUrl -Path $path) {
+            try { $fileName = "[$(([System.Uri]$path).Host)]" }
+            catch { $fileName = $path }
+        }
+        else {
+            $fileName = [System.IO.Path]::GetFileName($path)
+        }
+
+        $restartDelay = WdGetConfigInt -Config $config -Name "Restart" -DefaultValue 0 -Minimum 0
+        $killTree = if ($config.ContainsKey("KillTreeOnHang")) { [bool]$config.KillTreeOnHang } else { $true }
+        $processes = WdGetTargetProcess -Path $path
+
+        WdWriteLog "CONTROL: Restarting topmost target $fileName; relaunch scheduled in $restartDelay sec." "Yellow"
+        foreach ($process in @($processes)) {
+            $processId = WdGetProcessId $process
+            if ($processId -gt 0) {
+                [void](WdStopProcessTreeSafe -ProcessId $processId -KillTree $killTree)
+            }
+            if ($process -is [System.Diagnostics.Process]) {
+                try { $process.Dispose() } catch {}
+            }
+        }
+
+        foreach ($key in @($RestartStats.Keys)) {
+            if ([string]$key -like "${path}::H*") { $RestartStats.Remove($key) }
+        }
+        $RestartStats["${path}::Once"] = $false
+        $ScheduledLaunch[$path] = (Get-Date).AddSeconds($restartDelay)
+        [void]$LaunchTime.Remove($path)
+        [void]$DisplayRepairDone.Remove($path)
+        $HangFailCount[$path] = 0
+        $FastExitFailCount[$path] = 0
+        [void]$FastExitHandledLaunch.Remove($path)
+        [void]$LastStartAttempt.Remove($path)
+        [void]$DisplayChangeRestartInProgress.Remove($path)
+        $restartCount++
+    }
+
+    WdWriteLog "CONTROL: Topmost target restart scheduling complete. Targets=$restartCount." "DarkGreen"
+}
+
+function WdInvokePendingControlActions {
+    if ($Script:PendingSystemPowerAction) {
+        $action = $Script:PendingSystemPowerAction
+        $Script:PendingSystemPowerAction = $null
+        $Script:PendingControlRestart = $false
+        $shutdownExe = Join-Path $env:SystemRoot "System32\shutdown.exe"
+        $arguments = if ($action -eq "reboot") { "/r /t 0 /f" } else { "/s /t 0 /f" }
+
+        try {
+            WdWriteLog "CONTROL: Executing system $action." "Red"
+            Start-Process -FilePath $shutdownExe -ArgumentList $arguments -ErrorAction Stop | Out-Null
+        }
+        catch {
+            WdWriteLog "CONTROL: Failed to execute system $action - $($_.Exception.Message)" "Red"
+        }
+        return
+    }
+
+    if ($Script:PendingControlRestart) {
+        $Script:PendingControlRestart = $false
+        WdRestartTopmostApps
+    }
+}
+
+function WdWaitWithControlPolling {
+    param([int]$Milliseconds)
+
+    $deadline = (Get-Date).AddMilliseconds([Math]::Max(0, $Milliseconds))
+    do {
+        WdPollControlListeners
+        WdInvokePendingControlActions
+
+        $remaining = [int][Math]::Ceiling(($deadline - (Get-Date)).TotalMilliseconds)
+        if ($remaining -gt 0) {
+            Start-Sleep -Milliseconds ([Math]::Min(100, $remaining))
+        }
+    } while ((Get-Date) -lt $deadline)
+}
+
+# =================== 5.2 Compatibility layer (legacy -> Wd* APIs) ===================
 # Keep legacy function-name wrappers to preserve runtime compatibility.
 # New integrations should use Wd* interface names directly.
 function Open-LogWriter { return WdOpenLogWriter @PSBoundParameters }
@@ -1518,6 +1947,7 @@ WdWriteLog "INFO: Min restart gap = $MinRestartGapSeconds sec, Display loop repa
 WdWriteLog "INFO: Hang restart threshold = $HangConsecutiveFailuresToRestart consecutive failures" "DarkGray"
 WdWriteLog "INFO: Display change debounce = $DisplayChangeDebounceSeconds sec" "DarkGray"
 WdWriteLog "INFO: Process stop timeout = $ProcessStopTimeoutSeconds sec, Fast-exit max backoff = $FastExitMaxBackoffSeconds sec" "DarkGray"
+WdWriteLog "INFO: Control commands = reboot, shutdown, restart; heartbeat = ping / heartbeat (TCP / UDP UTF-8 text)" "DarkGray"
 
 $startupCursorRestoreNeeded = $false
 foreach ($startupPath in $Apps.Keys) {
@@ -1560,11 +1990,12 @@ $DisplayChangeRestartInProgress = @{}
 if ($DisplayTopologyFingerprint) {
     WdWriteLog "DISPLAY-CHANGE: Initial topology fingerprint = [$DisplayTopologyFingerprint]" "DarkGray"
 }
+[void](WdStartControlListeners)
 
 # =================== 7. 主循环 ===================
 try {
     while ($true) {
-        Start-Sleep -Milliseconds 200  # preventive: guards against CPU spin if an exception bypasses the end-of-loop sleep
+        WdWaitWithControlPolling -Milliseconds 200  # preventive: guards against CPU spin and keeps control responsive
         try {
             WdRotateLog
             $CurrentHour = (Get-Date).Hour
@@ -1581,7 +2012,7 @@ try {
                     $DisplayChangeRestartInProgress.Clear()
                 }
                 $FirstRun = $false
-                Start-Sleep -Seconds $CheckInterval
+                WdWaitWithControlPolling -Milliseconds ($CheckInterval * 1000)
                 continue
             }
 
@@ -2002,14 +2433,14 @@ try {
 
             if ($monitoringPaused) {
                 $FirstRun = $false
-                Start-Sleep -Seconds $CheckInterval
+                WdWaitWithControlPolling -Milliseconds ($CheckInterval * 1000)
                 continue
             }
 
             $disableReason = WdGetDisableReason
             if (WdUpdateDisableState -DisableReason $disableReason) {
                 $FirstRun = $false
-                Start-Sleep -Seconds $CheckInterval
+                WdWaitWithControlPolling -Milliseconds ($CheckInterval * 1000)
                 continue
             }
 
@@ -2034,11 +2465,12 @@ try {
             WdWriteLog "LOOP-ERROR: StackTrace: $($_.ScriptStackTrace)" "DarkRed"
         }
 
-        Start-Sleep -Seconds $CheckInterval
+        WdWaitWithControlPolling -Milliseconds ($CheckInterval * 1000)
     }
 }
 finally {
     try { WdWriteLog "=== Watchdog shutting down. Releasing resources... ===" "Yellow" } catch {}
+    WdStopControlListeners
     WdCloseLogWriter
     try { WdRestoreSystemCursor } catch {}
 
