@@ -105,6 +105,11 @@ $MatchFullPathForScripts = $true
 # 脚本类命令行匹配时是否需要严格引号边界（为兼容复杂场景默认 false）
 $StrictScriptPathBoundary = $false
 
+# 看门狗界面：隐藏自身 PowerShell 控制台，并在通知区域显示托盘图标。
+$HideWatchdogConsole = $true
+$ShowTrayIcon = $true
+$TrayIconPath = Join-Path $PSScriptRoot "watchdog.ico"  # 文件不存在时使用 Windows 系统图标
+
 # TCP / UDP 远程控制。两种协议可使用相同端口号。
 # 支持的 UTF-8 纯文本指令：reboot、shutdown、restart、VOL ...；心跳：ping、heartbeat
 $ControlEnabled = $true
@@ -199,6 +204,7 @@ if (-not $Script:MutexOwned) {
 
 # =================== 2.5 退出清理钩子 ===================
 $Script:ShutdownCleanupDone = $false
+$Script:ExitRequested = $false
 
 function WdInvokeShutdownCleanup {
     if ($Script:ShutdownCleanupDone) { return }
@@ -208,6 +214,14 @@ function WdInvokeShutdownCleanup {
     try {
         if (Get-Command WdRestoreSystemCursor -ErrorAction SilentlyContinue) {
             WdRestoreSystemCursor
+        }
+    }
+    catch {}
+
+    # 移除通知区域图标及右键菜单
+    try {
+        if (Get-Command WdDisposeTrayIcon -ErrorAction SilentlyContinue) {
+            WdDisposeTrayIcon
         }
     }
     catch {}
@@ -2164,11 +2178,103 @@ function WdInvokePendingControlActions {
     }
 }
 
+# =================== 5.2 托盘图标 ===================
+$Script:TrayNotifyIcon = $null
+$Script:TrayContextMenu = $null
+$Script:TrayExitMenuItem = $null
+$Script:TrayOwnedIcon = $null
+
+function WdHideWatchdogConsoleWindow {
+    if (-not $HideWatchdogConsole) { return }
+
+    try {
+        $consoleWindow = [WatchdogWin32.DisplayAPI]::GetConsoleWindow()
+        if ($consoleWindow -ne [IntPtr]::Zero) {
+            [void][WatchdogWin32.DisplayAPI]::ShowWindow($consoleWindow, 0)
+        }
+    }
+    catch {
+        WdWriteLog "TRAY: Failed to hide PowerShell console - $($_.Exception.Message)" "DarkYellow"
+    }
+}
+
+function WdInitializeTrayIcon {
+    if (-not $ShowTrayIcon) { return $true }
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+
+        $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
+        $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
+        $exitMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem
+        $exitMenuItem.Text = "退出看门狗"
+        $exitMenuItem.add_Click({
+                $Script:ExitRequested = $true
+            })
+        [void]$contextMenu.Items.Add($exitMenuItem)
+
+        $ownedIcon = $null
+        if (-not [string]::IsNullOrWhiteSpace($TrayIconPath) -and (Test-Path -LiteralPath $TrayIconPath)) {
+            $ownedIcon = New-Object System.Drawing.Icon($TrayIconPath)
+            $notifyIcon.Icon = $ownedIcon
+        }
+        else {
+            $notifyIcon.Icon = [System.Drawing.SystemIcons]::Shield
+        }
+
+        $notifyIcon.Text = "Watchdog 正在运行"
+        $notifyIcon.ContextMenuStrip = $contextMenu
+        $notifyIcon.Visible = $true
+
+        $Script:TrayNotifyIcon = $notifyIcon
+        $Script:TrayContextMenu = $contextMenu
+        $Script:TrayExitMenuItem = $exitMenuItem
+        $Script:TrayOwnedIcon = $ownedIcon
+        WdWriteLog "TRAY: Notification icon initialized. Right-click and choose Exit Watchdog to stop." "DarkGray"
+        return $true
+    }
+    catch {
+        WdWriteLog "TRAY: Failed to initialize notification icon - $($_.Exception.Message)" "DarkYellow"
+        WdDisposeTrayIcon
+        return $false
+    }
+}
+
+function WdPumpTrayEvents {
+    if (-not $Script:TrayNotifyIcon) { return }
+    try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+}
+
+function WdDisposeTrayIcon {
+    if ($Script:TrayNotifyIcon) {
+        try { $Script:TrayNotifyIcon.Visible = $false } catch {}
+        try { $Script:TrayNotifyIcon.Dispose() } catch {}
+        $Script:TrayNotifyIcon = $null
+    }
+    if ($Script:TrayExitMenuItem) {
+        try { $Script:TrayExitMenuItem.Dispose() } catch {}
+        $Script:TrayExitMenuItem = $null
+    }
+    if ($Script:TrayContextMenu) {
+        try { $Script:TrayContextMenu.Dispose() } catch {}
+        $Script:TrayContextMenu = $null
+    }
+    if ($Script:TrayOwnedIcon) {
+        try { $Script:TrayOwnedIcon.Dispose() } catch {}
+        $Script:TrayOwnedIcon = $null
+    }
+    try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+}
+
 function WdWaitWithControlPolling {
     param([int]$Milliseconds)
 
     $deadline = (Get-Date).AddMilliseconds([Math]::Max(0, $Milliseconds))
     do {
+        WdPumpTrayEvents
+        if ($Script:ExitRequested) { break }
+
         WdPollControlListeners
         WdInvokePendingControlActions
 
@@ -2176,10 +2282,10 @@ function WdWaitWithControlPolling {
         if ($remaining -gt 0) {
             Start-Sleep -Milliseconds ([Math]::Min(100, $remaining))
         }
-    } while ((Get-Date) -lt $deadline)
+    } while ((Get-Date) -lt $deadline -and -not $Script:ExitRequested)
 }
 
-# =================== 5.2 Compatibility layer (legacy -> Wd* APIs) ===================
+# =================== 5.3 Compatibility layer (legacy -> Wd* APIs) ===================
 # Keep legacy function-name wrappers to preserve runtime compatibility.
 # New integrations should use Wd* interface names directly.
 function Open-LogWriter { return WdOpenLogWriter @PSBoundParameters }
@@ -2204,6 +2310,13 @@ function Start-App { return WdStartApp @PSBoundParameters }
 # =================== 6. 初始化 ===================
 WdEnsureDirectory -Path $WatchdogRoot
 WdOpenLogWriter
+$trayInitialized = [bool](WdInitializeTrayIcon)
+if (-not $ShowTrayIcon -or $trayInitialized) {
+    WdHideWatchdogConsoleWindow
+}
+elseif ($HideWatchdogConsole) {
+    WdWriteLog "TRAY: Console remains visible because tray initialization failed." "DarkYellow"
+}
 
 WdWriteLog "=== Watchdog Service Active (Monitor Count: $($Apps.Count)) ===" "Yellow"
 WdWriteLog "INFO: Disable flag path = $DisableFlag" "DarkGray"
@@ -2216,6 +2329,7 @@ WdWriteLog "INFO: Hang restart threshold = $HangConsecutiveFailuresToRestart con
 WdWriteLog "INFO: Display change debounce = $DisplayChangeDebounceSeconds sec" "DarkGray"
 WdWriteLog "INFO: Process stop timeout = $ProcessStopTimeoutSeconds sec, Fast-exit max backoff = $FastExitMaxBackoffSeconds sec" "DarkGray"
 WdWriteLog "INFO: Control commands = reboot, shutdown, restart, VOL GET/SET/INC/DEC/MUTE; heartbeat = ping / heartbeat (TCP / UDP UTF-8 text)" "DarkGray"
+WdWriteLog "INFO: Console hidden = $HideWatchdogConsole, Tray icon = $ShowTrayIcon" "DarkGray"
 
 $startupCursorRestoreNeeded = $false
 foreach ($startupPath in $Apps.Keys) {
@@ -2262,8 +2376,9 @@ if ($DisplayTopologyFingerprint) {
 
 # =================== 7. 主循环 ===================
 try {
-    while ($true) {
+    while (-not $Script:ExitRequested) {
         WdWaitWithControlPolling -Milliseconds 200  # preventive: guards against CPU spin and keeps control responsive
+        if ($Script:ExitRequested) { break }
         try {
             WdRotateLog
             $CurrentHour = (Get-Date).Hour
@@ -2738,6 +2853,7 @@ try {
 }
 finally {
     try { WdWriteLog "=== Watchdog shutting down. Releasing resources... ===" "Yellow" } catch {}
+    WdDisposeTrayIcon
     WdStopControlListeners
     WdCloseLogWriter
     try { WdRestoreSystemCursor } catch {}
