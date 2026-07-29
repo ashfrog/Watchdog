@@ -2208,7 +2208,7 @@ function WdInitializeTrayIcon {
         $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
         $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
         $exitMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem
-        $exitMenuItem.Text = "退出看门狗"
+        $exitMenuItem.Text = "退出"
         $exitMenuItem.add_Click({
                 $Script:ExitRequested = $true
             })
@@ -2223,7 +2223,7 @@ function WdInitializeTrayIcon {
             $notifyIcon.Icon = [System.Drawing.SystemIcons]::Shield
         }
 
-        $notifyIcon.Text = "Watchdog 正在运行"
+        $notifyIcon.Text = "守护进程"
         $notifyIcon.ContextMenuStrip = $contextMenu
         $notifyIcon.Visible = $true
 
