@@ -106,10 +106,10 @@ $MatchFullPathForScripts = $true
 $StrictScriptPathBoundary = $false
 
 # TCP / UDP 远程控制。两种协议可使用相同端口号。
-# 支持的 UTF-8 纯文本指令：reboot、shutdown、restart；心跳：ping、heartbeat
+# 支持的 UTF-8 纯文本指令：reboot、shutdown、restart、VOL ...；心跳：ping、heartbeat
 $ControlEnabled = $true
 $ControlListenAddress = "0.0.0.0"
-$ControlPort = 19099
+$ControlPort = 55555
 $ControlMaxMessageBytes = 256
 
 # TCP 空闲连接超时秒数；0 表示 Watchdog 不主动断开空闲连接。
@@ -117,6 +117,9 @@ $ControlTcpIdleTimeoutSeconds = 0
 
 # 未带换行符的 TCP 数据若只是已知指令的前缀，最多等待这么久；之后静默丢弃。
 $ControlTcpPartialCommandTimeoutMilliseconds = 500
+
+# 无换行的数字类指令等待短暂稳定，避免 VOL SET 50 被 TCP 分包成 VOL SET 5 和 0。
+$ControlTcpCommandSettleMilliseconds = 75
 
 # 允许发送控制指令的远端 IP。空数组表示允许所有来源；生产环境建议填写固定管理端 IP。
 # 示例：@("127.0.0.1", "192.168.1.10")
@@ -413,6 +416,188 @@ namespace WatchdogWin32
             try { WdInvokeShutdownCleanup } catch {}
             exit 1
         }
+    }
+}
+
+# =================== 3.1 Windows Core Audio API 注入 ===================
+if (-not ([System.Management.Automation.PSTypeName]'WatchdogAudio.AudioAPI').Type) {
+    $audioApiCode = @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace WatchdogAudio
+{
+    enum EDataFlow { eRender = 0, eCapture = 1, eAll = 2 }
+    enum ERole { eConsole = 0, eMultimedia = 1, eCommunications = 2 }
+
+    [Flags]
+    enum CLSCTX : uint
+    {
+        InprocServer = 0x1,
+        InprocHandler = 0x2,
+        LocalServer = 0x4,
+        RemoteServer = 0x10,
+        All = InprocServer | InprocHandler | LocalServer | RemoteServer
+    }
+
+    [ComImport]
+    [Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    class MMDeviceEnumerator { }
+
+    [ComImport]
+    [Guid("A95664D2-9614-4F35-A746-DE8DB63617E6")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator
+    {
+        [PreserveSig] int EnumAudioEndpoints(EDataFlow dataFlow, uint stateMask, IntPtr devices);
+        [PreserveSig] int GetDefaultAudioEndpoint(EDataFlow dataFlow, ERole role, out IMMDevice device);
+    }
+
+    [ComImport]
+    [Guid("D666063F-1587-4E43-81F1-B948E807363F")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice
+    {
+        [PreserveSig]
+        int Activate(ref Guid iid, CLSCTX clsCtx, IntPtr activationParams,
+            [MarshalAs(UnmanagedType.IUnknown)] out object interfacePointer);
+    }
+
+    [ComImport]
+    [Guid("5CDF2C82-841E-4546-9722-0CF74078229A")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioEndpointVolume
+    {
+        [PreserveSig] int RegisterControlChangeNotify(IntPtr notify);
+        [PreserveSig] int UnregisterControlChangeNotify(IntPtr notify);
+        [PreserveSig] int GetChannelCount(out uint channelCount);
+        [PreserveSig] int SetMasterVolumeLevel(float levelDb, ref Guid eventContext);
+        [PreserveSig] int SetMasterVolumeLevelScalar(float level, ref Guid eventContext);
+        [PreserveSig] int GetMasterVolumeLevel(out float levelDb);
+        [PreserveSig] int GetMasterVolumeLevelScalar(out float level);
+        [PreserveSig] int SetChannelVolumeLevel(uint channel, float levelDb, ref Guid eventContext);
+        [PreserveSig] int SetChannelVolumeLevelScalar(uint channel, float level, ref Guid eventContext);
+        [PreserveSig] int GetChannelVolumeLevel(uint channel, out float levelDb);
+        [PreserveSig] int GetChannelVolumeLevelScalar(uint channel, out float level);
+        [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, ref Guid eventContext);
+        [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool mute);
+    }
+
+    public sealed class AudioState
+    {
+        public int Volume { get; set; }
+        public bool Muted { get; set; }
+    }
+
+    public static class AudioAPI
+    {
+        static IAudioEndpointVolume GetEndpoint(out object enumeratorObject, out object deviceObject)
+        {
+            IMMDeviceEnumerator enumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+            IMMDevice device;
+            int hr = enumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eMultimedia, out device);
+            if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+
+            Guid iid = typeof(IAudioEndpointVolume).GUID;
+            object endpointObject;
+            hr = device.Activate(ref iid, CLSCTX.All, IntPtr.Zero, out endpointObject);
+            if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+
+            enumeratorObject = enumerator;
+            deviceObject = device;
+            return (IAudioEndpointVolume)endpointObject;
+        }
+
+        static void Release(object value)
+        {
+            if (value != null && Marshal.IsComObject(value))
+                Marshal.FinalReleaseComObject(value);
+        }
+
+        public static AudioState GetState()
+        {
+            object enumerator = null;
+            object device = null;
+            IAudioEndpointVolume endpoint = null;
+            try
+            {
+                endpoint = GetEndpoint(out enumerator, out device);
+                float scalar;
+                bool muted;
+                int hr = endpoint.GetMasterVolumeLevelScalar(out scalar);
+                if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+                hr = endpoint.GetMute(out muted);
+                if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+                return new AudioState
+                {
+                    Volume = (int)Math.Round(scalar * 100.0, MidpointRounding.AwayFromZero),
+                    Muted = muted
+                };
+            }
+            finally
+            {
+                Release(endpoint);
+                Release(device);
+                Release(enumerator);
+            }
+        }
+
+        public static AudioState SetVolume(int percent)
+        {
+            percent = Math.Max(0, Math.Min(100, percent));
+            object enumerator = null;
+            object device = null;
+            IAudioEndpointVolume endpoint = null;
+            try
+            {
+                endpoint = GetEndpoint(out enumerator, out device);
+                Guid context = Guid.Empty;
+                int hr = endpoint.SetMasterVolumeLevelScalar(percent / 100.0f, ref context);
+                if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+            }
+            finally
+            {
+                Release(endpoint);
+                Release(device);
+                Release(enumerator);
+            }
+            return GetState();
+        }
+
+        public static AudioState AdjustVolume(int delta)
+        {
+            AudioState current = GetState();
+            return SetVolume(current.Volume + delta);
+        }
+
+        public static AudioState SetMute(bool muted)
+        {
+            object enumerator = null;
+            object device = null;
+            IAudioEndpointVolume endpoint = null;
+            try
+            {
+                endpoint = GetEndpoint(out enumerator, out device);
+                Guid context = Guid.Empty;
+                int hr = endpoint.SetMute(muted, ref context);
+                if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+            }
+            finally
+            {
+                Release(endpoint);
+                Release(device);
+                Release(enumerator);
+            }
+            return GetState();
+        }
+    }
+}
+"@
+    try {
+        Add-Type -TypeDefinition $audioApiCode -Language CSharp -ErrorAction Stop
+    }
+    catch {
+        Write-Host "WARNING: Failed to load Core Audio API type: $($_.Exception.Message)"
     }
 }
 
@@ -1530,6 +1715,86 @@ function WdTestControlRemoteAllowed {
     return $false
 }
 
+function WdFormatVolumeState {
+    param($State)
+
+    if ($null -eq $State) { return "ERR volume state unavailable" }
+    $muteValue = if ([bool]$State.Muted) { 1 } else { 0 }
+    return "VOL $([int]$State.Volume) MUTE $muteValue"
+}
+
+function WdInvokeVolumeCommand {
+    param([string]$Command)
+
+    if (-not ([System.Management.Automation.PSTypeName]'WatchdogAudio.AudioAPI').Type) {
+        return "ERR volume control unavailable"
+    }
+
+    $normalized = ([regex]::Replace($Command.Trim(), '\s+', ' ')).ToUpperInvariant()
+    try {
+        if ($normalized -eq "VOL GET") {
+            return WdFormatVolumeState -State ([WatchdogAudio.AudioAPI]::GetState())
+        }
+
+        if ($normalized -match '^VOL (SET|INC|DEC) ([0-9]{1,3})$') {
+            $operation = $Matches[1]
+            $amount = [int]$Matches[2]
+            if ($amount -lt 0 -or $amount -gt 100) {
+                return "ERR volume value must be between 0 and 100"
+            }
+
+            $state = switch ($operation) {
+                "SET" { [WatchdogAudio.AudioAPI]::SetVolume($amount) }
+                "INC" { [WatchdogAudio.AudioAPI]::AdjustVolume($amount) }
+                "DEC" { [WatchdogAudio.AudioAPI]::AdjustVolume(-$amount) }
+            }
+            WdWriteLog "CONTROL: Applied [$normalized]." "DarkCyan"
+            return WdFormatVolumeState -State $state
+        }
+
+        if ($normalized -match '^VOL MUTE ([01])$') {
+            $muted = ($Matches[1] -eq "1")
+            $state = [WatchdogAudio.AudioAPI]::SetMute($muted)
+            WdWriteLog "CONTROL: Applied [$normalized]." "DarkCyan"
+            return WdFormatVolumeState -State $state
+        }
+
+        return "ERR VOL syntax: VOL GET | VOL SET/INC/DEC 0-100 | VOL MUTE 0/1"
+    }
+    catch {
+        WdWriteLog "CONTROL: Volume command failed - $($_.Exception.Message)" "Red"
+        return "ERR volume control failed"
+    }
+}
+
+function WdTestCompleteVolumeCommand {
+    param([string]$Command)
+
+    $normalized = [regex]::Replace($Command.Trim(), '\s+', ' ')
+    return ($normalized -match '^(?i:VOL GET)$' -or
+        $normalized -match '^(?i:VOL (SET|INC|DEC) [0-9]{1,3})$' -or
+        $normalized -match '^(?i:VOL MUTE [01])$')
+}
+
+function WdTestControlCommandPrefix {
+    param([string]$Candidate)
+
+    if ([string]::IsNullOrWhiteSpace($Candidate)) { return $true }
+    $normalized = ([regex]::Replace($Candidate.TrimStart(), '\s+', ' ')).ToLowerInvariant()
+    $templates = @(
+        "ping", "heartbeat", "reboot", "shutdown", "restart",
+        "vol get", "vol set 000", "vol inc 000", "vol dec 000", "vol mute 0", "vol mute 1"
+    )
+
+    foreach ($template in $templates) {
+        if ($template.StartsWith($normalized, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return ($normalized -match '^vol (set|inc|dec) [0-9]{1,3}$')
+}
+
 function WdGetControlResponse {
     param(
         [string]$Command,
@@ -1544,6 +1809,10 @@ function WdGetControlResponse {
     }
 
     $normalizedCommand = if ($null -eq $Command) { "" } else { $Command.Trim().ToLowerInvariant() }
+    if ($normalizedCommand -match '^vol(?:\s|$)') {
+        return WdInvokeVolumeCommand -Command $Command
+    }
+
     switch ($normalizedCommand) {
         { $_ -in @("ping", "heartbeat") } {
             return "pong"
@@ -1723,6 +1992,11 @@ function WdPollControlListeners {
                 [void]$messages.Add($state.Buffer.ToString())
                 [void]$state.Buffer.Clear()
             }
+            elseif ((WdTestCompleteVolumeCommand -Command $candidate) -and
+                ((Get-Date) - $state.LastActivity).TotalMilliseconds -ge $ControlTcpCommandSettleMilliseconds) {
+                [void]$messages.Add($state.Buffer.ToString())
+                [void]$state.Buffer.Clear()
+            }
             elseif (-not [string]::IsNullOrWhiteSpace($candidate)) {
                 # TCP 可能把上一段未知数据与心跳粘在一起。仅允许安全的心跳做后缀恢复，
                 # reboot/shutdown/restart 必须完整、独立匹配，避免任意数据误触发系统操作。
@@ -1735,13 +2009,7 @@ function WdPollControlListeners {
                     [void]$state.Buffer.Clear()
                 }
                 else {
-                    $isKnownPrefix = $false
-                    foreach ($knownCommand in $knownCommands) {
-                        if ($knownCommand.StartsWith($candidate, [System.StringComparison]::OrdinalIgnoreCase)) {
-                            $isKnownPrefix = $true
-                            break
-                        }
-                    }
+                    $isKnownPrefix = WdTestControlCommandPrefix -Candidate $candidate
 
                     if (-not $isKnownPrefix -or
                         ((Get-Date) - $state.LastActivity).TotalMilliseconds -ge $ControlTcpPartialCommandTimeoutMilliseconds) {
@@ -1947,7 +2215,7 @@ WdWriteLog "INFO: Min restart gap = $MinRestartGapSeconds sec, Display loop repa
 WdWriteLog "INFO: Hang restart threshold = $HangConsecutiveFailuresToRestart consecutive failures" "DarkGray"
 WdWriteLog "INFO: Display change debounce = $DisplayChangeDebounceSeconds sec" "DarkGray"
 WdWriteLog "INFO: Process stop timeout = $ProcessStopTimeoutSeconds sec, Fast-exit max backoff = $FastExitMaxBackoffSeconds sec" "DarkGray"
-WdWriteLog "INFO: Control commands = reboot, shutdown, restart; heartbeat = ping / heartbeat (TCP / UDP UTF-8 text)" "DarkGray"
+WdWriteLog "INFO: Control commands = reboot, shutdown, restart, VOL GET/SET/INC/DEC/MUTE; heartbeat = ping / heartbeat (TCP / UDP UTF-8 text)" "DarkGray"
 
 $startupCursorRestoreNeeded = $false
 foreach ($startupPath in $Apps.Keys) {
