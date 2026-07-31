@@ -507,18 +507,24 @@ namespace WatchdogAudio
     {
         static IAudioEndpointVolume GetEndpoint(out object enumeratorObject, out object deviceObject)
         {
+            enumeratorObject = null;
+            deviceObject = null;
             IMMDeviceEnumerator enumerator = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+            enumeratorObject = enumerator;
             IMMDevice device;
             int hr = enumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eMultimedia, out device);
+            deviceObject = device;
             if (hr != 0) Marshal.ThrowExceptionForHR(hr);
 
             Guid iid = typeof(IAudioEndpointVolume).GUID;
             object endpointObject;
             hr = device.Activate(ref iid, CLSCTX.All, IntPtr.Zero, out endpointObject);
-            if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+            if (hr != 0)
+            {
+                Release(endpointObject);
+                Marshal.ThrowExceptionForHR(hr);
+            }
 
-            enumeratorObject = enumerator;
-            deviceObject = device;
             return (IAudioEndpointVolume)endpointObject;
         }
 
@@ -632,15 +638,14 @@ function WdOpenLogWriter {
 }
 
 function WdCloseLogWriter {
-    if ($Script:LogWriter) {
-        try {
-            $Script:LogWriter.Flush()
-            $Script:LogWriter.Close()
-            $Script:LogWriter.Dispose()
-        }
-        catch {}
-        $Script:LogWriter = $null
-    }
+    $writer = $Script:LogWriter
+    $Script:LogWriter = $null
+    if (-not $writer) { return }
+
+    # Keep cleanup steps independent: a failed Flush must not prevent Close/Dispose.
+    try { $writer.Flush() } catch {}
+    try { $writer.Close() } catch {}
+    try { $writer.Dispose() } catch {}
 }
 
 # =================== 5. 辅助函数 ===================
@@ -739,7 +744,8 @@ function WdWriteLog {
             return
         }
         catch {
-            $Script:LogWriter = $null
+            # Release the failed writer before AppendAllText opens the same file.
+            WdCloseLogWriter
         }
     }
 
@@ -767,12 +773,27 @@ function WdNormalizePathSafe {
     }
 }
 
+function WdIsTaskManagerRunning {
+    # 独立封装，确保 Get-Process 返回的进程句柄一定会被释放，
+    # 避免任务管理器长期开着时 Watchdog 每轮巡检都泄漏一个句柄。
+    $procs = $null
+    try {
+        $procs = Get-Process -Name "taskmgr" -ErrorAction SilentlyContinue
+        return [bool]$procs
+    }
+    finally {
+        if ($procs) {
+            @($procs) | ForEach-Object { try { $_.Dispose() } catch {} }
+        }
+    }
+}
+
 function WdGetDisableReason {
     if (Test-Path $DisableFlag) {
         return "disable.flag"
     }
 
-    if (Get-Process -Name "taskmgr" -ErrorAction SilentlyContinue) {
+    if (WdIsTaskManagerRunning) {
         return "Task Manager"
     }
 
@@ -1104,33 +1125,94 @@ function WdGetProcessId {
     return $ProcessObj.ProcessId
 }
 
+# 统一释放 WdGetTargetProcess 返回的进程对象。该函数对 .exe 类目标返回
+# System.Diagnostics.Process，对脚本类(.py/.bat)与浏览器 URL 类目标返回
+# Microsoft.Management.Infrastructure.CimInstance（Win32_Process）。
+# 此前全文各处的释放逻辑只判断了 Process 类型，CimInstance 从未被释放，
+# 导致长期监控脚本类/URL类条目时持续泄漏 WMI/COM 资源。
+function WdDisposeProcessResult {
+    param($ProcessObj)
+    if ($null -eq $ProcessObj) { return }
+    if ($ProcessObj -is [System.Diagnostics.Process]) {
+        try { $ProcessObj.Dispose() } catch {}
+    }
+    elseif ($ProcessObj -is [Microsoft.Management.Infrastructure.CimInstance]) {
+        try { $ProcessObj.Dispose() } catch {}
+    }
+}
+
 function WdGetTargetProcess {
     param(
         [string]$Path
     )
 
-    $CurrentPID = [System.Diagnostics.Process]::GetCurrentProcess().Id
+    # 使用 PowerShell 自动变量 $PID，避免为读取当前 PID 创建临时 Process 对象。
     $NormalizedPath = WdNormalizePathSafe $Path
 
     if (WdIsBrowserUrl -Path $Path) {
-        $profileBase = Join-Path $WatchdogRoot "browser_profiles"
-        $profileDir = (Join-Path $profileBase (WdSanitizeForPath -Url $Path)).ToLowerInvariant()
-        return Get-CimInstance Win32_Process -Filter "Name='chrome.exe' OR Name='msedge.exe'" -ErrorAction SilentlyContinue | Where-Object {
-            $procName = $_.Name.ToLowerInvariant() -replace '\.exe$', ''
-            $cmdLine = if ($_.CommandLine) { $_.CommandLine.ToLowerInvariant() } else { "" }
-            $_.ProcessId -ne $CurrentPID -and
-            ($procName -eq "chrome" -or $procName -eq "msedge") -and
-            $cmdLine.Contains($profileDir) -and
-            $cmdLine -notmatch '--type='
+        $browserProcesses = @()
+        $cimCandidates = @()
+        try {
+            $profileBase = Join-Path $WatchdogRoot "browser_profiles"
+            $profileDir = (Join-Path $profileBase (WdSanitizeForPath -Url $Path)).ToLowerInvariant()
+
+            # MainWindowHandle can temporarily be zero while Chromium creates or recreates
+            # its window, so use every browser PID for the narrow CIM command-line query.
+            $browserProcesses = @(Get-Process -Name "chrome", "msedge" -ErrorAction SilentlyContinue)
+            $candidateIds = @($browserProcesses |
+                Where-Object { $_.Id -ne $PID } |
+                ForEach-Object { $_.Id })
+
+            if ($candidateIds.Count -eq 0) { return $null }
+
+            $idFilter = ($candidateIds | ForEach-Object { "ProcessId=$_" }) -join " OR "
+            $cimCandidates = @(Get-CimInstance Win32_Process -Filter $idFilter -ErrorAction SilentlyContinue)
+            $matches = @()
+            foreach ($candidate in $cimCandidates) {
+                $procName = $candidate.Name.ToLowerInvariant() -replace '\.exe$', ''
+                $cmdLine = if ($candidate.CommandLine) { $candidate.CommandLine.ToLowerInvariant() } else { "" }
+                if (($procName -eq "chrome" -or $procName -eq "msedge") -and
+                    $cmdLine.Contains($profileDir) -and
+                    $cmdLine -notmatch '--type=') {
+                    $matches += $candidate
+                }
+                else {
+                    WdDisposeProcessResult $candidate
+                }
+            }
+
+            return $matches
+        }
+        catch {
+            $cimCandidates | ForEach-Object { WdDisposeProcessResult $_ }
+            return $null
+        }
+        finally {
+            $browserProcesses | ForEach-Object { WdDisposeProcessResult $_ }
         }
     }
 
     try {
         if ($Path.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
             $exeName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
-            return Get-Process -Name $exeName -ErrorAction SilentlyContinue | Where-Object {
-                $_.Id -ne $CurrentPID -and $_.Path -and (WdNormalizePathSafe $_.Path) -eq $NormalizedPath
+            $processCandidates = @(Get-Process -Name $exeName -ErrorAction SilentlyContinue)
+            $matches = @()
+            foreach ($candidate in $processCandidates) {
+                $isMatch = $false
+                try {
+                    $isMatch = ($candidate.Id -ne $PID -and $candidate.Path -and
+                        (WdNormalizePathSafe $candidate.Path) -eq $NormalizedPath)
+                }
+                catch {}
+
+                if ($isMatch) {
+                    $matches += $candidate
+                }
+                else {
+                    WdDisposeProcessResult $candidate
+                }
             }
+            return $matches
         }
         else {
             $SearchName = if ($Path.EndsWith(".py", [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -1144,20 +1226,47 @@ function WdGetTargetProcess {
                 "powershell"
             }
 
-            $wmiFilter = "Name like '$SearchName%'"
-            $candidates = Get-CimInstance Win32_Process -Filter $wmiFilter -ErrorAction SilentlyContinue |
-            Where-Object { $_.ProcessId -ne $CurrentPID }
+            $nameProcesses = @()
+            $cimCandidates = @()
+            try {
+                # Resolve the inexpensive local process list first, then query CommandLine
+                # only for the resulting PIDs instead of scanning Win32_Process by name.
+                $nameProcesses = @(Get-Process -Name "$SearchName*" -ErrorAction SilentlyContinue)
+                $candidateIds = @($nameProcesses |
+                    Where-Object { $_.Id -ne $PID } |
+                    ForEach-Object { $_.Id })
 
-            if ($MatchFullPathForScripts) {
-                return $candidates | Where-Object {
-                    $_.CommandLine -and (WdIsScriptPathInCommandLine -CommandLine $_.CommandLine -TargetPath $Path)
+                if ($candidateIds.Count -eq 0) { return $null }
+
+                $idFilter = ($candidateIds | ForEach-Object { "ProcessId=$_" }) -join " OR "
+                $cimCandidates = @(Get-CimInstance Win32_Process -Filter $idFilter -ErrorAction SilentlyContinue)
+                $matches = @()
+                foreach ($candidate in $cimCandidates) {
+                    $isMatch = if ($MatchFullPathForScripts) {
+                        $candidate.CommandLine -and
+                        (WdIsScriptPathInCommandLine -CommandLine $candidate.CommandLine -TargetPath $Path)
+                    }
+                    else {
+                        $nameNeedle = [System.IO.Path]::GetFileName($Path).ToLowerInvariant()
+                        $candidate.CommandLine -and $candidate.CommandLine.ToLowerInvariant().Contains($nameNeedle)
+                    }
+
+                    if ($isMatch) {
+                        $matches += $candidate
+                    }
+                    else {
+                        WdDisposeProcessResult $candidate
+                    }
                 }
+
+                return $matches
             }
-            else {
-                $nameNeedle = [System.IO.Path]::GetFileName($Path).ToLowerInvariant()
-                return $candidates | Where-Object {
-                    $_.CommandLine -and $_.CommandLine.ToLowerInvariant().Contains($nameNeedle)
-                }
+            catch {
+                $cimCandidates | ForEach-Object { WdDisposeProcessResult $_ }
+                return $null
+            }
+            finally {
+                $nameProcesses | ForEach-Object { WdDisposeProcessResult $_ }
             }
         }
     }
@@ -1488,11 +1597,7 @@ function WdIsProcessMissing {
     $count = if ($procs) { ($procs | Measure-Object).Count } else { 0 }
 
     if ($procs) {
-        $procs | ForEach-Object {
-            if ($_ -is [System.Diagnostics.Process]) {
-                try { $_.Dispose() } catch {}
-            }
-        }
+        $procs | ForEach-Object { WdDisposeProcessResult $_ }
     }
 
     return ($count -eq 0)
@@ -1680,19 +1785,23 @@ function WdLaunchAndTrack {
         [string]$StatKey, [string]$OnceKey, [string]$BrowserName, [bool]$IsOnce,
         $RestartStats, $LaunchTime, $DisplayRepairDone, $HangFailCount, $LastStartedProcessId, $FastExitHandledLaunch
     )
-    $proc = WdStartApp `
-        -Path        $Path            `
-        -Arguments   $Config.Arguments `
-        -FileName    $FileName        `
-        -HideWindow  ([bool]$Config.HideWindow)  `
-        -FocusTop    ([bool]$Config.FocusTop)    `
-        -Fullscreen  ([bool]$Config.Fullscreen)  `
-        -PythonExe   ([string]$Config.PythonExe) `
-        -ConsoleMode (WdGetConsoleMode -Config $Config) `
-        -Browser     $BrowserName
+    $proc = $null
     try {
+        # Count every actual launch attempt, including failures, so a broken path or
+        # permission error cannot bypass MaxRetryInHour and retry indefinitely.
+        $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
+        $proc = WdStartApp `
+            -Path        $Path            `
+            -Arguments   $Config.Arguments `
+            -FileName    $FileName        `
+            -HideWindow  ([bool]$Config.HideWindow)  `
+            -FocusTop    ([bool]$Config.FocusTop)    `
+            -Fullscreen  ([bool]$Config.Fullscreen)  `
+            -PythonExe   ([string]$Config.PythonExe) `
+            -ConsoleMode (WdGetConsoleMode -Config $Config) `
+            -Browser     $BrowserName
+
         if ($proc) {
-            $RestartStats[$StatKey] = [int]$RestartStats[$StatKey] + 1
             $LaunchTime[$Path] = Get-Date
             $DisplayRepairDone[$Path] = $false
             $HangFailCount[$Path] = 0
@@ -2131,9 +2240,7 @@ function WdRestartTopmostApps {
             if ($processId -gt 0) {
                 [void](WdStopProcessTreeSafe -ProcessId $processId -KillTree $killTree)
             }
-            if ($process -is [System.Diagnostics.Process]) {
-                try { $process.Dispose() } catch {}
-            }
+            WdDisposeProcessResult $process
         }
 
         foreach ($key in @($RestartStats.Keys)) {
@@ -2457,7 +2564,7 @@ try {
 
                             if ($restartProcs) {
                                 $restartProcs | ForEach-Object {
-                                    if ($_ -is [System.Diagnostics.Process]) { try { $_.Dispose() } catch {} }
+                                    WdDisposeProcessResult $_
                                 }
                             }
                         }
@@ -2512,14 +2619,6 @@ try {
                     break
                 }
 
-                if ($RestartStats[$StatKey] -ge $MaxRetryInHour) {
-                    if (-not $ThrottleWarned.ContainsKey($StatKey)) {
-                        WdWriteLog "CRITICAL: $FileName failed too many times this hour ($($RestartStats[$StatKey])/$MaxRetryInHour). Skipping until next hour..." "Red"
-                        $ThrottleWarned[$StatKey] = $true
-                    }
-                    continue
-                }
-
                 $allowMultiInstance = if ($Config.ContainsKey("AllowMultiInstance")) { [bool]$Config.AllowMultiInstance } else { $false }
                 $killTreeOnHang = if ($Config.ContainsKey("KillTreeOnHang")) { [bool]$Config.KillTreeOnHang }     else { $true }
                 $browserName = if ($Config.ContainsKey("Browser") -and
@@ -2540,7 +2639,7 @@ try {
                         $DisplayChangeRestartInProgress.Remove($Path)
                         if ($procs) {
                             $procs | ForEach-Object {
-                                if ($_ -is [System.Diagnostics.Process]) { try { $_.Dispose() } catch {} }
+                                WdDisposeProcessResult $_
                             }
                             $procs = $null
                         }
@@ -2570,7 +2669,7 @@ try {
 
                             if ($procs) {
                                 $procs | ForEach-Object {
-                                    if ($_ -is [System.Diagnostics.Process]) { try { $_.Dispose() } catch {} }
+                                    WdDisposeProcessResult $_
                                 }
                                 $procs = $null
                             }
@@ -2581,6 +2680,19 @@ try {
 
                 if ($procCount -eq 0) {
                     $HangFailCount[$Path] = 0
+
+                    # 节流检查放在这里：只拦截"确实缺失、即将重新拉起"的动作。
+                    # 之前放在最前面会导致节流命中后，哪怕程序本轮其实已经在
+                    # 正常运行，挂死检测/抢焦点/光标隐藏/全屏修复等常规监控
+                    # 也会被一并跳过，直到下一个整点才恢复。
+                    if ($RestartStats[$StatKey] -ge $MaxRetryInHour) {
+                        if (-not $ThrottleWarned.ContainsKey($StatKey)) {
+                            WdWriteLog "CRITICAL: $FileName failed too many times this hour ($($RestartStats[$StatKey])/$MaxRetryInHour). Skipping until next hour..." "Red"
+                            $ThrottleWarned[$StatKey] = $true
+                        }
+                        continue
+                    }
+
                     if ($Config.Once -and $RestartStats.ContainsKey($OnceKey) -and $RestartStats[$OnceKey]) {
                         continue
                     }
@@ -2683,7 +2795,7 @@ try {
                     if ($null -eq $FirstProc) {
                         if ($procs) {
                             $procs | ForEach-Object {
-                                if ($_ -is [System.Diagnostics.Process]) { try { $_.Dispose() } catch {} }
+                                WdDisposeProcessResult $_
                             }
                         }
                         continue
@@ -2695,7 +2807,7 @@ try {
                     if ($null -eq $mainProc) {
                         if ($procs) {
                             $procs | ForEach-Object {
-                                if ($_ -is [System.Diagnostics.Process]) { try { $_.Dispose() } catch {} }
+                                WdDisposeProcessResult $_
                             }
                         }
                         continue
@@ -2789,9 +2901,7 @@ try {
                         $mainProc = $null
                     }
 
-                    if ($FirstProc -is [System.Diagnostics.Process]) {
-                        try { $FirstProc.Dispose() } catch {}
-                    }
+                    WdDisposeProcessResult $FirstProc
                     $FirstProc = $null
                 }
 
@@ -2801,13 +2911,13 @@ try {
                         try { $mainProc.Dispose() } catch {}
                         $mainProc = $null
                     }
-                    if ($FirstProc -is [System.Diagnostics.Process]) {
-                        try { $FirstProc.Dispose() } catch {}
+                    if ($FirstProc) {
+                        WdDisposeProcessResult $FirstProc
                         $FirstProc = $null
                     }
                     if ($procs) {
                         $procs | ForEach-Object {
-                            if ($_ -is [System.Diagnostics.Process]) { try { $_.Dispose() } catch {} }
+                            WdDisposeProcessResult $_
                         }
                         $procs = $null
                     }
