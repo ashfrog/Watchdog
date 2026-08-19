@@ -10,3 +10,9 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+
+# Watchdog runtime data (portable configuration is intentionally not ignored)
+watchdog_log.txt
+watchdog_log.txt.bak.*
+disable.flag
+browser_profiles/

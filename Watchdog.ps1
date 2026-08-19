@@ -1,42 +1,166 @@
-﻿# powershell权限问题 先运行一次（管理员方式） Set-ExecutionPolicy Unrestricted -Scope CurrentUser
+﻿# 守护进程通过图形界面完成目标选择和管理员授权。
 
-# 配置无桌面启动：Win + R -> regedit
-# 路径：HKEY_CURRENT_USER\Software\Microsoft\Windows NT\CurrentVersion\Winlogon
-# 键名：Shell (右键新建 字符串值)
-# 数值：powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Watchdog\watchdog.ps1"
-# 也可创建快捷方式保留桌面环境： 将数值填入目标
+param(
+    [switch]$ElevatedRelaunch,
+    [switch]$RestartExisting
+)
 
-$Apps = [ordered]@{
-    "M:\GitHub\shanxi_yangquan\shanxi_yangquan\sha_pan\Release\sha_pan.exe" = @{
-        First = 1; Restart = 5; Arguments = ""
-        Once = $false; HideWindow = $false; FocusTop = $true
-        Fullscreen = $true; ForceDisplayMode = $true; PythonExe = ""
-        ConsoleMode = "Auto"; AllowMultiInstance = $false; KillTreeOnHang = $true
-        MinUpSeconds = 15; Browser = "auto"; HideCursor = $false
-        RestartOnDisplayChange = $true
+# StartWatchdog.vbs 已使用 ExecutionPolicy Bypass 启动，无需用户手工修改执行策略。
+# 目标程序通过首次运行向导或托盘菜单中的“设置启动程序”进行配置。
+
+$WatchdogRoot = $PSScriptRoot
+$UserConfigPath = Join-Path $PSScriptRoot "watchdog.config.json"
+$Script:ConfigWasLoaded = $false
+$Script:ConfigLoadError = $null
+$Script:AutoDiscoveredTarget = $false
+$Script:StartWithWindows = $false
+
+function WdGetConfigValue {
+    param($Source, [string]$Name, $DefaultValue)
+
+    if ($null -eq $Source) { return $DefaultValue }
+    if ($Source -is [System.Collections.IDictionary]) {
+        if ($Source.Contains($Name)) { return $Source[$Name] }
+        return $DefaultValue
     }
-    # "C:\Scripts\main.py" = @{
-    #     First = 1; Restart = 10; Arguments = ""
-    #     Once = $false; HideWindow = $false; FocusTop = $false
-    #     Fullscreen = $false; ForceDisplayMode = $false; PythonExe = "C:\Python311\python.exe"
-    #     ConsoleMode = "New"; AllowMultiInstance = $false; KillTreeOnHang = $true
-    #     MinUpSeconds = 5; Browser = "auto"; HideCursor = $false
-    #     RestartOnDisplayChange = $false
-    # }
+
+    $property = $Source.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $DefaultValue
+}
+
+function WdNewAppConfiguration {
+    param($Source)
+
+    return @{
+        First                  = [int](WdGetConfigValue $Source "First" 1)
+        Restart                = [int](WdGetConfigValue $Source "Restart" 5)
+        Arguments              = [string](WdGetConfigValue $Source "Arguments" "")
+        Once                   = [bool](WdGetConfigValue $Source "Once" $false)
+        HideWindow             = [bool](WdGetConfigValue $Source "HideWindow" $false)
+        FocusTop               = [bool](WdGetConfigValue $Source "FocusTop" $false)
+        Fullscreen             = [bool](WdGetConfigValue $Source "Fullscreen" $false)
+        ForceDisplayMode       = [bool](WdGetConfigValue $Source "ForceDisplayMode" $false)
+        PythonExe              = [string](WdGetConfigValue $Source "PythonExe" "")
+        ConsoleMode            = [string](WdGetConfigValue $Source "ConsoleMode" "Auto")
+        AllowMultiInstance     = [bool](WdGetConfigValue $Source "AllowMultiInstance" $false)
+        KillTreeOnHang         = [bool](WdGetConfigValue $Source "KillTreeOnHang" $true)
+        MinUpSeconds           = [int](WdGetConfigValue $Source "MinUpSeconds" 15)
+        Browser                = [string](WdGetConfigValue $Source "Browser" "auto")
+        HideCursor             = [bool](WdGetConfigValue $Source "HideCursor" $false)
+        RestartOnDisplayChange = [bool](WdGetConfigValue $Source "RestartOnDisplayChange" $false)
+    }
+}
+
+function WdResolveStoredTargetPath {
+    param([string]$StoredPath)
+
+    if ([string]::IsNullOrWhiteSpace($StoredPath) -or $StoredPath -imatch '^https?://') {
+        return $StoredPath
+    }
+
+    $expandedPath = [Environment]::ExpandEnvironmentVariables($StoredPath)
+    if (-not [System.IO.Path]::IsPathRooted($expandedPath)) {
+        $expandedPath = Join-Path $PSScriptRoot $expandedPath
+    }
+    return [System.IO.Path]::GetFullPath($expandedPath)
+}
+
+function WdGetPortableTargetPath {
+    param([string]$TargetPath)
+
+    if ([string]::IsNullOrWhiteSpace($TargetPath) -or $TargetPath -imatch '^https?://') {
+        return $TargetPath
+    }
+
+    $fullTargetPath = [System.IO.Path]::GetFullPath($TargetPath)
+    $rootPrefix = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\') + '\'
+    if ($fullTargetPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return ".\" + $fullTargetPath.Substring($rootPrefix.Length)
+    }
+    return $fullTargetPath
+}
+
+function WdGetLocalExecutableCandidates {
+    $helperExecutablePattern = '^(?:Watchdog|UnityCrashHandler\d*|CrashReportClient|CrashHandler|unins\d*|uninstall|updater?|repair|installer|setup)(?:[-_.].*)?\.exe$'
+    return @(
+        Get-ChildItem -LiteralPath $PSScriptRoot -Filter "*.exe" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch $helperExecutablePattern -and $_.Name -notmatch '\.vshost\.exe$' } |
+            Sort-Object Name
+    )
+}
+
+$Apps = [ordered]@{}
+$configurationExists = Test-Path -LiteralPath $UserConfigPath
+
+if ($configurationExists) {
+    try {
+        $savedConfiguration = Get-Content -LiteralPath $UserConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $savedTargets = @(
+            WdGetConfigValue $savedConfiguration "Targets" @()
+        )
+
+        $Apps = [ordered]@{}
+        foreach ($savedTarget in $savedTargets) {
+            $savedPath = WdResolveStoredTargetPath ([string](WdGetConfigValue $savedTarget "Path" ""))
+            if ([string]::IsNullOrWhiteSpace($savedPath)) { continue }
+            $Apps[$savedPath] = WdNewAppConfiguration -Source $savedTarget
+        }
+        $topmostTargetAssigned = $false
+        foreach ($savedPath in @($Apps.Keys)) {
+            if (-not [bool]$Apps[$savedPath].FocusTop) { continue }
+            if ($topmostTargetAssigned) {
+                $Apps[$savedPath].FocusTop = $false
+            }
+            else {
+                $topmostTargetAssigned = $true
+            }
+        }
+        if ($Apps.Count -eq 0) {
+            throw "配置文件中没有有效的启动程序。"
+        }
+
+        $Script:StartWithWindows = [bool](WdGetConfigValue $savedConfiguration "StartWithWindows" $false)
+        $Script:ConfigWasLoaded = $true
+    }
+    catch {
+        $Script:ConfigLoadError = $_.Exception.Message
+    }
+}
+
+if (-not $Script:ConfigWasLoaded) {
+    $localExecutables = @(WdGetLocalExecutableCandidates)
+    $autoDetectedExecutable = $null
+
+    if ($localExecutables.Count -eq 1) {
+        $autoDetectedExecutable = $localExecutables[0]
+    }
+    if ($autoDetectedExecutable) {
+        $Apps[$autoDetectedExecutable.FullName] = WdNewAppConfiguration -Source $null
+        if (-not $configurationExists -and -not $Script:ConfigLoadError) {
+            $Script:ConfigWasLoaded = $true
+            $Script:AutoDiscoveredTarget = $true
+        }
+    }
+    elseif ($localExecutables.Count -gt 0) {
+        # 多个候选全部带入列表，由用户确认后统一保存。
+        foreach ($localExecutable in $localExecutables) {
+            $Apps[$localExecutable.FullName] = WdNewAppConfiguration -Source $null
+        }
+    }
 }
 #
 # 紧急停用：
-#   创建文件 C:\Watchdog\disable.flag
+#   在程序目录创建 disable.flag
 #   或直接打开任务管理器
 #   Watchdog 检测到后将停止拉起目标程序，仅记录日志
-# 权限问题powershell管理员方式运行 Set-ExecutionPolicy RemoteSigned
 # 启动程序列表字段说明：
 # First:              首次启动延迟秒数
 # Restart:            异常重启前等待秒数
 # Arguments:          传递给程序的额外参数
 # Once:               $false=持续监控  $true=仅启动一次
 # HideWindow:         $true=隐藏窗口启动  $false=正常显示
-# FocusTop:           $true=允许置顶并抢焦点（建议仅 kiosk 场景启用）
+# FocusTop:           $true=允许置顶并抢焦点（全局最多一个目标）
 # Fullscreen:         $true=目标为全屏  $false=目标为窗口化
 # ForceDisplayMode:   $true=启用显示模式修复  $false=不干预窗口模式
 #                     （网页 URL 条目建议保持 $false，浏览器 --kiosk 自行管理全屏）
@@ -59,7 +183,6 @@ $Apps = [ordered]@{
 #                     	msedge=Microsoft Edge
 
 # =================== 1. 全局配置 ===================
-$WatchdogRoot = "C:\Watchdog"
 $LogPath = Join-Path $WatchdogRoot "watchdog_log.txt"
 $DisableFlag = Join-Path $WatchdogRoot "disable.flag"
 
@@ -187,10 +310,39 @@ $WD_WINDOWED_MIN_H = 480          # 窗口模式修复的最小默认高度
 $WD_WINDOWED_MARGIN = 100          # 窗口模式修复时距屏幕边缘的间距
 
 # =================== 2. 核心保护：防止 Watchdog 自身多开 ===================
-$Script:MutexOwned = $false
-$Script:Mutex = New-Object System.Threading.Mutex($false, "Global\WindowsWatchdogServiceMutex")
+if ($RestartExisting) {
+    $watchdogCommandPattern = '(?i)-File\s+["'']?[^"'']*[\\/]Watchdog\.ps1["'']?(?:\s|$)'
+    $existingInstances = @(
+        Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.ProcessId -ne $PID -and
+                $_.Name -match '^(?:powershell|pwsh)\.exe$' -and
+                $_.CommandLine -match $watchdogCommandPattern
+            }
+    )
+    foreach ($existingInstance in $existingInstances) {
+        Stop-Process -Id $existingInstance.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    if ($existingInstances.Count -gt 0) {
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+$mutexIdentity = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\').ToLowerInvariant()
+$mutexHasher = [System.Security.Cryptography.SHA256]::Create()
 try {
-    $Script:MutexOwned = $Script:Mutex.WaitOne(0)
+    $mutexHashBytes = $mutexHasher.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($mutexIdentity))
+    $mutexHash = ([System.BitConverter]::ToString($mutexHashBytes)).Replace('-', '').Substring(0, 24)
+}
+finally {
+    $mutexHasher.Dispose()
+}
+$Script:MutexName = "Local\WindowsWatchdog_$mutexHash"
+$Script:MutexOwned = $false
+$Script:Mutex = New-Object System.Threading.Mutex($false, $Script:MutexName)
+try {
+    $mutexWaitMilliseconds = if ($ElevatedRelaunch) { 15000 } else { 0 }
+    $Script:MutexOwned = $Script:Mutex.WaitOne($mutexWaitMilliseconds)
 }
 catch [System.Threading.AbandonedMutexException] {
     $Script:MutexOwned = $true
@@ -1652,6 +1804,7 @@ function WdStartApp {
         }
         catch {
             WdWriteLog "FAILED: $FileName (browser) - $($_.Exception.Message)" "Red"
+            WdOfferAuthorizationForError -Exception $_.Exception -Operation "启动 $FileName"
             return $null
         }
         finally {
@@ -1696,6 +1849,7 @@ function WdStartApp {
         }
         catch {
             WdWriteLog "FAILED: $FileName - $($_.Exception.Message)" "Red"
+            WdOfferAuthorizationForError -Exception $_.Exception -Operation "启动 $FileName"
             return $null
         }
         finally {
@@ -1730,6 +1884,7 @@ function WdStartApp {
         }
         catch {
             WdWriteLog "FAILED: $FileName - $($_.Exception.Message)" "Red"
+            WdOfferAuthorizationForError -Exception $_.Exception -Operation "启动 $FileName"
             return $null
         }
         finally {
@@ -1770,6 +1925,7 @@ function WdStartApp {
     }
     catch {
         WdWriteLog "FAILED: $FileName - $($_.Exception.Message)" "Red"
+        WdOfferAuthorizationForError -Exception $_.Exception -Operation "启动 $FileName"
         return $null
     }
     finally {
@@ -2285,10 +2441,759 @@ function WdInvokePendingControlActions {
     }
 }
 
-# =================== 5.2 托盘图标 ===================
+# =================== 5.2 界面配置 / 权限 ===================
+function WdTestIsAdministrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
+function WdGetStartupShortcutPath {
+    $startupDirectory = [Environment]::GetFolderPath('Startup')
+    if ([string]::IsNullOrWhiteSpace($startupDirectory)) {
+        throw "无法获取当前用户的 Windows 启动目录。"
+    }
+    return Join-Path $startupDirectory "Watchdog.lnk"
+}
+
+function WdTestStartupEnabled {
+    $shell = $null
+    $shortcut = $null
+    try {
+        $shortcutPath = WdGetStartupShortcutPath
+        if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) {
+            return $false
+        }
+
+        $launcherPath = Join-Path $PSScriptRoot "StartWatchdog.vbs"
+        $expectedWscriptPath = Join-Path $env:SystemRoot "System32\wscript.exe"
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        return (
+            $shortcut.TargetPath -ieq $expectedWscriptPath -and
+            $shortcut.Arguments -eq "`"$launcherPath`"" -and
+            $shortcut.WorkingDirectory -ieq $PSScriptRoot
+        )
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($shortcut -and [Runtime.InteropServices.Marshal]::IsComObject($shortcut)) {
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+        }
+        if ($shell -and [Runtime.InteropServices.Marshal]::IsComObject($shell)) {
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+        }
+    }
+}
+
+function WdSetStartupEnabled {
+    param([bool]$Enabled)
+
+    $shortcutPath = WdGetStartupShortcutPath
+    if (-not $Enabled) {
+        if (Test-Path -LiteralPath $shortcutPath) {
+            Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction Stop
+            WdWriteLog "UI: Windows startup shortcut removed." "DarkGreen"
+        }
+        return
+    }
+
+    $launcherPath = Join-Path $PSScriptRoot "StartWatchdog.vbs"
+    if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {
+        throw "未找到启动程序：$launcherPath"
+    }
+    if (WdTestStartupEnabled) {
+        return
+    }
+
+    $wscriptPath = Join-Path $env:SystemRoot "System32\wscript.exe"
+    $shell = $null
+    $shortcut = $null
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        $shortcut.TargetPath = $wscriptPath
+        $shortcut.Arguments = "`"$launcherPath`""
+        $shortcut.WorkingDirectory = $PSScriptRoot
+        $shortcut.Description = "Windows Watchdog"
+        $shortcut.IconLocation = "$wscriptPath,0"
+        $shortcut.WindowStyle = 7
+        $shortcut.Save()
+    }
+    finally {
+        if ($shortcut -and [Runtime.InteropServices.Marshal]::IsComObject($shortcut)) {
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+        }
+        if ($shell -and [Runtime.InteropServices.Marshal]::IsComObject($shell)) {
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) {
+        throw "开机自启动快捷方式创建失败。"
+    }
+    WdWriteLog "UI: Windows startup shortcut points to [$launcherPath]." "DarkGreen"
+}
+
+function WdSaveUserConfiguration {
+    param(
+        [System.Collections.IDictionary]$AppConfigurations,
+        [bool]$StartWithWindows = $Script:StartWithWindows
+    )
+
+    if ($null -eq $AppConfigurations -or $AppConfigurations.Count -eq 0) {
+        throw "请至少添加一个要监控的程序。"
+    }
+
+    $configurationDirectory = Split-Path $UserConfigPath -Parent
+    WdEnsureDirectory -Path $configurationDirectory
+
+    $targets = New-Object System.Collections.ArrayList
+    foreach ($targetPath in $AppConfigurations.Keys) {
+        $targetConfig = [ordered]@{ Path = (WdGetPortableTargetPath -TargetPath ([string]$targetPath)) }
+        $appConfig = WdNewAppConfiguration -Source $AppConfigurations[$targetPath]
+        foreach ($key in $appConfig.Keys) {
+            $targetConfig[$key] = $appConfig[$key]
+        }
+        [void]$targets.Add($targetConfig)
+    }
+
+    $payload = [ordered]@{
+        Version          = 3
+        StartWithWindows = $StartWithWindows
+        Targets          = @($targets)
+    }
+    $json = $payload | ConvertTo-Json -Depth 8
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($UserConfigPath, $json, $utf8)
+}
+
+function WdConvertConfigurationEntriesToApps {
+    param($Entries)
+
+    $newApps = [ordered]@{}
+    $topmostTargetAssigned = $false
+    foreach ($entry in @($Entries)) {
+        $targetPath = [string](WdGetConfigValue $entry "Path" "")
+        $targetPath = $targetPath.Trim()
+        if ([string]::IsNullOrWhiteSpace($targetPath)) {
+            throw "启动程序路径不能为空。"
+        }
+
+        if ($targetPath -imatch '^https?://') {
+            $targetUri = $null
+            if (-not [Uri]::TryCreate($targetPath, [UriKind]::Absolute, [ref]$targetUri) -or
+                @('http', 'https') -notcontains $targetUri.Scheme.ToLowerInvariant()) {
+                throw "网址格式无效：$targetPath"
+            }
+            $targetPath = $targetUri.AbsoluteUri
+        }
+        else {
+            if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf)) {
+                throw "程序文件不存在：$targetPath"
+            }
+            $targetPath = (Get-Item -LiteralPath $targetPath -ErrorAction Stop).FullName
+        }
+
+        if ($newApps.Contains($targetPath)) {
+            throw "启动程序重复：$targetPath"
+        }
+
+        $sourceConfig = WdGetConfigValue $entry "Config" $entry
+        $appConfig = WdNewAppConfiguration -Source $sourceConfig
+        if ([bool]$appConfig.FocusTop) {
+            if ($topmostTargetAssigned) {
+                $appConfig.FocusTop = $false
+            }
+            else {
+                $topmostTargetAssigned = $true
+            }
+        }
+        $newApps[$targetPath] = $appConfig
+    }
+
+    if ($newApps.Count -eq 0) {
+        throw "请至少添加一个要监控的程序。"
+    }
+    return $newApps
+}
+
+function WdResetMonitoringState {
+    foreach ($variableName in @(
+            "RestartStats", "LaunchTime", "DisplayRepairDone", "FocusLastTime",
+            "LastStartAttempt", "LastStartedProcessId", "ThrottleWarned", "MissingLogged",
+            "HangFailCount", "FastExitFailCount", "FastExitHandledLaunch", "ScheduledLaunch",
+            "DisplayChangeRestartInProgress"
+        )) {
+        $variable = Get-Variable -Name $variableName -Scope Script -ErrorAction SilentlyContinue
+        if ($variable -and $variable.Value -and $variable.Value.PSObject.Methods["Clear"]) {
+            $variable.Value.Clear()
+        }
+    }
+    Set-Variable -Name FirstRun -Value $true -Scope Script
+    $Script:AuthorizationPromptShown = $false
+}
+
+function WdApplyAppConfigurations {
+    param($Entries, [bool]$StartWithWindows)
+
+    $newApps = WdConvertConfigurationEntriesToApps -Entries $Entries
+    WdSaveUserConfiguration -AppConfigurations $newApps -StartWithWindows $StartWithWindows
+    WdSetStartupEnabled -Enabled $StartWithWindows
+    $script:Apps = $newApps
+    $Script:ConfigWasLoaded = $true
+    $Script:ConfigLoadError = $null
+    $Script:AutoDiscoveredTarget = $false
+    $Script:StartWithWindows = $StartWithWindows
+    WdResetMonitoringState
+    WdWriteLog "UI: Saved $($newApps.Count) monitoring target(s)." "DarkGreen"
+}
+
+function WdRequestElevatedRestart {
+    if (WdTestIsAdministrator) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "当前已经是管理员权限运行。", "守护进程",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        return $false
+    }
+
+    try {
+        $powershellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+        $arguments = "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -ElevatedRelaunch"
+        Start-Process -FilePath $powershellPath -ArgumentList $arguments -Verb RunAs -WindowStyle Hidden -ErrorAction Stop | Out-Null
+        WdWriteLog "UI: User approved UAC; elevated Watchdog restart requested." "DarkGreen"
+        $Script:ExitRequested = $true
+        return $true
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "未能获得管理员授权。请在系统提示中确认后重试。$([Environment]::NewLine)$($_.Exception.Message)",
+            "需要授权",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+        WdWriteLog "UI: Elevated restart was cancelled or failed - $($_.Exception.Message)" "DarkYellow"
+        return $false
+    }
+}
+
+function WdOfferAuthorizationForError {
+    param([System.Exception]$Exception, [string]$Operation)
+
+    if ($Script:AuthorizationPromptShown -or $Script:ExitRequested -or (WdTestIsAdministrator)) {
+        return
+    }
+
+    $isAuthorizationError = $false
+    $currentException = $Exception
+    while ($currentException) {
+        if ($currentException -is [System.ComponentModel.Win32Exception] -and
+            (@(5, 740) -contains $currentException.NativeErrorCode)) {
+            $isAuthorizationError = $true
+            break
+        }
+        if ($currentException.Message -match "access.*denied|拒绝访问|需要提升|elevation|管理员权限") {
+            $isAuthorizationError = $true
+            break
+        }
+        $currentException = $currentException.InnerException
+    }
+    if (-not $isAuthorizationError) { return }
+
+    $Script:AuthorizationPromptShown = $true
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        "$Operation 需要管理员权限。是否现在授权并重启守护进程？",
+        "需要管理员授权",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    )
+    if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) {
+        [void](WdRequestElevatedRestart)
+    }
+}
+
+function WdShowSettingsWindow {
+    param([switch]$FirstRun)
+
+    if ($Script:SettingsWindowOpen) {
+        try {
+            $Script:SettingsForm.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+            $Script:SettingsForm.Activate()
+        }
+        catch {}
+        return $false
+    }
+
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = if ($FirstRun) { "首次设置守护程序" } else { "守护程序设置" }
+    $form.StartPosition = "CenterScreen"
+    $form.ClientSize = New-Object System.Drawing.Size(980, 620)
+    $form.MinimizeBox = $false
+    $form.MaximizeBox = $false
+    $form.FormBorderStyle = "FixedDialog"
+    $form.TopMost = $true
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+    $form.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
+    $form.BackColor = [System.Drawing.Color]::White
+    $Script:SettingsWindowOpen = $true
+    $Script:SettingsForm = $form
+
+    $entries = New-Object System.Collections.ArrayList
+    foreach ($appPath in $Apps.Keys) {
+        [void]$entries.Add([pscustomobject]@{
+            Path   = [string]$appPath
+            Config = WdNewAppConfiguration -Source $Apps[$appPath]
+        })
+    }
+    $state = [pscustomobject]@{ SelectedIndex = -1; Loading = $false }
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = if ($FirstRun) { "选择要启动和监控的程序" } else { "启动程序设置" }
+    $title.AutoSize = $true
+    $title.Location = New-Object System.Drawing.Point(22, 18)
+    $title.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 13, [System.Drawing.FontStyle]::Bold)
+    [void]$form.Controls.Add($title)
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = "可同时管理多个程序；配置文件与 Watchdog.ps1 放在同一目录，便于复制部署。"
+    $hint.AutoSize = $true
+    $hint.Location = New-Object System.Drawing.Point(24, 49)
+    $hint.ForeColor = [System.Drawing.Color]::DimGray
+    [void]$form.Controls.Add($hint)
+
+    $listLabel = New-Object System.Windows.Forms.Label
+    $listLabel.Text = "启动程序列表"
+    $listLabel.AutoSize = $true
+    $listLabel.Location = New-Object System.Drawing.Point(22, 84)
+    $listLabel.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9, [System.Drawing.FontStyle]::Bold)
+    [void]$form.Controls.Add($listLabel)
+
+    $list = New-Object System.Windows.Forms.ListView
+    $list.View = [System.Windows.Forms.View]::Details
+    $list.FullRowSelect = $true
+    $list.GridLines = $false
+    $list.HideSelection = $false
+    $list.MultiSelect = $false
+    $list.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $list.Location = New-Object System.Drawing.Point(22, 108)
+    $list.Size = New-Object System.Drawing.Size(390, 402)
+    $list.Anchor = "Top,Bottom,Left"
+    [void]$list.Columns.Add("程序", 125)
+    [void]$list.Columns.Add("路径", 145)
+    [void]$list.Columns.Add("状态", 60)
+    [void]$list.Columns.Add("置顶", 55)
+    [void]$form.Controls.Add($list)
+
+    $add = New-Object System.Windows.Forms.Button
+    $add.Text = "添加程序..."
+    $add.Location = New-Object System.Drawing.Point(22, 520)
+    $add.Size = New-Object System.Drawing.Size(105, 32)
+    $add.Anchor = "Bottom,Left"
+    $add.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $add.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(190, 198, 207)
+    [void]$form.Controls.Add($add)
+
+    $remove = New-Object System.Windows.Forms.Button
+    $remove.Text = "删除"
+    $remove.Location = New-Object System.Drawing.Point(136, 520)
+    $remove.Size = New-Object System.Drawing.Size(78, 32)
+    $remove.Anchor = "Bottom,Left"
+    $remove.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $remove.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(190, 198, 207)
+    [void]$form.Controls.Add($remove)
+
+    $editorLabel = New-Object System.Windows.Forms.Label
+    $editorLabel.Text = "程序配置"
+    $editorLabel.AutoSize = $true
+    $editorLabel.Location = New-Object System.Drawing.Point(438, 84)
+    $editorLabel.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9, [System.Drawing.FontStyle]::Bold)
+    [void]$form.Controls.Add($editorLabel)
+
+    $pathLabel = New-Object System.Windows.Forms.Label
+    $pathLabel.Text = "程序路径"
+    $pathLabel.AutoSize = $true
+    $pathLabel.Location = New-Object System.Drawing.Point(438, 112)
+    [void]$form.Controls.Add($pathLabel)
+    $pathBox = New-Object System.Windows.Forms.TextBox
+    $pathBox.Location = New-Object System.Drawing.Point(510, 108)
+    $pathBox.Size = New-Object System.Drawing.Size(340, 26)
+    $pathBox.Anchor = "Top,Left,Right"
+    [void]$form.Controls.Add($pathBox)
+    $browse = New-Object System.Windows.Forms.Button
+    $browse.Text = "浏览..."
+    $browse.Location = New-Object System.Drawing.Point(858, 106)
+    $browse.Size = New-Object System.Drawing.Size(92, 30)
+    $browse.Anchor = "Top,Right"
+    [void]$form.Controls.Add($browse)
+
+    $argsLabel = New-Object System.Windows.Forms.Label
+    $argsLabel.Text = "启动参数"
+    $argsLabel.AutoSize = $true
+    $argsLabel.Location = New-Object System.Drawing.Point(438, 151)
+    [void]$form.Controls.Add($argsLabel)
+    $argsBox = New-Object System.Windows.Forms.TextBox
+    $argsBox.Location = New-Object System.Drawing.Point(510, 147)
+    $argsBox.Size = New-Object System.Drawing.Size(440, 26)
+    $argsBox.Anchor = "Top,Left,Right"
+    [void]$form.Controls.Add($argsBox)
+
+    $firstLabel = New-Object System.Windows.Forms.Label
+    $firstLabel.Text = "首次启动延迟"
+    $firstLabel.AutoSize = $true
+    $firstLabel.Location = New-Object System.Drawing.Point(438, 190)
+    [void]$form.Controls.Add($firstLabel)
+    $firstBox = New-Object System.Windows.Forms.NumericUpDown
+    $firstBox.Minimum = 0; $firstBox.Maximum = 86400; $firstBox.Width = 90
+    $firstBox.Location = New-Object System.Drawing.Point(530, 186)
+    [void]$form.Controls.Add($firstBox)
+    $firstUnit = New-Object System.Windows.Forms.Label
+    $firstUnit.Text = "秒"
+    $firstUnit.AutoSize = $true
+    $firstUnit.Location = New-Object System.Drawing.Point(625, 190)
+    [void]$form.Controls.Add($firstUnit)
+
+    $restartLabel = New-Object System.Windows.Forms.Label
+    $restartLabel.Text = "异常重启延迟"
+    $restartLabel.AutoSize = $true
+    $restartLabel.Location = New-Object System.Drawing.Point(680, 190)
+    [void]$form.Controls.Add($restartLabel)
+    $restartBox = New-Object System.Windows.Forms.NumericUpDown
+    $restartBox.Minimum = 0; $restartBox.Maximum = 86400; $restartBox.Width = 90
+    $restartBox.Location = New-Object System.Drawing.Point(772, 186)
+    [void]$form.Controls.Add($restartBox)
+    $restartUnit = New-Object System.Windows.Forms.Label
+    $restartUnit.Text = "秒"
+    $restartUnit.AutoSize = $true
+    $restartUnit.Location = New-Object System.Drawing.Point(867, 190)
+    [void]$form.Controls.Add($restartUnit)
+
+    $minLabel = New-Object System.Windows.Forms.Label
+    $minLabel.Text = "最短运行时间"
+    $minLabel.AutoSize = $true
+    $minLabel.Location = New-Object System.Drawing.Point(438, 229)
+    [void]$form.Controls.Add($minLabel)
+    $minBox = New-Object System.Windows.Forms.NumericUpDown
+    $minBox.Minimum = 0; $minBox.Maximum = 86400; $minBox.Width = 90
+    $minBox.Location = New-Object System.Drawing.Point(530, 225)
+    [void]$form.Controls.Add($minBox)
+    $minUnit = New-Object System.Windows.Forms.Label
+    $minUnit.Text = "秒（快速退出判定）"
+    $minUnit.AutoSize = $true
+    $minUnit.Location = New-Object System.Drawing.Point(625, 229)
+    [void]$form.Controls.Add($minUnit)
+
+    $options = @(
+        @{ Text = "窗口置顶（全局单选）"; Key = "FocusTop" },
+        @{ Text = "全屏模式"; Key = "Fullscreen" },
+        @{ Text = "强制显示模式"; Key = "ForceDisplayMode" },
+        @{ Text = "隐藏窗口启动"; Key = "HideWindow" },
+        @{ Text = "隐藏鼠标光标"; Key = "HideCursor" },
+        @{ Text = "仅启动一次"; Key = "Once" },
+        @{ Text = "异常时结束进程树"; Key = "KillTreeOnHang" },
+        @{ Text = "显示器变化时重启"; Key = "RestartOnDisplayChange" },
+        @{ Text = "允许多实例"; Key = "AllowMultiInstance" }
+    )
+    $checkBoxes = @{}
+    for ($optionIndex = 0; $optionIndex -lt $options.Count; $optionIndex++) {
+        $option = $options[$optionIndex]
+        $check = New-Object System.Windows.Forms.CheckBox
+        $check.Text = $option.Text
+        $check.AutoSize = $true
+        $check.Location = New-Object System.Drawing.Point((438 + (($optionIndex % 2) * 245)), (267 + ([int]($optionIndex / 2) * 29)))
+        [void]$form.Controls.Add($check)
+        $checkBoxes[$option.Key] = $check
+    }
+
+    $status = New-Object System.Windows.Forms.Label
+    $status.AutoSize = $false
+    $status.Size = New-Object System.Drawing.Size(928, 30)
+    $status.Location = New-Object System.Drawing.Point(22, 560)
+    $status.Anchor = "Bottom,Left,Right"
+    $status.ForeColor = [System.Drawing.Color]::DarkGoldenrod
+    if ($Script:ConfigLoadError) { $status.Text = "配置文件无法读取，请检查列表后重新保存。" }
+    elseif ($FirstRun) { $status.Text = "首次运行请添加至少一个程序。" }
+    [void]$form.Controls.Add($status)
+
+    $autoStart = New-Object System.Windows.Forms.CheckBox
+    $autoStart.Text = "自动启动"
+    $autoStart.AutoSize = $true
+    $autoStart.Checked = [bool]$Script:StartWithWindows
+    $autoStart.Location = New-Object System.Drawing.Point(438, 520)
+    $autoStart.Anchor = "Bottom,Left"
+    [void]$form.Controls.Add($autoStart)
+
+    $elevate = New-Object System.Windows.Forms.Button
+    $elevate.Text = "管理员授权"
+    $elevate.Location = New-Object System.Drawing.Point(640, 516)
+    $elevate.Size = New-Object System.Drawing.Size(105, 32)
+    $elevate.Anchor = "Bottom,Right"
+    $elevate.Visible = -not (WdTestIsAdministrator)
+    $elevate.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $elevate.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(190, 142, 50)
+    [void]$form.Controls.Add($elevate)
+
+    $save = New-Object System.Windows.Forms.Button
+    $save.Text = "保存全部"
+    $save.Location = New-Object System.Drawing.Point(755, 516)
+    $save.Size = New-Object System.Drawing.Size(95, 32)
+    $save.Anchor = "Bottom,Right"
+    $save.BackColor = [System.Drawing.Color]::FromArgb(28, 102, 196)
+    $save.ForeColor = [System.Drawing.Color]::White
+    $save.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $save.FlatAppearance.BorderSize = 0
+    [void]$form.Controls.Add($save)
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = if ($FirstRun) { "退出" } else { "取消" }
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $cancel.Location = New-Object System.Drawing.Point(858, 516)
+    $cancel.Size = New-Object System.Drawing.Size(92, 32)
+    $cancel.Anchor = "Bottom,Right"
+    $cancel.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $cancel.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(190, 198, 207)
+    [void]$form.Controls.Add($cancel)
+
+    $setEditorEnabled = {
+        $enabled = $state.SelectedIndex -ge 0 -and $state.SelectedIndex -lt $entries.Count
+        foreach ($control in @($pathBox, $browse, $argsBox, $firstBox, $restartBox, $minBox) + @($checkBoxes.Values)) {
+            $control.Enabled = $enabled
+        }
+        $remove.Enabled = $enabled
+    }.GetNewClosure()
+
+    $loadEditor = {
+        $wasLoading = $state.Loading
+        $state.Loading = $true
+        try {
+            if ($state.SelectedIndex -lt 0 -or $state.SelectedIndex -ge $entries.Count) {
+                $pathBox.Text = ""; $argsBox.Text = ""
+                $firstBox.Value = 1; $restartBox.Value = 5; $minBox.Value = 15
+                foreach ($check in $checkBoxes.Values) { $check.Checked = $false }
+                $checkBoxes["KillTreeOnHang"].Checked = $true
+                & $setEditorEnabled
+                return
+            }
+            $entry = $entries[$state.SelectedIndex]
+            $config = WdNewAppConfiguration -Source $entry.Config
+            $pathBox.Text = [string]$entry.Path
+            $argsBox.Text = $config.Arguments
+            $firstBox.Value = [Math]::Max($firstBox.Minimum, [Math]::Min($firstBox.Maximum, $config.First))
+            $restartBox.Value = [Math]::Max($restartBox.Minimum, [Math]::Min($restartBox.Maximum, $config.Restart))
+            $minBox.Value = [Math]::Max($minBox.Minimum, [Math]::Min($minBox.Maximum, $config.MinUpSeconds))
+            foreach ($key in $checkBoxes.Keys) { $checkBoxes[$key].Checked = [bool](WdGetConfigValue $config $key $false) }
+            & $setEditorEnabled
+        }
+        finally { $state.Loading = $wasLoading }
+    }.GetNewClosure()
+
+    $saveEditor = {
+        if ($state.SelectedIndex -lt 0 -or $state.SelectedIndex -ge $entries.Count) { return $true }
+        $entries[$state.SelectedIndex].Path = $pathBox.Text.Trim()
+        $config = WdNewAppConfiguration -Source $entries[$state.SelectedIndex].Config
+        $config.Arguments = $argsBox.Text
+        $config.First = [int]$firstBox.Value
+        $config.Restart = [int]$restartBox.Value
+        $config.MinUpSeconds = [int]$minBox.Value
+        foreach ($key in $checkBoxes.Keys) { $config[$key] = [bool]$checkBoxes[$key].Checked }
+        $entries[$state.SelectedIndex].Config = $config
+        if ($state.SelectedIndex -lt $list.Items.Count) {
+            $displayPath = [string]$entries[$state.SelectedIndex].Path
+            $displayName = $displayPath
+            if ($displayPath -notmatch '^https?://') {
+                try { $displayName = [System.IO.Path]::GetFileName($displayPath) } catch {}
+            }
+            if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = "未命名程序" }
+            $list.Items[$state.SelectedIndex].Text = $displayName
+            $list.Items[$state.SelectedIndex].SubItems[1].Text = $displayPath
+            $list.Items[$state.SelectedIndex].SubItems[2].Text = if ($displayPath -imatch '^https?://') { "网址" } elseif (Test-Path -LiteralPath $displayPath -PathType Leaf) { "就绪" } else { "待修复" }
+            $list.Items[$state.SelectedIndex].SubItems[3].Text = if ([bool]$config.FocusTop) { "是" } else { "" }
+        }
+        return $true
+    }.GetNewClosure()
+
+    $refreshList = {
+        $wasLoading = $state.Loading
+        $state.Loading = $true
+        $list.BeginUpdate()
+        try {
+            $list.Items.Clear()
+            for ($entryIndex = 0; $entryIndex -lt $entries.Count; $entryIndex++) {
+                $entry = $entries[$entryIndex]
+                $displayPath = [string]$entry.Path
+                $displayName = $displayPath
+                if ($displayPath -notmatch '^https?://') {
+                    try { $displayName = [System.IO.Path]::GetFileName($displayPath) } catch {}
+                }
+                if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = "未命名程序" }
+                $statusText = if ($displayPath -imatch '^https?://') { "网址" } elseif (Test-Path -LiteralPath $displayPath -PathType Leaf) { "就绪" } else { "待修复" }
+                $item = New-Object System.Windows.Forms.ListViewItem($displayName)
+                [void]$item.SubItems.Add($displayPath)
+                [void]$item.SubItems.Add($statusText)
+                [void]$item.SubItems.Add($(if ([bool]$entry.Config.FocusTop) { "是" } else { "" }))
+                [void]$list.Items.Add($item)
+            }
+            if ($state.SelectedIndex -ge 0 -and $state.SelectedIndex -lt $list.Items.Count) {
+                $list.Items[$state.SelectedIndex].Selected = $true
+                $list.Items[$state.SelectedIndex].Focused = $true
+            }
+        }
+        finally {
+            $list.EndUpdate()
+            $state.Loading = $wasLoading
+        }
+    }.GetNewClosure()
+
+    $browse.Add_Click({
+        $dialog = New-Object System.Windows.Forms.OpenFileDialog
+        $dialog.Title = "选择要监控的程序"
+        $dialog.Filter = "程序和脚本 (*.exe;*.bat;*.cmd;*.py)|*.exe;*.bat;*.cmd;*.py|所有文件 (*.*)|*.*"
+        $dialog.CheckFileExists = $true
+        if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) { $pathBox.Text = $dialog.FileName }
+        $dialog.Dispose()
+    })
+    $checkBoxes["FocusTop"].Add_CheckedChanged({
+        if ($state.Loading -or $state.SelectedIndex -lt 0 -or $state.SelectedIndex -ge $entries.Count) { return }
+
+        $currentConfig = WdNewAppConfiguration -Source $entries[$state.SelectedIndex].Config
+        $currentConfig.FocusTop = [bool]$checkBoxes["FocusTop"].Checked
+        $entries[$state.SelectedIndex].Config = $currentConfig
+        if ($state.SelectedIndex -lt $list.Items.Count) {
+            $list.Items[$state.SelectedIndex].SubItems[3].Text = if ($currentConfig.FocusTop) { "是" } else { "" }
+        }
+        if (-not $currentConfig.FocusTop) {
+            $status.ForeColor = [System.Drawing.Color]::DimGray
+            $status.Text = "已取消当前程序的窗口置顶。"
+            return
+        }
+
+        for ($entryIndex = 0; $entryIndex -lt $entries.Count; $entryIndex++) {
+            if ($entryIndex -eq $state.SelectedIndex) { continue }
+            $entryConfig = WdNewAppConfiguration -Source $entries[$entryIndex].Config
+            if ([bool]$entryConfig.FocusTop) {
+                $entryConfig.FocusTop = $false
+                $entries[$entryIndex].Config = $entryConfig
+                if ($entryIndex -lt $list.Items.Count) { $list.Items[$entryIndex].SubItems[3].Text = "" }
+            }
+        }
+        $status.ForeColor = [System.Drawing.Color]::DarkGreen
+        $status.Text = "已将当前程序设为唯一置顶目标。"
+    })
+    $add.Add_Click({
+        $dialog = New-Object System.Windows.Forms.OpenFileDialog
+        $dialog.Title = "添加要监控的程序"
+        $dialog.Filter = "程序和脚本 (*.exe;*.bat;*.cmd;*.py)|*.exe;*.bat;*.cmd;*.py|所有文件 (*.*)|*.*"
+        $dialog.CheckFileExists = $true
+        if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+            [void](& $saveEditor)
+            [void]$entries.Add([pscustomobject]@{ Path = $dialog.FileName; Config = WdNewAppConfiguration -Source $null })
+            $state.SelectedIndex = $entries.Count - 1
+            & $refreshList; & $loadEditor
+        }
+        $dialog.Dispose()
+    })
+    $remove.Add_Click({
+        if ($state.SelectedIndex -lt 0 -or $state.SelectedIndex -ge $entries.Count) { return }
+        [void]$entries.RemoveAt($state.SelectedIndex)
+        $state.SelectedIndex = [Math]::Min($state.SelectedIndex, $entries.Count - 1)
+        & $refreshList; & $loadEditor
+    })
+    $list.Add_SelectedIndexChanged({
+        if ($state.Loading -or $list.SelectedIndices.Count -eq 0) { return }
+        [void](& $saveEditor)
+        $state.SelectedIndex = $list.SelectedIndices[0]
+        & $loadEditor
+    })
+    $save.Add_Click({
+        try {
+            [void](& $saveEditor)
+            WdApplyAppConfigurations -Entries $entries -StartWithWindows $autoStart.Checked
+            $form.Tag = "saved"
+            $status.ForeColor = [System.Drawing.Color]::DarkGreen
+            $status.Text = "已保存 $($entries.Count) 个启动程序，监控已立即更新。"
+            $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        }
+        catch {
+            $status.ForeColor = [System.Drawing.Color]::Firebrick
+            $status.Text = "保存失败：$($_.Exception.Message)"
+            WdOfferAuthorizationForError -Exception $_.Exception -Operation "保存看门狗配置"
+            $form.DialogResult = [System.Windows.Forms.DialogResult]::None
+            if ($Script:ExitRequested) { $form.Close() }
+        }
+    })
+    $elevate.Add_Click({
+        try {
+            [void](& $saveEditor)
+            WdApplyAppConfigurations -Entries $entries -StartWithWindows $autoStart.Checked
+            $form.Tag = "saved"
+        }
+        catch {
+            $status.ForeColor = [System.Drawing.Color]::Firebrick
+            $status.Text = "保存失败：$($_.Exception.Message)"
+            WdWriteLog "UI: Saving before elevation failed - $($_.Exception.Message)" "DarkYellow"
+        }
+        [void](WdRequestElevatedRestart)
+        if ($Script:ExitRequested) { $form.Close() }
+    })
+
+    $form.AcceptButton = $save
+    $form.CancelButton = $cancel
+    if ($entries.Count -gt 0) { $state.SelectedIndex = 0 }
+    & $refreshList; & $loadEditor
+    try {
+        [void]$form.ShowDialog()
+        return ($form.Tag -eq "saved")
+    }
+    finally {
+        $Script:SettingsForm = $null
+        $Script:SettingsWindowOpen = $false
+        $form.Dispose()
+    }
+}
+
+function WdEnsureConfiguredTarget {
+    $hasValidTarget = $false
+    foreach ($currentPath in $Apps.Keys) {
+        if ($currentPath -imatch '^https?://' -or (Test-Path -LiteralPath $currentPath -PathType Leaf)) {
+            $hasValidTarget = $true
+            break
+        }
+    }
+    $needsSetup = (-not $Script:ConfigWasLoaded) -or (-not $hasValidTarget)
+
+    if (-not $needsSetup) { return $true }
+
+    try {
+        $saved = WdShowSettingsWindow -FirstRun
+        if ($saved) { return $true }
+    }
+    catch {
+        WdWriteLog "UI: Settings window failed - $($_.Exception.Message)" "Red"
+    }
+
+    $Script:ExitRequested = $true
+    return $false
+}
+
+# =================== 5.3 托盘图标 ===================
 $Script:TrayNotifyIcon = $null
 $Script:TrayContextMenu = $null
 $Script:TrayExitMenuItem = $null
+$Script:TraySettingsMenuItem = $null
+$Script:TrayElevateMenuItem = $null
 $Script:TrayOwnedIcon = $null
 
 function WdHideWatchdogConsoleWindow {
@@ -2314,7 +3219,24 @@ function WdInitializeTrayIcon {
 
         $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
         $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
+        $settingsMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem
+        $elevateMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem
         $exitMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem
+
+        $settingsMenuItem.Text = "设置启动程序..."
+        $settingsMenuItem.add_Click({
+                [void](WdShowSettingsWindow)
+            })
+        [void]$contextMenu.Items.Add($settingsMenuItem)
+
+        $elevateMenuItem.Text = "管理员授权并重启"
+        $elevateMenuItem.Visible = -not (WdTestIsAdministrator)
+        $elevateMenuItem.add_Click({
+                [void](WdRequestElevatedRestart)
+            })
+        [void]$contextMenu.Items.Add($elevateMenuItem)
+        [void]$contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
         $exitMenuItem.Text = "退出"
         $exitMenuItem.add_Click({
                 $Script:ExitRequested = $true
@@ -2332,13 +3254,24 @@ function WdInitializeTrayIcon {
 
         $notifyIcon.Text = "守护进程"
         $notifyIcon.ContextMenuStrip = $contextMenu
+        $notifyIcon.add_DoubleClick({
+                [void](WdShowSettingsWindow)
+            })
         $notifyIcon.Visible = $true
 
         $Script:TrayNotifyIcon = $notifyIcon
         $Script:TrayContextMenu = $contextMenu
+        $Script:TraySettingsMenuItem = $settingsMenuItem
+        $Script:TrayElevateMenuItem = $elevateMenuItem
         $Script:TrayExitMenuItem = $exitMenuItem
         $Script:TrayOwnedIcon = $ownedIcon
-        WdWriteLog "TRAY: Notification icon initialized. Right-click and choose Exit Watchdog to stop." "DarkGray"
+        if ($ElevatedRelaunch) {
+            $notifyIcon.BalloonTipTitle = "守护进程"
+            $notifyIcon.BalloonTipText = "管理员授权已完成。"
+            $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+            $notifyIcon.ShowBalloonTip(3000)
+        }
+        WdWriteLog "TRAY: Notification icon initialized." "DarkGray"
         return $true
     }
     catch {
@@ -2362,6 +3295,14 @@ function WdDisposeTrayIcon {
     if ($Script:TrayExitMenuItem) {
         try { $Script:TrayExitMenuItem.Dispose() } catch {}
         $Script:TrayExitMenuItem = $null
+    }
+    if ($Script:TrayElevateMenuItem) {
+        try { $Script:TrayElevateMenuItem.Dispose() } catch {}
+        $Script:TrayElevateMenuItem = $null
+    }
+    if ($Script:TraySettingsMenuItem) {
+        try { $Script:TraySettingsMenuItem.Dispose() } catch {}
+        $Script:TraySettingsMenuItem = $null
     }
     if ($Script:TrayContextMenu) {
         try { $Script:TrayContextMenu.Dispose() } catch {}
@@ -2392,32 +3333,36 @@ function WdWaitWithControlPolling {
     } while ((Get-Date) -lt $deadline -and -not $Script:ExitRequested)
 }
 
-# =================== 5.3 Compatibility layer (legacy -> Wd* APIs) ===================
-# Keep legacy function-name wrappers to preserve runtime compatibility.
-# New integrations should use Wd* interface names directly.
-function Open-LogWriter { return WdOpenLogWriter @PSBoundParameters }
-function Close-LogWriter { return WdCloseLogWriter @PSBoundParameters }
-function Write-WatchdogLog { return WdWriteLog @PSBoundParameters }
-function Test-DisableFlag { return WdTestDisableFlag @PSBoundParameters }
-function Initialize-CounterIfNeeded { return WdInitializeCounter @PSBoundParameters }
-function Get-PythonInterpreter { return WdGetPythonInterpreter @PSBoundParameters }
-function Get-ConsoleMode { return WdGetConsoleMode @PSBoundParameters }
-function Test-HasConsoleWindow { return WdIsConsoleWindowPresent @PSBoundParameters }
-function Resolve-EffectiveConsoleMode { return WdResolveConsoleMode @PSBoundParameters }
-function Test-IsScriptPathInCommandLine { return WdIsScriptPathInCommandLine @PSBoundParameters }
-function Get-TargetProcess { return WdGetTargetProcess @PSBoundParameters }
-function Wait-ForWindowHandle { return WdWaitForWindowHandle @PSBoundParameters }
-function Test-IsWindowForeground { return WdIsWindowForeground @PSBoundParameters }
-function Set-WindowToForeground { return WdSetWindowToForeground @PSBoundParameters }
-function Repair-WindowDisplayMode { return WdRepairWindowDisplayMode @PSBoundParameters }
-function Stop-ProcessTreeSafe { return WdStopProcessTreeSafe @PSBoundParameters }
-function Test-ProcessStillMissing { return WdIsProcessMissing @PSBoundParameters }
-function Start-App { return WdStartApp @PSBoundParameters }
-
 # =================== 6. 初始化 ===================
 WdEnsureDirectory -Path $WatchdogRoot
 WdOpenLogWriter
 $trayInitialized = [bool](WdInitializeTrayIcon)
+$targetConfigured = WdEnsureConfiguredTarget
+if (-not $targetConfigured -or $Script:ExitRequested) {
+    if (-not $targetConfigured -and -not $Script:ConfigWasLoaded) {
+        try { WdWriteLog "UI: No valid monitoring target was selected; Watchdog will exit." "DarkYellow" } catch {}
+    }
+    WdInvokeShutdownCleanup
+    exit 0
+}
+
+try {
+    if ($Script:AutoDiscoveredTarget) {
+        WdSaveUserConfiguration -AppConfigurations $Apps -StartWithWindows $Script:StartWithWindows
+        $Script:AutoDiscoveredTarget = $false
+        WdWriteLog "UI: Local executable auto-detected and saved." "DarkGreen"
+    }
+    WdSetStartupEnabled -Enabled $Script:StartWithWindows
+}
+catch {
+    WdWriteLog "UI: Configuration/startup synchronization failed - $($_.Exception.Message)" "Red"
+    WdOfferAuthorizationForError -Exception $_.Exception -Operation "保存配置或设置开机自启动"
+    if ($Script:ExitRequested) {
+        WdInvokeShutdownCleanup
+        exit 0
+    }
+}
+
 if (-not $ShowTrayIcon -or $trayInitialized) {
     WdHideWatchdogConsoleWindow
 }
@@ -2426,6 +3371,8 @@ elseif ($HideWatchdogConsole) {
 }
 
 WdWriteLog "=== Watchdog Service Active (Monitor Count: $($Apps.Count)) ===" "Yellow"
+WdWriteLog "INFO: Portable configuration path = $UserConfigPath" "DarkGray"
+WdWriteLog "INFO: Start with Windows = $Script:StartWithWindows" "DarkGray"
 WdWriteLog "INFO: Disable flag path = $DisableFlag" "DarkGray"
 WdWriteLog "INFO: Task Manager open state is treated as disable flag" "DarkGray"
 WdWriteLog "INFO: Check interval = $CheckInterval sec, Max retry/hour = $MaxRetryInHour" "DarkGray"

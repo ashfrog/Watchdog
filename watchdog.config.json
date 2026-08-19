@@ -1,0 +1,44 @@
+{
+    "Version":  3,
+    "StartWithWindows":  false,
+    "Targets":  [
+                    {
+                        "Path":  "U:\\GitHub\\ALeTai\\Release\\QuartzDistribution_石英分布程序\\QuartzDistribution.exe",
+                        "RestartOnDisplayChange":  false,
+                        "Fullscreen":  false,
+                        "Once":  false,
+                        "Arguments":  "",
+                        "HideWindow":  false,
+                        "ForceDisplayMode":  false,
+                        "Restart":  5,
+                        "AllowMultiInstance":  false,
+                        "MinUpSeconds":  15,
+                        "HideCursor":  false,
+                        "KillTreeOnHang":  true,
+                        "PythonExe":  "",
+                        "First":  1,
+                        "ConsoleMode":  "Auto",
+                        "FocusTop":  true,
+                        "Browser":  "auto"
+                    },
+                    {
+                        "Path":  "U:\\GitHub\\ALeTai\\Release\\QuartzMicroView_显微镜观察程序\\MediaPlayerServer.exe",
+                        "RestartOnDisplayChange":  false,
+                        "Fullscreen":  false,
+                        "Once":  false,
+                        "Arguments":  "",
+                        "HideWindow":  false,
+                        "ForceDisplayMode":  false,
+                        "Restart":  5,
+                        "AllowMultiInstance":  false,
+                        "MinUpSeconds":  15,
+                        "HideCursor":  false,
+                        "KillTreeOnHang":  true,
+                        "PythonExe":  "",
+                        "First":  1,
+                        "ConsoleMode":  "Auto",
+                        "FocusTop":  true,
+                        "Browser":  "auto"
+                    }
+                ]
+}
