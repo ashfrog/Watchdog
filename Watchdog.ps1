@@ -13,7 +13,9 @@ $UserConfigPath = Join-Path $PSScriptRoot "watchdog.config.json"
 $Script:ConfigWasLoaded = $false
 $Script:ConfigLoadError = $null
 $Script:AutoDiscoveredTarget = $false
-$Script:StartWithWindows = $false
+$Script:StartWithWindows = $true
+$Script:DisableLockScreen = $false
+$Script:DisableLockScreenWasConfigured = $false
 
 function WdGetConfigValue {
     param($Source, [string]$Name, $DefaultValue)
@@ -95,10 +97,14 @@ $configurationExists = Test-Path -LiteralPath $UserConfigPath
 
 if ($configurationExists) {
     try {
-        $savedConfiguration = Get-Content -LiteralPath $UserConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-        $savedTargets = @(
-            WdGetConfigValue $savedConfiguration "Targets" @()
-        )
+        $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $configurationJson = [System.IO.File]::ReadAllText($UserConfigPath, $utf8)
+        $savedConfiguration = $configurationJson | ConvertFrom-Json -ErrorAction Stop
+        $targetsProperty = $savedConfiguration.PSObject.Properties["Targets"]
+        if (-not $targetsProperty) {
+            throw "配置文件缺少启动程序列表。"
+        }
+        $savedTargets = @($targetsProperty.Value)
 
         $Apps = [ordered]@{}
         foreach ($savedTarget in $savedTargets) {
@@ -116,11 +122,15 @@ if ($configurationExists) {
                 $topmostTargetAssigned = $true
             }
         }
-        if ($Apps.Count -eq 0) {
-            throw "配置文件中没有有效的启动程序。"
+        if ($savedTargets.Count -gt 0 -and $Apps.Count -eq 0) {
+            throw "启动程序列表中没有有效路径。"
         }
-
         $Script:StartWithWindows = [bool](WdGetConfigValue $savedConfiguration "StartWithWindows" $false)
+        $disableLockScreenProperty = $savedConfiguration.PSObject.Properties["DisableLockScreen"]
+        if ($disableLockScreenProperty) {
+            $Script:DisableLockScreen = [bool]$disableLockScreenProperty.Value
+            $Script:DisableLockScreenWasConfigured = $true
+        }
         $Script:ConfigWasLoaded = $true
     }
     catch {
@@ -2453,6 +2463,139 @@ function WdTestIsAdministrator {
     }
 }
 
+function WdSetAuthorizationControlsVisible {
+    param([bool]$Visible)
+
+    if ($Script:TrayElevateMenuItem -and -not $Script:TrayElevateMenuItem.IsDisposed) {
+        $Script:TrayElevateMenuItem.Visible = $Visible
+    }
+}
+
+function WdGetRegistryValue {
+    param([string]$Path, [string]$Name)
+
+    try {
+        $item = Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop
+        return $item.$Name
+    }
+    catch {
+        return $null
+    }
+}
+
+function WdSetRegistryDword {
+    param([string]$Path, [string]$Name, [int]$Value)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        [void](New-Item -Path $Path -Force -ErrorAction Stop)
+    }
+    [void](New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType DWord -Force -ErrorAction Stop)
+}
+
+function WdSetRegistryString {
+    param([string]$Path, [string]$Name, [AllowEmptyString()][string]$Value)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        [void](New-Item -Path $Path -Force -ErrorAction Stop)
+    }
+    [void](New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType String -Force -ErrorAction Stop)
+}
+
+function WdRemoveRegistryValue {
+    param([string]$Path, [string]$Name)
+
+    if (Test-Path -LiteralPath $Path) {
+        Remove-ItemProperty -LiteralPath $Path -Name $Name -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function WdTestLockScreenSettingMatches {
+    param([bool]$Disabled)
+
+    $personalizationPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization"
+    $systemPolicyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+    $desktopPath = "HKCU:\Control Panel\Desktop"
+    $userPolicyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+
+    $noLockScreen = WdGetRegistryValue -Path $personalizationPath -Name "NoLockScreen"
+    $inactivityTimeout = WdGetRegistryValue -Path $systemPolicyPath -Name "InactivityTimeoutSecs"
+    $screenSaveActive = WdGetRegistryValue -Path $desktopPath -Name "ScreenSaveActive"
+    $screenSaverIsSecure = WdGetRegistryValue -Path $desktopPath -Name "ScreenSaverIsSecure"
+    $disableLockWorkstation = WdGetRegistryValue -Path $userPolicyPath -Name "DisableLockWorkstation"
+
+    if ($Disabled) {
+        return (
+            [int]$noLockScreen -eq 1 -and
+            [int]$inactivityTimeout -eq 0 -and
+            [string]$screenSaveActive -eq "0" -and
+            [string]$screenSaverIsSecure -eq "0" -and
+            [int]$disableLockWorkstation -eq 1
+        )
+    }
+
+    return ([int]$noLockScreen -ne 1 -and [int]$disableLockWorkstation -ne 1)
+}
+
+function WdInvokePowerConfiguration {
+    param([bool]$DisableLockScreen)
+
+    $powercfgPath = Join-Path $env:SystemRoot "System32\powercfg.exe"
+    $timeouts = if ($DisableLockScreen) {
+        @(
+            @("monitor-timeout-ac", "0"), @("monitor-timeout-dc", "0"),
+            @("standby-timeout-ac", "0"), @("standby-timeout-dc", "0")
+        )
+    }
+    else {
+        @(
+            @("monitor-timeout-ac", "10"), @("monitor-timeout-dc", "5"),
+            @("standby-timeout-ac", "30"), @("standby-timeout-dc", "15")
+        )
+    }
+
+    foreach ($timeout in $timeouts) {
+        & $powercfgPath /change $timeout[0] $timeout[1] | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            WdWriteLog "UI: Power setting update failed: $($timeout[0])." "DarkYellow"
+        }
+    }
+}
+
+function WdSetLockScreenDisabled {
+    param([bool]$Disabled)
+
+    if (WdTestLockScreenSettingMatches -Disabled $Disabled) { return }
+    if (-not (WdTestIsAdministrator)) {
+        throw "修改 Windows 锁屏设置需要管理员权限。"
+    }
+
+    $personalizationPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization"
+    $systemPolicyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+    $desktopPath = "HKCU:\Control Panel\Desktop"
+    $userPolicyPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+
+    if ($Disabled) {
+        WdSetRegistryDword -Path $personalizationPath -Name "NoLockScreen" -Value 1
+        WdSetRegistryDword -Path $systemPolicyPath -Name "InactivityTimeoutSecs" -Value 0
+        WdSetRegistryString -Path $desktopPath -Name "ScreenSaveActive" -Value "0"
+        WdSetRegistryString -Path $desktopPath -Name "ScreenSaverIsSecure" -Value "0"
+        WdSetRegistryDword -Path $userPolicyPath -Name "DisableLockWorkstation" -Value 1
+    }
+    else {
+        WdRemoveRegistryValue -Path $personalizationPath -Name "NoLockScreen"
+        WdRemoveRegistryValue -Path $systemPolicyPath -Name "InactivityTimeoutSecs"
+        WdRemoveRegistryValue -Path $desktopPath -Name "ScreenSaveActive"
+        WdRemoveRegistryValue -Path $desktopPath -Name "ScreenSaverIsSecure"
+        WdRemoveRegistryValue -Path $userPolicyPath -Name "DisableLockWorkstation"
+    }
+
+    WdInvokePowerConfiguration -DisableLockScreen $Disabled
+    if (-not (WdTestLockScreenSettingMatches -Disabled $Disabled)) {
+        throw "Windows 锁屏设置更新后校验失败。"
+    }
+    WdWriteLog "UI: Disable Windows lock screen = $Disabled" "DarkGreen"
+}
+
 function WdGetStartupShortcutPath {
     $startupDirectory = [Environment]::GetFolderPath('Startup')
     if ([string]::IsNullOrWhiteSpace($startupDirectory)) {
@@ -2545,11 +2688,12 @@ function WdSetStartupEnabled {
 function WdSaveUserConfiguration {
     param(
         [System.Collections.IDictionary]$AppConfigurations,
-        [bool]$StartWithWindows = $Script:StartWithWindows
+        [bool]$StartWithWindows = $Script:StartWithWindows,
+        [bool]$DisableLockScreen = $Script:DisableLockScreen
     )
 
-    if ($null -eq $AppConfigurations -or $AppConfigurations.Count -eq 0) {
-        throw "请至少添加一个要监控的程序。"
+    if ($null -eq $AppConfigurations) {
+        throw "启动程序列表无效。"
     }
 
     $configurationDirectory = Split-Path $UserConfigPath -Parent
@@ -2568,6 +2712,7 @@ function WdSaveUserConfiguration {
     $payload = [ordered]@{
         Version          = 3
         StartWithWindows = $StartWithWindows
+        DisableLockScreen = $DisableLockScreen
         Targets          = @($targets)
     }
     $json = $payload | ConvertTo-Json -Depth 8
@@ -2619,9 +2764,6 @@ function WdConvertConfigurationEntriesToApps {
         $newApps[$targetPath] = $appConfig
     }
 
-    if ($newApps.Count -eq 0) {
-        throw "请至少添加一个要监控的程序。"
-    }
     return $newApps
 }
 
@@ -2642,22 +2784,29 @@ function WdResetMonitoringState {
 }
 
 function WdApplyAppConfigurations {
-    param($Entries, [bool]$StartWithWindows)
+    param($Entries, [bool]$StartWithWindows, [bool]$DisableLockScreen)
 
     $newApps = WdConvertConfigurationEntriesToApps -Entries $Entries
-    WdSaveUserConfiguration -AppConfigurations $newApps -StartWithWindows $StartWithWindows
+    WdSaveUserConfiguration `
+        -AppConfigurations $newApps `
+        -StartWithWindows $StartWithWindows `
+        -DisableLockScreen $DisableLockScreen
     WdSetStartupEnabled -Enabled $StartWithWindows
+    WdSetLockScreenDisabled -Disabled $DisableLockScreen
     $script:Apps = $newApps
     $Script:ConfigWasLoaded = $true
     $Script:ConfigLoadError = $null
     $Script:AutoDiscoveredTarget = $false
     $Script:StartWithWindows = $StartWithWindows
+    $Script:DisableLockScreen = $DisableLockScreen
+    $Script:DisableLockScreenWasConfigured = $true
     WdResetMonitoringState
     WdWriteLog "UI: Saved $($newApps.Count) monitoring target(s)." "DarkGreen"
 }
 
 function WdRequestElevatedRestart {
     if (WdTestIsAdministrator) {
+        WdSetAuthorizationControlsVisible -Visible $false
         [System.Windows.Forms.MessageBox]::Show(
             "当前已经是管理员权限运行。", "守护进程",
             [System.Windows.Forms.MessageBoxButtons]::OK,
@@ -2671,6 +2820,7 @@ function WdRequestElevatedRestart {
         $arguments = "-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -ElevatedRelaunch"
         Start-Process -FilePath $powershellPath -ArgumentList $arguments -Verb RunAs -WindowStyle Hidden -ErrorAction Stop | Out-Null
         WdWriteLog "UI: User approved UAC; elevated Watchdog restart requested." "DarkGreen"
+        WdSetAuthorizationControlsVisible -Visible $false
         $Script:ExitRequested = $true
         return $true
     }
@@ -2769,7 +2919,7 @@ function WdShowSettingsWindow {
     [void]$form.Controls.Add($title)
 
     $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = "可同时管理多个程序；配置文件与 Watchdog.ps1 放在同一目录，便于复制部署。"
+    $hint.Text = "可同时管理多个程序"
     $hint.AutoSize = $true
     $hint.Location = New-Object System.Drawing.Point(24, 49)
     $hint.ForeColor = [System.Drawing.Color]::DimGray
@@ -2788,6 +2938,7 @@ function WdShowSettingsWindow {
     $list.GridLines = $false
     $list.HideSelection = $false
     $list.MultiSelect = $false
+    $list.AllowDrop = $true
     $list.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
     $list.Location = New-Object System.Drawing.Point(22, 108)
     $list.Size = New-Object System.Drawing.Size(390, 402)
@@ -2838,6 +2989,9 @@ function WdShowSettingsWindow {
     $browse.Location = New-Object System.Drawing.Point(858, 106)
     $browse.Size = New-Object System.Drawing.Size(92, 30)
     $browse.Anchor = "Top,Right"
+    $browse.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $browse.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(190, 198, 207)
+    $browse.BackColor = [System.Drawing.Color]::White
     [void]$form.Controls.Add($browse)
 
     $argsLabel = New-Object System.Windows.Forms.Label
@@ -2925,7 +3079,7 @@ function WdShowSettingsWindow {
     $status.Anchor = "Bottom,Left,Right"
     $status.ForeColor = [System.Drawing.Color]::DarkGoldenrod
     if ($Script:ConfigLoadError) { $status.Text = "配置文件无法读取，请检查列表后重新保存。" }
-    elseif ($FirstRun) { $status.Text = "首次运行请添加至少一个程序。" }
+    elseif ($FirstRun -and $entries.Count -eq 0) { $status.Text = "当前没有启动程序，看门狗将保持空闲。" }
     [void]$form.Controls.Add($status)
 
     $autoStart = New-Object System.Windows.Forms.CheckBox
@@ -2936,15 +3090,13 @@ function WdShowSettingsWindow {
     $autoStart.Anchor = "Bottom,Left"
     [void]$form.Controls.Add($autoStart)
 
-    $elevate = New-Object System.Windows.Forms.Button
-    $elevate.Text = "管理员授权"
-    $elevate.Location = New-Object System.Drawing.Point(640, 516)
-    $elevate.Size = New-Object System.Drawing.Size(105, 32)
-    $elevate.Anchor = "Bottom,Right"
-    $elevate.Visible = -not (WdTestIsAdministrator)
-    $elevate.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $elevate.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(190, 142, 50)
-    [void]$form.Controls.Add($elevate)
+    $disableLockScreen = New-Object System.Windows.Forms.CheckBox
+    $disableLockScreen.Text = "禁用 Windows 锁屏"
+    $disableLockScreen.AutoSize = $true
+    $disableLockScreen.Checked = [bool]$Script:DisableLockScreen
+    $disableLockScreen.Location = New-Object System.Drawing.Point(535, 520)
+    $disableLockScreen.Anchor = "Bottom,Left"
+    [void]$form.Controls.Add($disableLockScreen)
 
     $save = New-Object System.Windows.Forms.Button
     $save.Text = "保存全部"
@@ -3057,6 +3209,61 @@ function WdShowSettingsWindow {
         }
     }.GetNewClosure()
 
+    $addExecutablePaths = {
+        param([string[]]$Paths)
+
+        [void](& $saveEditor)
+        $knownPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($entry in $entries) {
+            $entryPath = [string]$entry.Path
+            if ([string]::IsNullOrWhiteSpace($entryPath) -or $entryPath -imatch '^https?://') { continue }
+            try { $entryPath = [System.IO.Path]::GetFullPath($entryPath) } catch {}
+            [void]$knownPaths.Add($entryPath)
+        }
+
+        $addedCount = 0
+        $skippedCount = 0
+        foreach ($droppedPath in @($Paths)) {
+            if ([string]::IsNullOrWhiteSpace($droppedPath) -or
+                [System.IO.Path]::GetExtension($droppedPath) -ine '.exe' -or
+                -not (Test-Path -LiteralPath $droppedPath -PathType Leaf)) {
+                $skippedCount++
+                continue
+            }
+
+            try {
+                $executablePath = (Get-Item -LiteralPath $droppedPath -ErrorAction Stop).FullName
+                if (-not $knownPaths.Add($executablePath)) {
+                    $skippedCount++
+                    continue
+                }
+                [void]$entries.Add([pscustomobject]@{
+                    Path   = $executablePath
+                    Config = WdNewAppConfiguration -Source $null
+                })
+                $addedCount++
+            }
+            catch {
+                $skippedCount++
+            }
+        }
+
+        if ($addedCount -gt 0) {
+            $state.SelectedIndex = $entries.Count - 1
+            & $refreshList
+            & $loadEditor
+            $status.ForeColor = [System.Drawing.Color]::DarkGreen
+            $status.Text = "已添加 $addedCount 个程序。请点击保存全部应用配置。"
+        }
+        else {
+            $status.ForeColor = [System.Drawing.Color]::DarkGoldenrod
+            $status.Text = "未添加程序：仅接受存在且未重复的 .exe 文件。"
+        }
+        if ($addedCount -gt 0 -and $skippedCount -gt 0) {
+            $status.Text += " 已忽略 $skippedCount 个无效或重复文件。"
+        }
+    }.GetNewClosure()
+
     $browse.Add_Click({
         $dialog = New-Object System.Windows.Forms.OpenFileDialog
         $dialog.Title = "选择要监控的程序"
@@ -3105,6 +3312,32 @@ function WdShowSettingsWindow {
         }
         $dialog.Dispose()
     })
+    $list.Add_DragEnter({
+        param($sender, $eventArgs)
+
+        $eventArgs.Effect = [System.Windows.Forms.DragDropEffects]::None
+        if (-not $eventArgs.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { return }
+        $droppedPaths = @($eventArgs.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop))
+        if (@($droppedPaths | Where-Object {
+                    [System.IO.Path]::GetExtension([string]$_) -ieq '.exe' -and
+                    (Test-Path -LiteralPath ([string]$_) -PathType Leaf)
+                }).Count -gt 0) {
+            $eventArgs.Effect = [System.Windows.Forms.DragDropEffects]::Copy
+        }
+    })
+    $list.Add_DragDrop({
+        param($sender, $eventArgs)
+
+        if (-not $eventArgs.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { return }
+        try {
+            $droppedPaths = [string[]]@($eventArgs.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop))
+            & $addExecutablePaths -Paths $droppedPaths
+        }
+        catch {
+            $status.ForeColor = [System.Drawing.Color]::Firebrick
+            $status.Text = "拖入程序失败：$($_.Exception.Message)"
+        }
+    })
     $remove.Add_Click({
         if ($state.SelectedIndex -lt 0 -or $state.SelectedIndex -ge $entries.Count) { return }
         [void]$entries.RemoveAt($state.SelectedIndex)
@@ -3120,7 +3353,10 @@ function WdShowSettingsWindow {
     $save.Add_Click({
         try {
             [void](& $saveEditor)
-            WdApplyAppConfigurations -Entries $entries -StartWithWindows $autoStart.Checked
+            WdApplyAppConfigurations `
+                -Entries $entries `
+                -StartWithWindows $autoStart.Checked `
+                -DisableLockScreen $disableLockScreen.Checked
             $form.Tag = "saved"
             $status.ForeColor = [System.Drawing.Color]::DarkGreen
             $status.Text = "已保存 $($entries.Count) 个启动程序，监控已立即更新。"
@@ -3134,21 +3370,6 @@ function WdShowSettingsWindow {
             if ($Script:ExitRequested) { $form.Close() }
         }
     })
-    $elevate.Add_Click({
-        try {
-            [void](& $saveEditor)
-            WdApplyAppConfigurations -Entries $entries -StartWithWindows $autoStart.Checked
-            $form.Tag = "saved"
-        }
-        catch {
-            $status.ForeColor = [System.Drawing.Color]::Firebrick
-            $status.Text = "保存失败：$($_.Exception.Message)"
-            WdWriteLog "UI: Saving before elevation failed - $($_.Exception.Message)" "DarkYellow"
-        }
-        [void](WdRequestElevatedRestart)
-        if ($Script:ExitRequested) { $form.Close() }
-    })
-
     $form.AcceptButton = $save
     $form.CancelButton = $cancel
     if ($entries.Count -gt 0) { $state.SelectedIndex = 0 }
@@ -3172,7 +3393,8 @@ function WdEnsureConfiguredTarget {
             break
         }
     }
-    $needsSetup = (-not $Script:ConfigWasLoaded) -or (-not $hasValidTarget)
+    $needsSetup = (-not $Script:ConfigWasLoaded) -or
+        ($Apps.Count -gt 0 -and -not $hasValidTarget)
 
     if (-not $needsSetup) { return $true }
 
@@ -3335,6 +3557,9 @@ function WdWaitWithControlPolling {
 
 # =================== 6. 初始化 ===================
 WdEnsureDirectory -Path $WatchdogRoot
+if (-not $Script:DisableLockScreenWasConfigured) {
+    $Script:DisableLockScreen = WdTestLockScreenSettingMatches -Disabled $true
+}
 WdOpenLogWriter
 $trayInitialized = [bool](WdInitializeTrayIcon)
 $targetConfigured = WdEnsureConfiguredTarget
@@ -3353,10 +3578,11 @@ try {
         WdWriteLog "UI: Local executable auto-detected and saved." "DarkGreen"
     }
     WdSetStartupEnabled -Enabled $Script:StartWithWindows
+    WdSetLockScreenDisabled -Disabled $Script:DisableLockScreen
 }
 catch {
     WdWriteLog "UI: Configuration/startup synchronization failed - $($_.Exception.Message)" "Red"
-    WdOfferAuthorizationForError -Exception $_.Exception -Operation "保存配置或设置开机自启动"
+    WdOfferAuthorizationForError -Exception $_.Exception -Operation "保存配置或更新 Windows 系统设置"
     if ($Script:ExitRequested) {
         WdInvokeShutdownCleanup
         exit 0
