@@ -525,6 +525,29 @@ namespace WatchdogWin32
         [DllImport("user32.dll")]
         public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
+        public static IntPtr EnterPerMonitorDpiAwareness()
+        {
+            try
+            {
+                // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+                return SetThreadDpiAwarenessContext(new IntPtr(-4));
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return IntPtr.Zero;
+            }
+        }
+
+        public static void RestoreThreadDpiAwareness(IntPtr previousContext)
+        {
+            if (previousContext == IntPtr.Zero) return;
+            try { SetThreadDpiAwarenessContext(previousContext); }
+            catch (EntryPointNotFoundException) { }
+        }
+
         public static string GetActiveMonitorFingerprint()
         {
             List<string> parts = new List<string>();
@@ -1016,12 +1039,17 @@ function WdCleanupRestartStats {
 }
 
 function WdGetDisplayTopologyFingerprint {
+    $previousDpiContext = [IntPtr]::Zero
     try {
+        $previousDpiContext = [WatchdogWin32.DisplayAPI]::EnterPerMonitorDpiAwareness()
         return [WatchdogWin32.DisplayAPI]::GetActiveMonitorFingerprint()
     }
     catch {
         WdWriteLog "DISPLAY-CHANGE: Failed to read display topology - $($_.Exception.Message)" "DarkYellow"
         return $null
+    }
+    finally {
+        [WatchdogWin32.DisplayAPI]::RestoreThreadDpiAwareness($previousDpiContext)
     }
 }
 
@@ -1598,26 +1626,46 @@ function WdRepairWindowDisplayMode {
         [bool]$Fullscreen
     )
 
-    if ($null -eq $ProcessObj) { return }
+    if ($null -eq $ProcessObj) { return $false }
+
+    $previousDpiContext = [IntPtr]::Zero
+    try {
+        # Watchdog 由隐藏 PowerShell 宿主运行，而 Unity 通常是 Per-Monitor DPI Aware。
+        # 在相同 DPI 上下文内读取和设置跨进程窗口，避免 150%/200% 缩放导致半屏。
+        $previousDpiContext = [WatchdogWin32.DisplayAPI]::EnterPerMonitorDpiAwareness()
 
     $hwnd = WdWaitForWindowHandle -ProcessObj $ProcessObj -TimeoutMs $WD_REPAIR_WINDOW_HANDLE_TIMEOUT_MS
     if ($hwnd -eq [IntPtr]::Zero) {
         WdWriteLog "DISPLAY: Window handle not ready, skipping repair." "DarkGray"
-        return
+        return $false
     }
 
     $winRect = New-Object WatchdogWin32.DisplayAPI+RECT
-    [WatchdogWin32.DisplayAPI]::GetWindowRect($hwnd, [ref]$winRect) | Out-Null
+    if (-not [WatchdogWin32.DisplayAPI]::GetWindowRect($hwnd, [ref]$winRect)) {
+        WdWriteLog "DISPLAY: Failed to read the target window rectangle." "DarkYellow"
+        return $false
+    }
 
     $hMonitor = [WatchdogWin32.DisplayAPI]::MonitorFromWindow($hwnd, $MONITOR_NEAREST)
+    if ($hMonitor -eq [IntPtr]::Zero) {
+        WdWriteLog "DISPLAY: No monitor is available for the target window." "DarkYellow"
+        return $false
+    }
     $mi = New-Object WatchdogWin32.DisplayAPI+MONITORINFO
     $mi.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($mi)
-    [WatchdogWin32.DisplayAPI]::GetMonitorInfo($hMonitor, [ref]$mi) | Out-Null
+    if (-not [WatchdogWin32.DisplayAPI]::GetMonitorInfo($hMonitor, [ref]$mi)) {
+        WdWriteLog "DISPLAY: Failed to read monitor bounds." "DarkYellow"
+        return $false
+    }
 
     $mLeft = $mi.rcMonitor.left
     $mTop = $mi.rcMonitor.top
     $mWidth = $mi.rcMonitor.right - $mi.rcMonitor.left
     $mHeight = $mi.rcMonitor.bottom - $mi.rcMonitor.top
+    if ($mWidth -le 0 -or $mHeight -le 0) {
+        WdWriteLog "DISPLAY: Monitor bounds are not ready (${mWidth}x${mHeight})." "DarkYellow"
+        return $false
+    }
 
     $isFullscreen = (
         [Math]::Abs($winRect.left - $mLeft) -le $WD_FULLSCREEN_TOLERANCE_PX -and
@@ -1632,11 +1680,15 @@ function WdRepairWindowDisplayMode {
         $newStyle = $curStyle -band (-bnot $WS_OVERLAPPEDWINDOW)
         [WatchdogWin32.DisplayAPI]::SetWindowLong($hwnd, $GWL_STYLE, $newStyle) | Out-Null
         [WatchdogWin32.DisplayAPI]::ShowWindow($hwnd, $SW_RESTORE) | Out-Null
-        [WatchdogWin32.DisplayAPI]::SetWindowPos(
+        $fullscreenApplied = [WatchdogWin32.DisplayAPI]::SetWindowPos(
             $hwnd, $HWND_TOP,
             $mLeft, $mTop, $mWidth, $mHeight,
             ($SWP_FRAMECHANGED -bor $SWP_SHOWWINDOW -bor $SWP_NOZORDER)
-        ) | Out-Null
+        )
+        if (-not $fullscreenApplied) {
+            WdWriteLog "DISPLAY: Failed to resize PID $($ProcessObj.Id) to fullscreen." "DarkYellow"
+            return $false
+        }
         WdWriteLog "DISPLAY: Fullscreen applied ($mWidth x $mHeight)." "Green"
     }
     elseif (-not $Fullscreen -and $isFullscreen) {
@@ -1657,6 +1709,12 @@ function WdRepairWindowDisplayMode {
             ($SWP_FRAMECHANGED -bor $SWP_SHOWWINDOW -bor $SWP_NOZORDER)
         ) | Out-Null
         WdWriteLog "DISPLAY: Windowed applied (${winW}x${winH} @ $winX,$winY)." "Green"
+    }
+
+    return $true
+    }
+    finally {
+        [WatchdogWin32.DisplayAPI]::RestoreThreadDpiAwareness($previousDpiContext)
     }
 }
 
@@ -1763,6 +1821,52 @@ function WdIsProcessMissing {
     }
 
     return ($count -eq 0)
+}
+
+function WdStartVisibleExeAsDesktopUser {
+    param(
+        [string]$Path,
+        [string]$Arguments,
+        [string]$WorkingDirectory,
+        [int]$ProcessLookupTimeoutMs = 10000
+    )
+
+    # Watchdog 可能因为修改开机启动/锁屏设置而通过 UAC 提权。直接 Start-Process
+    # 会让 Unity 继承高完整性令牌，与用户双击或 Windows Startup 快捷方式启动不同。
+    # Shell.Application 由桌面 Explorer 代理启动，因此目标返回普通用户令牌和桌面上下文。
+    $shellApplication = $null
+    try {
+        $shellApplication = New-Object -ComObject Shell.Application -ErrorAction Stop
+        $shellArguments = if ([string]::IsNullOrWhiteSpace($Arguments)) { "" } else { $Arguments }
+        [void]$shellApplication.ShellExecute($Path, $shellArguments, $WorkingDirectory, "open", 1)
+
+        $deadline = (Get-Date).AddMilliseconds([Math]::Max(1000, $ProcessLookupTimeoutMs))
+        do {
+            if ($Script:ExitRequested) { return $null }
+            Start-Sleep -Milliseconds 100
+
+            $startedProcesses = @(WdGetTargetProcess -Path $Path)
+            if ($startedProcesses.Count -gt 0) {
+                $startedProcess = $startedProcesses |
+                    Sort-Object @{ Expression = { WdGetProcessStartTimeSafe $_ }; Descending = $true } |
+                    Select-Object -First 1
+                $startedPid = WdGetProcessId $startedProcess
+                foreach ($candidate in $startedProcesses) {
+                    if ((WdGetProcessId $candidate) -ne $startedPid) {
+                        WdDisposeProcessResult $candidate
+                    }
+                }
+                return $startedProcess
+            }
+        } while ((Get-Date) -lt $deadline)
+
+        throw "Explorer accepted the launch request, but the target process was not detected within $ProcessLookupTimeoutMs ms."
+    }
+    finally {
+        if ($shellApplication -and [System.Runtime.InteropServices.Marshal]::IsComObject($shellApplication)) {
+            try { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($shellApplication) } catch {}
+        }
+    }
 }
 
 function WdStartApp {
@@ -1902,8 +2006,6 @@ function WdStartApp {
         }
     }
 
-    $winStyle = if ($HideWindow) { 'Hidden' } else { 'Normal' }
-
     $proc = $null
     $startSucceeded = $false
     try {
@@ -1913,17 +2015,34 @@ function WdStartApp {
         $splat = @{
             FilePath         = $Path
             WorkingDirectory = $Dir
-            WindowStyle      = $winStyle
             PassThru         = $true
             ErrorAction      = 'Stop'
+        }
+        # 可见 GUI 程序不显式传入 STARTF_USESHOWWINDOW/SW_SHOWNORMAL，使 Unity 的
+        # 创建方式与资源管理器或 Windows “启动”快捷方式直接启动保持一致。
+        if ($HideWindow) {
+            $splat.WindowStyle = 'Hidden'
         }
         if (-not [string]::IsNullOrWhiteSpace($Arguments)) {
             $splat.ArgumentList = $Arguments
         }
-        $proc = Start-Process @splat
+        if (-not $HideWindow) {
+            WdWriteLog "START: Using the Explorer desktop context for [$FileName]." "DarkCyan"
+            $proc = WdStartVisibleExeAsDesktopUser `
+                -Path $Path `
+                -Arguments $Arguments `
+                -WorkingDirectory $Dir
+        }
+        else {
+            $proc = Start-Process @splat
+        }
+
+        if (-not $proc) {
+            throw "The target process was not returned after launch."
+        }
 
         WdWriteProcessStartLog -FileName $FileName -Proc $proc `
-            -Details "Hide=$HideWindow, FocusTop=$FocusTop, Fullscreen=$Fullscreen"
+            -Details "Hide=$HideWindow, FocusTop=$FocusTop, Fullscreen=$Fullscreen, ExplorerDesktopLaunch=$(-not $HideWindow)"
 
         if ($FocusTop -and -not $HideWindow -and $proc) {
             Start-Sleep -Milliseconds $WD_INITIAL_FOCUS_DELAY_MS
@@ -2821,7 +2940,7 @@ function WdRequestElevatedRestart {
         Start-Process -FilePath $powershellPath -ArgumentList $arguments -Verb RunAs -WindowStyle Hidden -ErrorAction Stop | Out-Null
         WdWriteLog "UI: User approved UAC; elevated Watchdog restart requested." "DarkGreen"
         WdSetAuthorizationControlsVisible -Visible $false
-        $Script:ExitRequested = $true
+        WdRequestExit -Reason "elevated restart"
         return $true
     }
     catch {
@@ -3418,6 +3537,52 @@ $Script:TraySettingsMenuItem = $null
 $Script:TrayElevateMenuItem = $null
 $Script:TrayOwnedIcon = $null
 
+function WdRequestExit {
+    param([string]$Reason = "user request")
+
+    if ($Script:ExitRequested) { return }
+
+    $Script:ExitRequested = $true
+    try { WdWriteLog "TRAY: Exit requested ($Reason)." "Yellow" } catch {}
+
+    # 立即隐藏图标并关闭菜单，给用户明确的退出反馈。完整 Dispose 由主循环
+    # finally 执行，避免在 ToolStripMenuItem.Click 回调内释放正在执行的控件。
+    if ($Script:TrayExitMenuItem) {
+        try { $Script:TrayExitMenuItem.Enabled = $false } catch {}
+    }
+    if ($Script:TraySettingsMenuItem) {
+        try { $Script:TraySettingsMenuItem.Enabled = $false } catch {}
+    }
+    if ($Script:TrayElevateMenuItem) {
+        try { $Script:TrayElevateMenuItem.Enabled = $false } catch {}
+    }
+    if ($Script:TrayContextMenu) {
+        try { $Script:TrayContextMenu.Close() } catch {}
+    }
+    if ($Script:TrayNotifyIcon) {
+        try { $Script:TrayNotifyIcon.Visible = $false } catch {}
+    }
+
+    # ShowDialog 会形成嵌套的 WinForms 消息循环。如果设置窗口正打开，
+    # 只设 ExitRequested 无法让主循环继续到 finally，必须主动关闭该对话框。
+    $settingsForm = $Script:SettingsForm
+    if ($settingsForm) {
+        try {
+            if (-not $settingsForm.IsDisposed) {
+                $settingsForm.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+                $settingsForm.Close()
+            }
+        }
+        catch {
+            try {
+                $closeSettingsForm = [Action]{ $settingsForm.Close() }
+                $settingsForm.BeginInvoke($closeSettingsForm) | Out-Null
+            }
+            catch {}
+        }
+    }
+}
+
 function WdHideWatchdogConsoleWindow {
     if (-not $HideWatchdogConsole) { return }
 
@@ -3461,7 +3626,7 @@ function WdInitializeTrayIcon {
 
         $exitMenuItem.Text = "退出"
         $exitMenuItem.add_Click({
-                $Script:ExitRequested = $true
+                WdRequestExit -Reason "tray menu"
             })
         [void]$contextMenu.Items.Add($exitMenuItem)
 
@@ -4024,7 +4189,6 @@ try {
                                 if ($LaunchTime.ContainsKey($Path) -and $LaunchTime[$Path] -and
                                     ((Get-Date) - $LaunchTime[$Path]).TotalSeconds -ge $FullscreenRepairDelay) {
                                     $needRepair = $true
-                                    $DisplayRepairDone[$Path] = $true
                                 }
                             }
                             elseif ($DisplayLoopRepair) {
@@ -4032,7 +4196,7 @@ try {
                             }
 
                             if ($needRepair) {
-                                WdRepairWindowDisplayMode -ProcessObj $mainProc -Fullscreen ([bool]$Config.Fullscreen)
+                                $DisplayRepairDone[$Path] = [bool](WdRepairWindowDisplayMode -ProcessObj $mainProc -Fullscreen ([bool]$Config.Fullscreen))
                             }
                         }
 
@@ -4136,13 +4300,5 @@ try {
 }
 finally {
     try { WdWriteLog "=== Watchdog shutting down. Releasing resources... ===" "Yellow" } catch {}
-    WdDisposeTrayIcon
-    WdStopControlListeners
-    WdCloseLogWriter
-    try { WdRestoreSystemCursor } catch {}
-
-    if ($Script:MutexOwned) {
-        try { $Script:Mutex.ReleaseMutex() } catch {}
-    }
-    try { $Script:Mutex.Dispose() } catch {}
+    WdInvokeShutdownCleanup
 }
