@@ -1,0 +1,9 @@
+{
+    "Version":  4,
+    "StartWithWindows":  true,
+    "DisableLockScreen":  false,
+    "EnableMagicWake":  true,
+    "Targets":  [
+
+                ]
+}

@@ -2,7 +2,8 @@
 
 param(
     [switch]$ElevatedRelaunch,
-    [switch]$RestartExisting
+    [switch]$RestartExisting,
+    [switch]$Unattended
 )
 
 # StartWatchdog.vbs 已使用 ExecutionPolicy Bypass 启动，无需用户手工修改执行策略。
@@ -16,6 +17,8 @@ $Script:AutoDiscoveredTarget = $false
 $Script:StartWithWindows = $true
 $Script:DisableLockScreen = $false
 $Script:DisableLockScreenWasConfigured = $false
+$Script:EnableMagicWake = $true
+$Script:UserInteractionActive = $false
 
 function WdGetConfigValue {
     param($Source, [string]$Name, $DefaultValue)
@@ -126,6 +129,10 @@ if ($configurationExists) {
             throw "启动程序列表中没有有效路径。"
         }
         $Script:StartWithWindows = [bool](WdGetConfigValue $savedConfiguration "StartWithWindows" $false)
+        $magicWakeProperty = $savedConfiguration.PSObject.Properties["EnableMagicWake"]
+        if ($magicWakeProperty) {
+            $Script:EnableMagicWake = [bool]$magicWakeProperty.Value
+        }
         $disableLockScreenProperty = $savedConfiguration.PSObject.Properties["DisableLockScreen"]
         if ($disableLockScreenProperty) {
             $Script:DisableLockScreen = [bool]$disableLockScreenProperty.Value
@@ -2680,6 +2687,163 @@ function WdInvokePowerConfiguration {
     }
 }
 
+function WdGetPhysicalNetworkAdapters {
+    $adapters = @()
+    try {
+        $adapters = @(Get-NetAdapter -Physical -ErrorAction Stop |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.MacAddress) } |
+            Select-Object Name, InterfaceDescription, MacAddress, ifIndex)
+    }
+    catch {
+        $adapters = @(Get-CimInstance Win32_NetworkAdapter -ErrorAction SilentlyContinue |
+            Where-Object { $_.PhysicalAdapter -and -not [string]::IsNullOrWhiteSpace([string]$_.MACAddress) } |
+            ForEach-Object {
+                [pscustomobject]@{
+                    Name = if ($_.NetConnectionID) { $_.NetConnectionID } else { $_.Name }
+                    InterfaceDescription = $_.Name
+                    MacAddress = $_.MACAddress
+                    ifIndex = $_.Index
+                }
+            })
+    }
+    return @($adapters | Sort-Object Name, MacAddress)
+}
+
+function WdSetFastStartupDisabled {
+    if (-not (WdTestIsAdministrator)) { throw "修改 Windows 快速启动设置需要管理员权限。" }
+    $powerPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power"
+    WdSetRegistryDword -Path $powerPath -Name "HiberbootEnabled" -Value 0
+    $current = WdGetRegistryValue -Path $powerPath -Name "HiberbootEnabled"
+    if ([int]$current -ne 0) { throw "Windows 快速启动设置更新后校验失败。" }
+    WdWriteLog "WAKE: Windows Fast Startup disabled." "DarkGreen"
+}
+
+function WdTestMagicWakeSettingMatches {
+    $fastStartup = WdGetRegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" -Name "HiberbootEnabled"
+    if ($null -eq $fastStartup -or [int]$fastStartup -ne 0) {
+        return $false
+    }
+
+    $adapters = @(WdGetPhysicalNetworkAdapters)
+    if ($adapters.Count -eq 0) { return $true }
+    $wakeArmed = ""
+    try {
+        $wakeArmed = (& (Join-Path $env:SystemRoot "System32\powercfg.exe") /devicequery wake_armed 2>$null) -join "`n"
+    }
+    catch {}
+
+    foreach ($adapter in $adapters) {
+        $isArmed = $wakeArmed -match [regex]::Escape([string]$adapter.InterfaceDescription)
+        $advancedMatches = $true
+        try {
+            $advanced = @(Get-NetAdapterAdvancedProperty -Name ([string]$adapter.Name) -AllProperties -ErrorAction Stop |
+                Where-Object {
+                    ($_.DisplayName -match '(?i)wake\s*on\s*magic|magic\s*packet|shutdown.*wake|PME|魔法数据包|关机.*唤醒' -or
+                        $_.RegistryKeyword -match '(?i)wakeonmagic|magicpacket|s5wake|shutdownwake|enablepme|modernstandbywol') -and
+                    @($_.ValidDisplayValues | Where-Object { $_ -match '(?i)^enabled$|^on$|^yes$|启用|开启|打开|是|true|1' }).Count -gt 0
+                })
+            if ($advanced.Count -gt 0) {
+                $advancedMatches = @($advanced | Where-Object {
+                        $_.DisplayValue -notmatch '(?i)^enabled$|^on$|^yes$|启用|开启|打开|是|true|1'
+                    }).Count -eq 0
+            }
+        }
+        catch { $advancedMatches = $false }
+        if (-not $isArmed -or -not $advancedMatches) { return $false }
+    }
+    return $true
+}
+
+function WdSetAdapterMagicWake {
+    param($Adapter, [bool]$Enabled)
+
+    $adapterName = [string]$Adapter.Name
+    $displayName = [string]$Adapter.InterfaceDescription
+    $changed = $false
+    $powerState = if ($Enabled) { 'Enabled' } else { 'Disabled' }
+    try {
+        try {
+            Set-NetAdapterPowerManagement -Name $adapterName `
+                -WakeOnMagicPacket $powerState `
+                -WakeOnPattern $powerState `
+                -NoRestart -ErrorAction Stop
+        }
+        catch {
+            Set-NetAdapterPowerManagement -InterfaceDescription $displayName `
+                -WakeOnMagicPacket $powerState `
+                -WakeOnPattern $powerState `
+                -NoRestart -ErrorAction Stop
+        }
+        $changed = $true
+    }
+    catch {
+        WdWriteLog "WAKE: Power-management setting skipped for [$displayName] - $($_.Exception.Message)" "DarkYellow"
+    }
+    try {
+        $advanced = @(Get-NetAdapterAdvancedProperty -Name $adapterName -AllProperties -ErrorAction Stop |
+            Where-Object {
+                ($_.DisplayName -match '(?i)wake\s*on\s*magic|magic\s*packet|shutdown.*wake|PME|魔法数据包|关机.*唤醒' -or
+                    $_.RegistryKeyword -match '(?i)wakeonmagic|magicpacket|s5wake|shutdownwake|enablepme|modernstandbywol') -and
+                @($_.ValidDisplayValues | Where-Object { $_ -match '(?i)^enabled$|^on$|^yes$|启用|开启|打开|是|true|1' }).Count -gt 0
+            })
+        foreach ($property in $advanced) {
+            try {
+                $valuePattern = if ($Enabled) { '(?i)^enabled$|^on$|^yes$|启用|开启|打开|是|true|1' } else { '(?i)^disabled$|^off$|^no$|禁用|关闭|否|false|0' }
+                $displayValue = @($property.ValidDisplayValues | Where-Object { $_ -match $valuePattern }) | Select-Object -First 1
+                if (-not $displayValue) { $displayValue = @($property.ValidDisplayValues) | Select-Object -First 1 }
+                if (-not $displayValue) { continue }
+                Set-NetAdapterAdvancedProperty -Name $adapterName -DisplayName $property.DisplayName -DisplayValue $displayValue -NoRestart -ErrorAction Stop
+                $changed = $true
+            }
+            catch {
+                WdWriteLog "WAKE: Property [$($property.DisplayName)] skipped for [$displayName] - $($_.Exception.Message)" "DarkYellow"
+            }
+        }
+    }
+    catch {
+        WdWriteLog "WAKE: Advanced property update skipped for [$displayName] - $($_.Exception.Message)" "DarkYellow"
+    }
+
+    try {
+        $powercfgPath = Join-Path $env:SystemRoot "System32\powercfg.exe"
+        $deviceNames = @($displayName, $adapterName) | Select-Object -Unique
+        foreach ($deviceName in $deviceNames) {
+            if ($Enabled) {
+                & $powercfgPath /deviceenablewake $deviceName | Out-Null
+            }
+            else {
+                & $powercfgPath /devicedisablewake $deviceName | Out-Null
+            }
+            if ($LASTEXITCODE -eq 0) { $changed = $true; break }
+        }
+    }
+    catch {
+        WdWriteLog "WAKE: Device wake update skipped for [$displayName] - $($_.Exception.Message)" "DarkYellow"
+    }
+    return $changed
+}
+
+function WdApplyMagicWakeSettings {
+    param([bool]$Enabled)
+
+    if (-not $Enabled) { WdWriteLog "WAKE: Automatic Magic Packet configuration is disabled." "DarkGray"; return }
+    if (WdTestMagicWakeSettingMatches) { return }
+    if (-not (WdTestIsAdministrator)) { throw "启用网卡魔法唤醒需要管理员权限。" }
+
+    WdSetFastStartupDisabled
+    $adapters = @(WdGetPhysicalNetworkAdapters)
+    if ($adapters.Count -eq 0) {
+        WdWriteLog "WAKE: No physical network adapter with a MAC address was found." "DarkYellow"
+        return
+    }
+    foreach ($adapter in $adapters) {
+        $adapterChanged = WdSetAdapterMagicWake -Adapter $adapter -Enabled $true
+        $adapterMac = ([string]$adapter.MacAddress).ToUpperInvariant()
+        WdWriteLog "WAKE: Adapter [$($adapter.Name)] MAC [$adapterMac] configured=$adapterChanged." $(if ($adapterChanged) { "DarkGreen" } else { "DarkYellow" })
+    }
+    WdWriteLog "WAKE: Magic Packet enabled for $($adapters.Count) physical adapter(s)." "DarkGreen"
+}
+
 function WdSetLockScreenDisabled {
     param([bool]$Disabled)
 
@@ -2738,7 +2902,7 @@ function WdTestStartupEnabled {
         $shortcut = $shell.CreateShortcut($shortcutPath)
         return (
             $shortcut.TargetPath -ieq $expectedWscriptPath -and
-            $shortcut.Arguments -eq "`"$launcherPath`"" -and
+            $shortcut.Arguments -eq "`"$launcherPath`" /unattended" -and
             $shortcut.WorkingDirectory -ieq $PSScriptRoot
         )
     }
@@ -2782,7 +2946,7 @@ function WdSetStartupEnabled {
         $shell = New-Object -ComObject WScript.Shell
         $shortcut = $shell.CreateShortcut($shortcutPath)
         $shortcut.TargetPath = $wscriptPath
-        $shortcut.Arguments = "`"$launcherPath`""
+        $shortcut.Arguments = "`"$launcherPath`" /unattended"
         $shortcut.WorkingDirectory = $PSScriptRoot
         $shortcut.Description = "Windows Watchdog"
         $shortcut.IconLocation = "$wscriptPath,0"
@@ -2808,7 +2972,8 @@ function WdSaveUserConfiguration {
     param(
         [System.Collections.IDictionary]$AppConfigurations,
         [bool]$StartWithWindows = $Script:StartWithWindows,
-        [bool]$DisableLockScreen = $Script:DisableLockScreen
+        [bool]$DisableLockScreen = $Script:DisableLockScreen,
+        [bool]$EnableMagicWake = $Script:EnableMagicWake
     )
 
     if ($null -eq $AppConfigurations) {
@@ -2829,9 +2994,10 @@ function WdSaveUserConfiguration {
     }
 
     $payload = [ordered]@{
-        Version          = 3
+        Version          = 4
         StartWithWindows = $StartWithWindows
         DisableLockScreen = $DisableLockScreen
+        EnableMagicWake  = $EnableMagicWake
         Targets          = @($targets)
     }
     $json = $payload | ConvertTo-Json -Depth 8
@@ -2903,15 +3069,17 @@ function WdResetMonitoringState {
 }
 
 function WdApplyAppConfigurations {
-    param($Entries, [bool]$StartWithWindows, [bool]$DisableLockScreen)
+    param($Entries, [bool]$StartWithWindows, [bool]$DisableLockScreen, [bool]$EnableMagicWake)
 
     $newApps = WdConvertConfigurationEntriesToApps -Entries $Entries
     WdSaveUserConfiguration `
         -AppConfigurations $newApps `
         -StartWithWindows $StartWithWindows `
-        -DisableLockScreen $DisableLockScreen
+        -DisableLockScreen $DisableLockScreen `
+        -EnableMagicWake $EnableMagicWake
     WdSetStartupEnabled -Enabled $StartWithWindows
     WdSetLockScreenDisabled -Disabled $DisableLockScreen
+    WdApplyMagicWakeSettings -Enabled $EnableMagicWake
     $script:Apps = $newApps
     $Script:ConfigWasLoaded = $true
     $Script:ConfigLoadError = $null
@@ -2919,6 +3087,7 @@ function WdApplyAppConfigurations {
     $Script:StartWithWindows = $StartWithWindows
     $Script:DisableLockScreen = $DisableLockScreen
     $Script:DisableLockScreenWasConfigured = $true
+    $Script:EnableMagicWake = $EnableMagicWake
     WdResetMonitoringState
     WdWriteLog "UI: Saved $($newApps.Count) monitoring target(s)." "DarkGreen"
 }
@@ -2958,6 +3127,10 @@ function WdRequestElevatedRestart {
 function WdOfferAuthorizationForError {
     param([System.Exception]$Exception, [string]$Operation)
 
+    if (-not $Script:UserInteractionActive) {
+        WdWriteLog "UI: Administrator authorization deferred because no user action is active ($Operation)." "DarkYellow"
+        return
+    }
     if ($Script:AuthorizationPromptShown -or $Script:ExitRequested -or (WdTestIsAdministrator)) {
         return
     }
@@ -2979,16 +3152,8 @@ function WdOfferAuthorizationForError {
     if (-not $isAuthorizationError) { return }
 
     $Script:AuthorizationPromptShown = $true
-    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-    $answer = [System.Windows.Forms.MessageBox]::Show(
-        "$Operation 需要管理员权限。是否现在授权并重启守护进程？",
-        "需要管理员授权",
-        [System.Windows.Forms.MessageBoxButtons]::YesNo,
-        [System.Windows.Forms.MessageBoxIcon]::Warning
-    )
-    if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) {
-        [void](WdRequestElevatedRestart)
-    }
+    WdWriteLog "UI: User action requires administrator authorization ($Operation)." "DarkYellow"
+    [void](WdRequestElevatedRestart)
 }
 
 function WdShowSettingsWindow {
@@ -3006,6 +3171,9 @@ function WdShowSettingsWindow {
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
     Add-Type -AssemblyName System.Drawing -ErrorAction Stop
     [System.Windows.Forms.Application]::EnableVisualStyles()
+    $previousUserInteraction = $Script:UserInteractionActive
+    $Script:UserInteractionActive = $true
+    $Script:AuthorizationPromptShown = $false
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = if ($FirstRun) { "首次设置守护程序" } else { "守护程序设置" }
@@ -3190,6 +3358,56 @@ function WdShowSettingsWindow {
         [void]$form.Controls.Add($check)
         $checkBoxes[$option.Key] = $check
     }
+
+    $wakeLabel = New-Object System.Windows.Forms.Label
+    $wakeLabel.Text = "物理网卡（魔法唤醒使用）"
+    $wakeLabel.AutoSize = $true
+    $wakeLabel.Location = New-Object System.Drawing.Point(438, 410)
+    $wakeLabel.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9, [System.Drawing.FontStyle]::Bold)
+    [void]$form.Controls.Add($wakeLabel)
+
+    $adapterList = New-Object System.Windows.Forms.ListView
+    $adapterList.View = [System.Windows.Forms.View]::Details
+    $adapterList.FullRowSelect = $true
+    $adapterList.HideSelection = $false
+    $adapterList.MultiSelect = $false
+    $adapterList.Location = New-Object System.Drawing.Point(438, 430)
+    $adapterList.Size = New-Object System.Drawing.Size(410, 48)
+    [void]$adapterList.Columns.Add("网卡", 175)
+    [void]$adapterList.Columns.Add("物理 MAC 地址", 150)
+    [void]$form.Controls.Add($adapterList)
+    $copyMac = New-Object System.Windows.Forms.Button
+    $copyMac.Text = "复制 MAC"
+    $copyMac.Location = New-Object System.Drawing.Point(858, 438)
+    $copyMac.Size = New-Object System.Drawing.Size(92, 30)
+    $copyMac.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $copyMac.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(190, 198, 207)
+    [void]$form.Controls.Add($copyMac)
+
+    $magicWake = New-Object System.Windows.Forms.CheckBox
+    $magicWake.Text = "允许魔法唤醒（自动配置网卡、设备唤醒和关闭快速启动）"
+    $magicWake.AutoSize = $true
+    $magicWake.Checked = [bool]$Script:EnableMagicWake
+    $magicWake.Location = New-Object System.Drawing.Point(438, 482)
+    [void]$form.Controls.Add($magicWake)
+
+    $adapters = @(WdGetPhysicalNetworkAdapters)
+    foreach ($adapter in $adapters) {
+        $item = New-Object System.Windows.Forms.ListViewItem([string]$adapter.Name)
+        [void]$item.SubItems.Add(([string]$adapter.MacAddress).ToUpperInvariant())
+        $item.Tag = [string]$adapter.MacAddress
+        [void]$adapterList.Items.Add($item)
+    }
+    if ($adapterList.Items.Count -gt 0) { $adapterList.Items[0].Selected = $true }
+    $copyMac.Add_Click({
+        if ($adapterList.SelectedItems.Count -eq 0) { return }
+        $mac = [string]$adapterList.SelectedItems[0].Tag
+        if (-not [string]::IsNullOrWhiteSpace($mac)) {
+            [System.Windows.Forms.Clipboard]::SetText($mac)
+            $status.ForeColor = [System.Drawing.Color]::DarkGreen
+            $status.Text = "已复制物理网卡 MAC 地址：$mac"
+        }
+    })
 
     $status = New-Object System.Windows.Forms.Label
     $status.AutoSize = $false
@@ -3475,7 +3693,8 @@ function WdShowSettingsWindow {
             WdApplyAppConfigurations `
                 -Entries $entries `
                 -StartWithWindows $autoStart.Checked `
-                -DisableLockScreen $disableLockScreen.Checked
+                -DisableLockScreen $disableLockScreen.Checked `
+                -EnableMagicWake $magicWake.Checked
             $form.Tag = "saved"
             $status.ForeColor = [System.Drawing.Color]::DarkGreen
             $status.Text = "已保存 $($entries.Count) 个启动程序，监控已立即更新。"
@@ -3500,6 +3719,7 @@ function WdShowSettingsWindow {
     finally {
         $Script:SettingsForm = $null
         $Script:SettingsWindowOpen = $false
+        $Script:UserInteractionActive = $previousUserInteraction
         $form.Dispose()
     }
 }
@@ -3516,6 +3736,10 @@ function WdEnsureConfiguredTarget {
         ($Apps.Count -gt 0 -and -not $hasValidTarget)
 
     if (-not $needsSetup) { return $true }
+    if ($Unattended) {
+        WdWriteLog "UI: Setup is required, but unattended startup will not display a window." "DarkYellow"
+        return $true
+    }
 
     try {
         $saved = WdShowSettingsWindow -FirstRun
@@ -3738,12 +3962,13 @@ if (-not $targetConfigured -or $Script:ExitRequested) {
 
 try {
     if ($Script:AutoDiscoveredTarget) {
-        WdSaveUserConfiguration -AppConfigurations $Apps -StartWithWindows $Script:StartWithWindows
+        WdSaveUserConfiguration -AppConfigurations $Apps -StartWithWindows $Script:StartWithWindows -EnableMagicWake $Script:EnableMagicWake
         $Script:AutoDiscoveredTarget = $false
         WdWriteLog "UI: Local executable auto-detected and saved." "DarkGreen"
     }
     WdSetStartupEnabled -Enabled $Script:StartWithWindows
     WdSetLockScreenDisabled -Disabled $Script:DisableLockScreen
+    WdApplyMagicWakeSettings -Enabled $Script:EnableMagicWake
 }
 catch {
     WdWriteLog "UI: Configuration/startup synchronization failed - $($_.Exception.Message)" "Red"
@@ -3764,6 +3989,7 @@ elseif ($HideWatchdogConsole) {
 WdWriteLog "=== Watchdog Service Active (Monitor Count: $($Apps.Count)) ===" "Yellow"
 WdWriteLog "INFO: Portable configuration path = $UserConfigPath" "DarkGray"
 WdWriteLog "INFO: Start with Windows = $Script:StartWithWindows" "DarkGray"
+WdWriteLog "INFO: Magic wake enabled = $Script:EnableMagicWake" "DarkGray"
 WdWriteLog "INFO: Disable flag path = $DisableFlag" "DarkGray"
 WdWriteLog "INFO: Task Manager open state is treated as disable flag" "DarkGray"
 WdWriteLog "INFO: Check interval = $CheckInterval sec, Max retry/hour = $MaxRetryInHour" "DarkGray"
