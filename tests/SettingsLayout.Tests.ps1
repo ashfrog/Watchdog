@@ -24,7 +24,7 @@ $Script:StartWithWindows = $true
 $Script:DisableLockScreen = $false
 $Script:EnableMagicWake = $true
 if ($OutputDirectory) { [void][IO.Directory]::CreateDirectory($OutputDirectory) }
-$cases = @(@('desktop', 1380, 740, 1920, 1080), @('small-desktop', 1280, 680, 1366, 728), @('portrait', 900, 1320, 1080, 1920), @('small-portrait', 704, 1301, 800, 1440))
+$cases = @(@('desktop', 1120, 660, 1920, 1080), @('minimum-desktop', 960, 640, 1024, 768), @('portrait', 900, 1280, 1080, 1920), @('small-portrait', 704, 1241, 800, 1440))
 foreach ($case in $cases) {
     $global:SettingsPreviewArea = New-Object Drawing.Rectangle(0, 0, $case[3], $case[4])
     $view = WdNewSettingsView
