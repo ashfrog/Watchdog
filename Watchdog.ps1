@@ -3820,7 +3820,8 @@ function WdNewSettingsView {
     $ui.AdapterList.View = 'Details'; $ui.AdapterList.FullRowSelect = $true
     $ui.AdapterList.HideSelection = $false; $ui.AdapterList.MultiSelect = $false
     $ui.AdapterList.BorderStyle = 'None'; $ui.AdapterList.Dock = 'Top'
-    $ui.AdapterList.Height = 64
+    # Header plus two adapter rows; avoids a scrollbar on the common dual-NIC setup.
+    $ui.AdapterList.Height = 78
     $ui.AdapterList.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 8)
     [void]$ui.AdapterList.Columns.Add('网卡'); [void]$ui.AdapterList.Columns.Add('物理 MAC 地址')
     & $append $hostContent $ui.AdapterList
@@ -3915,9 +3916,18 @@ function WdNewSettingsView {
             $list.Columns[1].Width = 0
             $list.Columns[2].Width = 0
             $list.Columns[3].Width = 0
-            $adapterWidth = [Math]::Max(180, $ui.AdapterList.ClientSize.Width - (22 * $scale))
-            $ui.AdapterList.Columns[0].Width = [int]($adapterWidth * 0.46)
-            $ui.AdapterList.Columns[1].Width = [int]($adapterWidth * 0.54)
+            # Keep the combined columns inside the live client width. Updating the second
+            # column to zero first prevents a transient horizontal scrollbar while resizing.
+            $adapterWidth = [Math]::Max(2, $ui.AdapterList.ClientSize.Width - 2)
+            $adapterNameWidth = [int][Math]::Floor($adapterWidth * 0.46)
+            $adapterMacWidth = [int]$adapterWidth - $adapterNameWidth
+            $ui.AdapterList.BeginUpdate()
+            try {
+                $ui.AdapterList.Columns[1].Width = 0
+                $ui.AdapterList.Columns[0].Width = $adapterNameWidth
+                $ui.AdapterList.Columns[1].Width = $adapterMacWidth
+            }
+            finally { $ui.AdapterList.EndUpdate() }
             foreach ($pair in @(@($ui.RecoveryHint, $ui.ProgramPage), @($ui.WakeHint, $ui.HostPage), @($ui.Status, $footer), @($ui.ListHint, $library))) {
                 $wrapWidth = if ($pair[0] -eq $ui.Status) {
                     [Math]::Max(100, $footer.ClientSize.Width - $actions.Width - 20 * $scale)

@@ -53,6 +53,9 @@ foreach ($case in $cases) {
         $adapter = New-Object Windows.Forms.ListViewItem('Ethernet 1')
         [void]$adapter.SubItems.Add('D8-43-AE-B6-F7-2C')
         [void]$view.AdapterList.Items.Add($adapter)
+        $adapter = New-Object Windows.Forms.ListViewItem('Ethernet 2')
+        [void]$adapter.SubItems.Add('10-62-E5-4B-91-08')
+        [void]$view.AdapterList.Items.Add($adapter)
         [void]$form.Handle
         $createHandles = { param($control)
             [void]$control.Handle
@@ -93,6 +96,14 @@ foreach ($case in $cases) {
             }
         }
         if ($view.List.ClientSize.Height -lt 116) { throw 'Program list cannot show both sample items without scrolling' }
+        $secondAdapterBounds = $view.AdapterList.GetItemRect(1)
+        if ($view.AdapterList.VerticalScroll.Visible -or $secondAdapterBounds.Bottom -gt $view.AdapterList.ClientSize.Height) {
+            throw "Two network adapters require scrolling: second bottom=$($secondAdapterBounds.Bottom), available=$($view.AdapterList.ClientSize.Height)"
+        }
+        $adapterColumnsWidth = $view.AdapterList.Columns[0].Width + $view.AdapterList.Columns[1].Width
+        if ($view.AdapterList.HorizontalScroll.Visible -or $adapterColumnsWidth -gt $view.AdapterList.ClientSize.Width) {
+            throw "Network adapter columns require horizontal scrolling: columns=$adapterColumnsWidth, available=$($view.AdapterList.ClientSize.Width)"
+        }
         Write-Output ("PASS {0}: client={1}; body={2}; save={3}; program={4}" -f $case[0], $form.ClientSize, $view.Body.Size, $saveTop, $view.ProgramPage.Size)
         # Resize the same live form in both directions; its minimum size must retain access and edits.
         # Native resizing clamps tall windows to the real landscape monitor; portrait sizes are checked as separate cases.
@@ -106,6 +117,22 @@ foreach ($case in $cases) {
             if ($view.Body.GetCellPosition($view.HostPage.Parent.Parent).Column -ne $(if ($case[0] -like '*portrait') { 0 } else { 1 })) { throw 'Live resize placed the settings panel incorrectly' }
             foreach ($page in @($view.ProgramPage, $view.HostPage)) {
                 if ($page.Controls[0].Height -gt $page.ClientSize.Height) { throw "Resize clipped settings on $($case[0]) at width $width; form=$($form.Size), page=$($page.Size), content=$($page.Controls[0].Size)" }
+            }
+            $adapterColumnsWidth = $view.AdapterList.Columns[0].Width + $view.AdapterList.Columns[1].Width
+            if ($view.AdapterList.HorizontalScroll.Visible -or $adapterColumnsWidth -gt $view.AdapterList.ClientSize.Width) {
+                throw "Resize introduced a network adapter scrollbar on $($case[0]) at width $width"
+            }
+        }
+        if ($case[0] -eq 'desktop') {
+            # Simulate dragging the left window edge rightward in small increments.
+            $rightEdge = $form.Right
+            foreach ($outerWidth in (1120..960 | Where-Object { ($_ % 8) -eq 0 })) {
+                $form.SetBounds(($rightEdge - $outerWidth), $form.Top, $outerWidth, $form.Height)
+                [Windows.Forms.Application]::DoEvents()
+                $adapterColumnsWidth = $view.AdapterList.Columns[0].Width + $view.AdapterList.Columns[1].Width
+                if ($view.AdapterList.HorizontalScroll.Visible -or $adapterColumnsWidth -gt $view.AdapterList.ClientSize.Width) {
+                    throw "Left-edge resize introduced a network adapter scrollbar at width $outerWidth"
+                }
             }
         }
     }
