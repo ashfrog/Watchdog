@@ -19,6 +19,7 @@ $Script:DisableLockScreen = $false
 $Script:DisableLockScreenWasConfigured = $false
 $Script:EnableMagicWake = $true
 $Script:UserInteractionActive = $false
+$Script:DisplayEventQuietUntil = [DateTime]::MinValue
 
 function WdGetConfigValue {
     param($Source, [string]$Name, $DefaultValue)
@@ -54,6 +55,7 @@ function WdNewAppConfiguration {
         Browser                = [string](WdGetConfigValue $Source "Browser" "auto")
         HideCursor             = [bool](WdGetConfigValue $Source "HideCursor" $false)
         RestartOnDisplayChange = [bool](WdGetConfigValue $Source "RestartOnDisplayChange" $false)
+        UnityDisplayRecovery   = [bool](WdGetConfigValue $Source "UnityDisplayRecovery" $true)
     }
 }
 
@@ -192,8 +194,14 @@ if (-not $Script:ConfigWasLoaded) {
 # HideCursor:         $true=程序运行期间隐藏系统鼠标光标  $false=保持系统默认光标显示
 #                     （仅对 exe 类条目有效；适用于 Unity 等全屏 kiosk 程序）
 # RestartOnDisplayChange:
-#                     $true=显示器数量/分辨率/主屏/排列顺序变化并稳定后重启
-#                     $false=显示器变化时不重启（推荐仅 Unity 多屏 kiosk 程序启用）
+#                     $true=显示器数量/分辨率/旋转方向/主屏/排列顺序变化并稳定后重启
+#                     也响应系统亮屏/显示变化通知；Unity 持续未全屏时直接重启，无需另开恢复选项。
+#                     $false=不强制重启；UnityDisplayRecovery 仍可刷新全屏并在失败后重启。
+# UnityDisplayRecovery:
+#                     默认 $true：Unity 显示变化或全屏持续异常时先刷新全屏，复查仍异常才重启。
+#                     不依赖 RestartOnDisplayChange；显式打开后仍会在显示变化时重启。
+#                     根据同目录 UnityPlayer.dll 和对应的 *_Data 目录识别 Unity 程序。
+#                     窗口化 Unity 请关闭；仅启动一次、隐藏窗口、多实例或强制窗口化时不启用。
 # Browser:            网页 URL 条目专用，指定打开浏览器
 #                     	auto=自动检测（优先 Chrome，其次 Edge）
 #                     	chrome=Google Chrome
@@ -223,6 +231,12 @@ $DisplayLoopRepair = $false
 
 # 显示器拓扑变化后等待系统稳定 N 秒，再重启显式启用的目标程序
 $DisplayChangeDebounceSeconds = 10
+
+# Unity 初始化宽限、连续异常次数，以及显示恢复重启的最短间隔。
+$UnityDisplayStartupGraceSeconds = 20
+$UnityDisplayMismatchChecks = 3
+$UnityDisplayRepairGraceSeconds = 5
+$DisplayRecoveryCooldownSeconds = 60
 
 # 结束进程后等待其真正退出的最长秒数
 $ProcessStopTimeoutSeconds = 10
@@ -389,6 +403,14 @@ function WdInvokeShutdownCleanup {
 
     # 移除通知区域图标及右键菜单
     try {
+        if ($Script:DisplayEventMonitor) {
+            $Script:DisplayEventMonitor.Dispose()
+            $Script:DisplayEventMonitor = $null
+        }
+    }
+    catch {}
+
+    try {
         if (Get-Command WdDisposeTrayIcon -ErrorAction SilentlyContinue) {
             WdDisposeTrayIcon
         }
@@ -466,6 +488,35 @@ namespace WatchdogWin32
             [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
             public string szDevice;
         }
+
+        // Fixed-size DEVMODEW (wingdi.h); unused fields retain their native padding.
+        [StructLayout(LayoutKind.Explicit, Size = 220)]
+        public struct DEVMODEW
+        {
+            [FieldOffset(68)] public ushort dmSize;
+            [FieldOffset(72)] public uint dmFields;
+            [FieldOffset(84)] public uint dmDisplayOrientation;
+            [FieldOffset(172)] public uint dmPelsWidth;
+            [FieldOffset(176)] public uint dmPelsHeight;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT { public int x, y; }
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern bool EnumDisplaySettingsEx(string device, int mode, ref DEVMODEW settings, uint flags);
+
+        [DllImport("user32.dll")]
+        public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
+
+        [DllImport("user32.dll")]
+        public static extern bool ClientToScreen(IntPtr hWnd, ref POINT point);
+
+        [DllImport("user32.dll")]
+        public static extern bool IsIconic(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern bool IsWindowVisible(IntPtr hWnd);
 
         [DllImport("user32.dll")]
         public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
@@ -559,6 +610,7 @@ namespace WatchdogWin32
         {
             List<string> parts = new List<string>();
             int index = 0;
+            bool complete = true;
 
             MonitorEnumProc callback = delegate(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData)
             {
@@ -567,27 +619,25 @@ namespace WatchdogWin32
 
                 if (GetMonitorInfo(hMonitor, ref info))
                 {
+                    DEVMODEW mode = new DEVMODEW();
+                    mode.dmSize = (ushort)Marshal.SizeOf(typeof(DEVMODEW));
+                    if (!EnumDisplaySettingsEx(info.szDevice, -1, ref mode, 0)) { complete = false; return false; }
                     parts.Add(String.Format(
-                        "{0}|{1}|{2}|{3},{4},{5},{6}",
+                        "{0}|{1}|{2}|{3},{4},{5},{6}|mode={7}x{8}|rotation={9}",
                         index,
                         info.szDevice,
                         info.dwFlags,
                         info.rcMonitor.left,
                         info.rcMonitor.top,
                         info.rcMonitor.right - info.rcMonitor.left,
-                        info.rcMonitor.bottom - info.rcMonitor.top
+                        info.rcMonitor.bottom - info.rcMonitor.top,
+                        mode.dmPelsWidth, mode.dmPelsHeight, mode.dmDisplayOrientation
                     ));
                 }
                 else
                 {
-                    parts.Add(String.Format(
-                        "{0}|UNKNOWN|0|{1},{2},{3},{4}",
-                        index,
-                        lprcMonitor.left,
-                        lprcMonitor.top,
-                        lprcMonitor.right - lprcMonitor.left,
-                        lprcMonitor.bottom - lprcMonitor.top
-                    ));
+                    complete = false;
+                    return false;
                 }
 
                 index++;
@@ -599,9 +649,9 @@ namespace WatchdogWin32
                 return null;
             }
 
-            if (parts.Count == 0)
+            if (!complete || parts.Count == 0)
             {
-                return "NO_ACTIVE_MONITORS";
+                return null;
             }
 
             return String.Join("||", parts.ToArray());
@@ -1061,12 +1111,142 @@ function WdGetDisplayTopologyFingerprint {
 }
 
 function WdIsDisplayChangeRestartEnabled {
-    param($Config)
+    param($Config, [string]$Path = "")
 
     if ($null -eq $Config) { return $false }
     if ($Config.ContainsKey("Once") -and [bool]$Config.Once) { return $false }
-    if (-not $Config.ContainsKey("RestartOnDisplayChange")) { return $false }
-    return [bool]$Config.RestartOnDisplayChange
+    return ([bool]$Config.RestartOnDisplayChange -or (WdIsUnityDisplayRecoveryEnabled -Path $Path -Config $Config))
+}
+
+function WdIsUnityDisplayRecoveryEnabled {
+    param([string]$Path, $Config)
+
+    if (-not $Config -or (-not [bool](WdGetConfigValue $Config "UnityDisplayRecovery" $true) -and
+            -not [bool]$Config.RestartOnDisplayChange) -or
+        [bool]$Config.Once -or [bool]$Config.HideWindow -or [bool]$Config.AllowMultiInstance -or
+        ([bool]$Config.ForceDisplayMode -and -not [bool]$Config.Fullscreen) -or
+        -not $Path.EndsWith(".exe", [StringComparison]::OrdinalIgnoreCase)) { return $false }
+
+    $directory = [IO.Path]::GetDirectoryName($Path)
+    $dataDirectory = Join-Path $directory ([IO.Path]::GetFileNameWithoutExtension($Path) + "_Data")
+    return ((Test-Path -LiteralPath (Join-Path $directory "UnityPlayer.dll") -PathType Leaf) -and
+        (Test-Path -LiteralPath $dataDirectory -PathType Container))
+}
+
+function WdGetFullscreenObservation {
+    param($ProcessObj)
+
+    $previousDpiContext = [IntPtr]::Zero
+    try {
+        $previousDpiContext = [WatchdogWin32.DisplayAPI]::EnterPerMonitorDpiAwareness()
+        $ProcessObj.Refresh()
+        $hwnd = [IntPtr]$ProcessObj.MainWindowHandle
+        if ($hwnd -eq [IntPtr]::Zero -or [WatchdogWin32.DisplayAPI]::IsIconic($hwnd) -or
+            -not [WatchdogWin32.DisplayAPI]::IsWindowVisible($hwnd)) { return $null }
+
+        $rect = New-Object WatchdogWin32.DisplayAPI+RECT
+        $origin = New-Object WatchdogWin32.DisplayAPI+POINT
+        $monitor = [WatchdogWin32.DisplayAPI]::MonitorFromWindow($hwnd, $MONITOR_NEAREST)
+        $info = New-Object WatchdogWin32.DisplayAPI+MONITORINFO
+        $info.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($info)
+        if ($monitor -eq [IntPtr]::Zero -or
+            -not [WatchdogWin32.DisplayAPI]::GetMonitorInfo($monitor, [ref]$info) -or
+            -not [WatchdogWin32.DisplayAPI]::GetClientRect($hwnd, [ref]$rect) -or
+            -not [WatchdogWin32.DisplayAPI]::ClientToScreen($hwnd, [ref]$origin)) { return $null }
+
+        $width = $rect.right - $rect.left
+        $height = $rect.bottom - $rect.top
+        $monitorWidth = $info.rcMonitor.right - $info.rcMonitor.left
+        $monitorHeight = $info.rcMonitor.bottom - $info.rcMonitor.top
+        if ($width -le 0 -or $height -le 0 -or $monitorWidth -le 0 -or $monitorHeight -le 0) { return $null }
+
+        return @{
+            Matches = (WdTestFullscreenClientBounds -Left $origin.x -Top $origin.y -Width $width -Height $height `
+                -MonitorLeft $info.rcMonitor.left -MonitorTop $info.rcMonitor.top -MonitorWidth $monitorWidth -MonitorHeight $monitorHeight)
+            Details = "client=${width}x${height}@$($origin.x),$($origin.y); monitor=${monitorWidth}x${monitorHeight}@$($info.rcMonitor.left),$($info.rcMonitor.top)"
+        }
+    }
+    catch { return $null }
+    finally { [WatchdogWin32.DisplayAPI]::RestoreThreadDpiAwareness($previousDpiContext) }
+}
+
+function WdTestFullscreenClientBounds {
+    param([int]$Left, [int]$Top, [int]$Width, [int]$Height,
+        [int]$MonitorLeft, [int]$MonitorTop, [int]$MonitorWidth, [int]$MonitorHeight)
+
+    return ($Width -gt 0 -and $Height -gt 0 -and $MonitorWidth -gt 0 -and $MonitorHeight -gt 0 -and
+        [Math]::Abs($Left - $MonitorLeft) -le $WD_FULLSCREEN_TOLERANCE_PX -and
+        [Math]::Abs($Top - $MonitorTop) -le $WD_FULLSCREEN_TOLERANCE_PX -and
+        [Math]::Abs($Width - $MonitorWidth) -le $WD_FULLSCREEN_TOLERANCE_PX -and
+        [Math]::Abs($Height - $MonitorHeight) -le $WD_FULLSCREEN_TOLERANCE_PX)
+}
+
+function WdUpdateFullscreenHealth {
+    param([hashtable]$States, [string]$Path, [int]$ProcessId, $Observation,
+        [bool]$DisplayStable, [DateTime]$Now = (Get-Date))
+
+    if (-not $States.ContainsKey($Path) -or $States[$Path].ProcessId -ne $ProcessId) {
+        $States[$Path] = @{ ProcessId = $ProcessId; FirstSeen = $Now; Failures = 0; RepairAt = $null }
+        if ($Observation) {
+            WdWriteLog "DISPLAY-HEALTH: PID=$ProcessId; fullscreen=$($Observation.Matches); $($Observation.Details)" "DarkGray"
+        }
+    }
+    $state = $States[$Path]
+    if ($null -ne $Observation -and $Observation.Matches) {
+        if ($state.RepairAt) {
+            WdWriteLog "DISPLAY-RECOVERY: PID=$ProcessId client bounds recovered without restart; $($Observation.Details)" "Green"
+        }
+        $state.RepairAt = $null
+    }
+    if (-not $DisplayStable -or $null -eq $Observation -or $Observation.Matches -or
+        ($state.RepairAt -and ($Now - $state.RepairAt).TotalSeconds -lt $UnityDisplayRepairGraceSeconds) -or
+        ($Now - $state.FirstSeen).TotalSeconds -lt $UnityDisplayStartupGraceSeconds) {
+        $state.Failures = 0
+        return $false
+    }
+    $state.Failures = [int]$state.Failures + 1
+    return ($state.Failures -ge $UnityDisplayMismatchChecks)
+}
+
+function WdCanScheduleDisplayRecovery {
+    param([string]$Path, [hashtable]$LastRecovery, [hashtable]$InProgress,
+        [int]$AttemptsThisHour, [DateTime]$Now = (Get-Date))
+
+    if ($InProgress.ContainsKey($Path) -or $AttemptsThisHour -ge $MaxRetryInHour) { return $false }
+    return (-not $LastRecovery.ContainsKey($Path) -or
+        ($Now - $LastRecovery[$Path]).TotalSeconds -ge $DisplayRecoveryCooldownSeconds)
+}
+
+function WdUpdateDisplayTopologyState {
+    param([hashtable]$State, [string]$Fingerprint, [DateTime]$Now = (Get-Date), [bool]$DisplayEvent = $false)
+
+    if ([string]::IsNullOrWhiteSpace($Fingerprint)) {
+        # 断屏/查询失败不属于稳定状态；恢复后重新计时，包括恢复到原分辨率。
+        $State.Pending = "UNAVAILABLE"
+        $State.ChangedAt = $null
+        return $false
+    }
+    if (-not $State.Baseline) {
+        $State.Baseline = $Fingerprint
+    }
+    if ($DisplayEvent) {
+        $State.Pending = $Fingerprint
+        $State.ChangedAt = $Now
+        WdWriteLog "DISPLAY-CHANGE: Display notification received; waiting $DisplayChangeDebounceSeconds sec even if resolution is unchanged." "Yellow"
+        return $false
+    }
+    if ($Fingerprint -eq $State.Baseline -and -not $State.Pending) { return $false }
+    if ($State.Pending -ne $Fingerprint -or -not $State.ChangedAt) {
+        $State.Pending = $Fingerprint
+        $State.ChangedAt = $Now
+        WdWriteLog "DISPLAY-CHANGE: Waiting $DisplayChangeDebounceSeconds sec for stability. Baseline=[$($State.Baseline)] New=[$Fingerprint]" "Yellow"
+        return $false
+    }
+    if (($Now - $State.ChangedAt).TotalSeconds -lt $DisplayChangeDebounceSeconds) { return $false }
+    $State.Baseline = $Fingerprint
+    $State.Pending = $null
+    $State.ChangedAt = $null
+    return $true
 }
 
 function WdGetConfigInt {
@@ -1171,6 +1351,8 @@ function WdScheduleDisplayChangeRestart {
 
     WdWriteLog "DISPLAY-CHANGE: Restarting $FileName (PID:$ProcessId); relaunch scheduled in $restartDelay sec." "Yellow"
     $stopSucceeded = WdStopProcessTreeSafe -ProcessId $ProcessId -KillTree $killTree
+    # Unity 退出/启动可能广播它自己的显示模式切换，避免被当作下一次开屏。
+    $Script:DisplayEventQuietUntil = (Get-Date).AddSeconds($UnityDisplayStartupGraceSeconds)
 
     $ScheduledLaunch[$Path] = (Get-Date).AddSeconds($restartDelay)
     if ($LaunchTime.ContainsKey($Path)) { $LaunchTime.Remove($Path) }
@@ -1630,7 +1812,8 @@ function WdSetWindowToForeground {
 function WdRepairWindowDisplayMode {
     param(
         $ProcessObj,
-        [bool]$Fullscreen
+        [bool]$Fullscreen,
+        [switch]$ForceRefresh
     )
 
     if ($null -eq $ProcessObj) { return $false }
@@ -1681,7 +1864,7 @@ function WdRepairWindowDisplayMode {
         [Math]::Abs(($winRect.bottom - $winRect.top) - $mHeight) -le $WD_FULLSCREEN_TOLERANCE_PX
     )
 
-    if ($Fullscreen -and -not $isFullscreen) {
+    if ($Fullscreen -and (-not $isFullscreen -or $ForceRefresh)) {
         WdWriteLog "DISPLAY: Forcing fullscreen for PID $($ProcessObj.Id)..." "Yellow"
         $curStyle = [WatchdogWin32.DisplayAPI]::GetWindowLong($hwnd, $GWL_STYLE)
         $newStyle = $curStyle -band (-bnot $WS_OVERLAPPEDWINDOW)
@@ -2095,6 +2278,9 @@ function WdLaunchAndTrack {
 
         if ($proc) {
             $LaunchTime[$Path] = Get-Date
+            if (WdIsDisplayChangeRestartEnabled -Path $Path -Config $Config) {
+                $Script:DisplayEventQuietUntil = (Get-Date).AddSeconds($UnityDisplayStartupGraceSeconds)
+            }
             $DisplayRepairDone[$Path] = $false
             $HangFailCount[$Path] = 0
             $LastStartedProcessId[$Path] = $proc.Id
@@ -3057,7 +3243,7 @@ function WdResetMonitoringState {
             "RestartStats", "LaunchTime", "DisplayRepairDone", "FocusLastTime",
             "LastStartAttempt", "LastStartedProcessId", "ThrottleWarned", "MissingLogged",
             "HangFailCount", "FastExitFailCount", "FastExitHandledLaunch", "ScheduledLaunch",
-            "DisplayChangeRestartInProgress"
+            "DisplayChangeRestartInProgress", "FullscreenHealth", "DisplayRecoveryLastAttempt", "DisplayRecoveryPending"
         )) {
         $variable = Get-Variable -Name $variableName -Scope Script -ErrorAction SilentlyContinue
         if ($variable -and $variable.Value -and $variable.Value.PSObject.Methods["Clear"]) {
@@ -3156,6 +3342,606 @@ function WdOfferAuthorizationForError {
     [void](WdRequestElevatedRestart)
 }
 
+function WdInitializeSettingsControls {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    if (([Management.Automation.PSTypeName]'WatchdogUI.CompactButton').Type) { return }
+    $settingsControlsCode = @"
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Windows.Forms;
+
+namespace WatchdogUI
+{
+    internal static class PaintKit
+    {
+        internal static readonly Color Ink = Color.FromArgb(32, 39, 54);
+        internal static readonly Color Muted = Color.FromArgb(113, 122, 139);
+        internal static readonly Color Accent = Color.FromArgb(78, 91, 235);
+        internal static readonly Color Border = Color.FromArgb(224, 228, 236);
+        internal static GraphicsPath Round(Rectangle r, int radius)
+        {
+            int d = Math.Max(2, Math.Min(radius * 2, Math.Min(r.Width, r.Height)));
+            GraphicsPath p = new GraphicsPath();
+            p.AddArc(r.Left, r.Top, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure(); return p;
+        }
+        internal static void Box(Graphics g, Rectangle r, int radius, Color fill, Color stroke)
+        {
+            if (r.Width < 2 || r.Height < 2) return;
+            using (GraphicsPath p = Round(r, radius))
+            using (Brush b = new SolidBrush(fill))
+            { g.FillPath(b, p); if (stroke != Color.Empty) using (Pen pen = new Pen(stroke)) g.DrawPath(pen, p); }
+        }
+    }
+
+    public sealed class CompactButton : Button
+    {
+        private bool hover;
+        public CompactButton() { SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true); }
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(Parent == null ? SystemColors.Control : Parent.BackColor);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            Color fill = Enabled ? (hover ? FlatAppearance.MouseOverBackColor : BackColor) : Color.FromArgb(241, 243, 247);
+            PaintKit.Box(e.Graphics, new Rectangle(0, 0, Width - 1, Height - 1), Math.Max(4, DeviceDpi / 16), fill, Color.Empty);
+            TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, Enabled ? ForeColor : PaintKit.Muted,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            if (Focused && ShowFocusCues)
+                using (GraphicsPath p = PaintKit.Round(Rectangle.Inflate(ClientRectangle, -3, -3), 4))
+                using (Pen pen = new Pen(PaintKit.Accent)) e.Graphics.DrawPath(pen, p);
+        }
+    }
+
+    public sealed class Toggle : CheckBox
+    {
+        public Toggle() { SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true); Cursor = Cursors.Hand; }
+        public override Size GetPreferredSize(Size proposedSize)
+        { return new Size(Math.Max(MinimumSize.Width, TextRenderer.MeasureText(Text, Font).Width + 50 * DeviceDpi / 96), Math.Max(MinimumSize.Height, 30 * DeviceDpi / 96)); }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(Parent == null ? BackColor : Parent.BackColor);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            int s = Math.Max(16, 18 * DeviceDpi / 96), w = s * 2 - 4;
+            Rectangle track = new Rectangle(Width - w - 2, (Height - s) / 2, w, s);
+            Color color = !Enabled ? Color.FromArgb(230, 233, 239) : Checked ? PaintKit.Accent : Color.FromArgb(197, 204, 217);
+            PaintKit.Box(e.Graphics, track, s / 2, color, Color.Empty);
+            int knob = s - 6, x = Checked ? track.Right - knob - 3 : track.Left + 3;
+            using (Brush b = new SolidBrush(Color.White)) e.Graphics.FillEllipse(b, x, track.Top + 3, knob, knob);
+            TextRenderer.DrawText(e.Graphics, Text, Font, new Rectangle(0, 0, Math.Max(0, track.Left - 10), Height),
+                Enabled ? PaintKit.Ink : PaintKit.Muted, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine);
+            if (Focused && ShowFocusCues)
+                using (GraphicsPath p = PaintKit.Round(Rectangle.Inflate(ClientRectangle, -1, -1), 4))
+                using (Pen pen = new Pen(PaintKit.Border)) e.Graphics.DrawPath(pen, p);
+        }
+        protected override void OnCheckedChanged(EventArgs e) { Invalidate(); base.OnCheckedChanged(e); }
+    }
+
+    public class Field : UserControl
+    {
+        protected Control Input;
+        protected int SuffixWidth;
+        public Field() { SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true); Height = 34; MinimumSize = new Size(40, 32); BackColor = Color.White; }
+        protected void Attach(Control input)
+        {
+            Input = input; Controls.Add(input);
+            input.Enter += delegate { Invalidate(); }; input.Leave += delegate { Invalidate(); };
+            TabStop = false; PerformLayout();
+        }
+        protected override void OnLayout(LayoutEventArgs e)
+        {
+            base.OnLayout(e);
+            if (Input != null) { int gap = 10 * DeviceDpi / 96; Input.SetBounds(gap, Math.Max(2, (Height - Input.PreferredSize.Height) / 2), Math.Max(10, Width - gap * 2 - SuffixWidth), Input.PreferredSize.Height); }
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(Parent == null ? SystemColors.Control : Parent.BackColor);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            PaintKit.Box(e.Graphics, new Rectangle(0, 0, Width - 1, Height - 1), Math.Max(4, DeviceDpi / 16), BackColor, ContainsFocus ? PaintKit.Accent : PaintKit.Border);
+            if (SuffixWidth > 0) TextRenderer.DrawText(e.Graphics, "s", Font, new Rectangle(Width - SuffixWidth - 8, 0, SuffixWidth, Height), PaintKit.Muted, TextFormatFlags.VerticalCenter | TextFormatFlags.HorizontalCenter);
+        }
+    }
+    public sealed class TextField : Field
+    {
+        private TextBox editor;
+        public TextField()
+        {
+            editor = new TextBox(); editor.BorderStyle = BorderStyle.None; editor.BackColor = Color.White;
+            editor.TextChanged += delegate { OnTextChanged(EventArgs.Empty); }; Attach(editor);
+        }
+        public override string Text { get { return editor == null ? base.Text : editor.Text; } set { if (editor == null) base.Text = value; else editor.Text = value; } }
+    }
+    internal sealed class QuietNumber : NumericUpDown
+    {
+        protected override void OnLayout(LayoutEventArgs e)
+        {
+            base.OnLayout(e);
+            foreach (Control child in Controls) { if (child is TextBox) child.SetBounds(0, 0, Width, Height); else child.Visible = false; }
+        }
+    }
+    public sealed class NumberField : Field
+    {
+        private QuietNumber editor;
+        public NumberField()
+        { editor = new QuietNumber(); editor.BorderStyle = BorderStyle.None; editor.BackColor = Color.White; SuffixWidth = 16; Attach(editor); }
+        public decimal Value { get { return editor.Value; } set { editor.Value = value; } }
+        public decimal Minimum { get { return editor.Minimum; } set { editor.Minimum = value; } }
+        public decimal Maximum { get { return editor.Maximum; } set { editor.Maximum = value; } }
+    }
+
+    public sealed class ProgramList : ListView
+    {
+        public ProgramList() { OwnerDraw = true; HeaderStyle = ColumnHeaderStyle.None; DoubleBuffered = true; }
+        protected override void OnDrawColumnHeader(DrawListViewColumnHeaderEventArgs e) { }
+        protected override void OnDrawSubItem(DrawListViewSubItemEventArgs e) { }
+        protected override void OnDrawItem(DrawListViewItemEventArgs e)
+        {
+            Graphics g = e.Graphics; g.SmoothingMode = SmoothingMode.AntiAlias;
+            float scale = DeviceDpi / 96f;
+            Rectangle row = new Rectangle(0, e.Bounds.Top + 2, ClientSize.Width - 2, e.Bounds.Height - 4);
+            Color fill = e.Item.Selected ? Color.FromArgb(235, 237, 255) : BackColor;
+            PaintKit.Box(g, row, (int)(7 * scale), fill, e.Item.Selected ? Color.FromArgb(215, 220, 255) : Color.Empty);
+            int iconSize = (int)(30 * scale), gap = (int)(10 * scale);
+            Rectangle icon = new Rectangle(row.Left + gap, row.Top + (row.Height - iconSize) / 2, iconSize, iconSize);
+            PaintKit.Box(g, icon, (int)(7 * scale), e.Item.Selected ? PaintKit.Accent : Color.FromArgb(226, 230, 239), Color.Empty);
+            TextRenderer.DrawText(g, ">_", Font, icon, e.Item.Selected ? Color.White : PaintKit.Muted, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            int left = icon.Right + gap, width = Math.Max(1, row.Right - left - gap);
+            string status = e.Item.SubItems.Count > 2 ? e.Item.SubItems[2].Text : "";
+            if (status != "待修复" && e.Item.SubItems.Count > 3 && !String.IsNullOrEmpty(e.Item.SubItems[3].Text)) status = "置顶";
+            int statusWidth = String.IsNullOrEmpty(status) ? 0 : (int)(46 * scale);
+            Rectangle name = new Rectangle(left, row.Top + (int)(7 * scale), Math.Max(1, width - statusWidth), (int)(21 * scale));
+            TextRenderer.DrawText(g, e.Item.Text, Font, name, PaintKit.Ink, TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+            if (statusWidth > 0)
+            {
+                Rectangle badge = new Rectangle(row.Right - gap - statusWidth, name.Top, statusWidth, name.Height);
+                using (Font small = new Font(Font.FontFamily, Math.Max(7, Font.Size - 1)))
+                    TextRenderer.DrawText(g, status, small, badge, status == "待修复" ? Color.FromArgb(178, 104, 22) : PaintKit.Muted, TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
+            }
+            if (e.Item.SubItems.Count > 1)
+            {
+                Rectangle path = new Rectangle(left, name.Bottom, width, (int)(18 * scale));
+                using (Font small = new Font(Font.FontFamily, Math.Max(7, Font.Size - 1)))
+                    TextRenderer.DrawText(g, e.Item.SubItems[1].Text, small, path, PaintKit.Muted, TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+            }
+            if (Focused && e.Item.Focused && ShowFocusCues) ControlPaint.DrawFocusRectangle(g, Rectangle.Inflate(row, -3, -3));
+        }
+    }
+
+    public sealed class NetworkList : ListView
+    {
+        public NetworkList() { OwnerDraw = true; DoubleBuffered = true; }
+        protected override void OnDrawColumnHeader(DrawListViewColumnHeaderEventArgs e)
+        {
+            e.Graphics.FillRectangle(SystemBrushes.Window, e.Bounds);
+            TextRenderer.DrawText(e.Graphics, e.Header.Text, Font, Rectangle.Inflate(e.Bounds, -8, 0), PaintKit.Muted, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            using (Pen p = new Pen(PaintKit.Border)) e.Graphics.DrawLine(p, e.Bounds.Left, e.Bounds.Bottom - 1, e.Bounds.Right, e.Bounds.Bottom - 1);
+        }
+        protected override void OnDrawItem(DrawListViewItemEventArgs e) { }
+        protected override void OnDrawSubItem(DrawListViewSubItemEventArgs e)
+        {
+            using (Brush b = new SolidBrush(e.Item.Selected ? Color.FromArgb(235, 237, 255) : Color.White)) e.Graphics.FillRectangle(b, e.Bounds);
+            TextRenderer.DrawText(e.Graphics, e.SubItem.Text, Font, Rectangle.Inflate(e.Bounds, -8, 0), PaintKit.Ink, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+        }
+    }
+}
+"@
+    $settingsReferences = @(
+        [Windows.Forms.Button].Assembly.Location, [Windows.Forms.Message].Assembly.Location,
+        [Drawing.Graphics].Assembly.Location, [Drawing.Color].Assembly.Location,
+        [ComponentModel.Component].Assembly.Location
+        [Drawing.Graphics].GetInterfaces() | ForEach-Object { $_.Assembly.Location }
+    ) | Select-Object -Unique
+    Add-Type -TypeDefinition $settingsControlsCode -Language CSharp -ReferencedAssemblies $settingsReferences -ErrorAction Stop
+}
+
+function WdNewSettingsView {
+    param([switch]$FirstRun)
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    WdInitializeSettingsControls
+    $ui = @{}
+    $ink = [Drawing.ColorTranslator]::FromHtml('#202736')
+    $muted = [Drawing.ColorTranslator]::FromHtml('#717A8B')
+    $accent = [Drawing.ColorTranslator]::FromHtml('#4E5BEB')
+    $border = [Drawing.ColorTranslator]::FromHtml('#DCE3ED')
+    $canvas = [Drawing.ColorTranslator]::FromHtml('#F6F7FB')
+    $form = New-Object Windows.Forms.Form
+    $ui.Form = $form
+    $form.Text = if ($FirstRun) { '看门狗 · 首次设置' } else { '看门狗 · 设置' }
+    $form.StartPosition = 'CenterScreen'
+    $form.AutoScaleDimensions = New-Object Drawing.SizeF(96, 96)
+    $form.AutoScaleMode = 'Dpi'
+    $form.Font = New-Object Drawing.Font('Microsoft YaHei UI', 9.5)
+    $ownedFonts = New-Object System.Collections.ArrayList
+    [void]$ownedFonts.Add($form.Font)
+    $form.ForeColor = $ink
+    $form.BackColor = $canvas
+    $form.FormBorderStyle = 'Sizable'
+    $form.MinimizeBox = $false
+    $form.TopMost = $true
+    $form.MinimumSize = New-Object Drawing.Size(480, 580)
+    $area = [Windows.Forms.Screen]::FromPoint([Windows.Forms.Cursor]::Position).WorkingArea
+    $form.ClientSize = New-Object Drawing.Size(([Math]::Min(1040, $area.Width - 64)), ([Math]::Min(680, $area.Height - 80)))
+    $form.SuspendLayout()
+
+    $newLabel = {
+        param([string]$Text, [single]$Size = 9.5, [bool]$Bold = $false)
+        $control = New-Object Windows.Forms.Label
+        $control.Text = $Text
+        $control.AutoSize = $true
+        $control.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 5)
+        $style = if ($Bold) { [Drawing.FontStyle]::Bold } else { [Drawing.FontStyle]::Regular }
+        $control.Font = New-Object Drawing.Font('Microsoft YaHei UI', $Size, $style)
+        [void]$ownedFonts.Add($control.Font)
+        return $control
+    }
+    $newButton = {
+        param([string]$Text, [bool]$Primary = $false)
+        $control = New-Object WatchdogUI.CompactButton
+        $control.Text = $Text
+        $control.AutoSize = $true
+        $control.AutoSizeMode = 'GrowAndShrink'
+        $control.MinimumSize = New-Object Drawing.Size(72, 32)
+        $control.Padding = New-Object Windows.Forms.Padding(10, 3, 10, 3)
+        $control.Margin = New-Object Windows.Forms.Padding(0, 0, 8, 0)
+        $control.FlatStyle = 'Flat'
+        $control.FlatAppearance.BorderSize = if ($Primary) { 0 } else { 1 }
+        $control.FlatAppearance.BorderColor = $border
+        $control.BackColor = if ($Primary) { $accent } else { [Drawing.Color]::White }
+        $control.ForeColor = if ($Primary) { [Drawing.Color]::White } else { $ink }
+        $control.FlatAppearance.MouseOverBackColor = if ($Primary) { [Drawing.Color]::FromArgb(29, 78, 216) } else { [Drawing.Color]::FromArgb(239, 244, 252) }
+        $control.Cursor = [Windows.Forms.Cursors]::Hand
+        return $control
+    }
+    $newStack = {
+        $control = New-Object Windows.Forms.TableLayoutPanel
+        $control.ColumnCount = 1
+        $control.RowCount = 0
+        $control.AutoSize = $true
+        $control.AutoSizeMode = 'GrowAndShrink'
+        $control.Dock = 'Top'
+        $control.Margin = New-Object Windows.Forms.Padding(0)
+        [void]$control.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
+        return $control
+    }
+    $append = {
+        param($Parent, $Child)
+        $row = $Parent.RowCount
+        $Parent.RowCount++
+        [void]$Parent.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize')))
+        [void]$Parent.Controls.Add($Child, 0, $row)
+    }
+    $newFlow = {
+        $control = New-Object Windows.Forms.FlowLayoutPanel
+        $control.AutoSize = $true
+        $control.AutoSizeMode = 'GrowAndShrink'
+        $control.Dock = 'Top'
+        $control.WrapContents = $true
+        $control.Margin = New-Object Windows.Forms.Padding(0)
+        return $control
+    }
+
+    $root = New-Object Windows.Forms.TableLayoutPanel
+    $root.Dock = 'Fill'
+    $root.Padding = New-Object Windows.Forms.Padding(16, 12, 16, 12)
+    $root.ColumnCount = 1; $root.RowCount = 3
+    [void]$root.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
+    [void]$root.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize')))
+    [void]$root.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent', 100)))
+    [void]$root.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize')))
+    [void]$form.Controls.Add($root)
+    $header = & $newFlow
+    $header.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 12)
+    $brand = & $newLabel '看门狗' 14 $true
+    $brand.Margin = New-Object Windows.Forms.Padding(0, 0, 12, 0)
+    [void]$header.Controls.Add($brand)
+    $subtitle = & $newLabel '程序守护 / 设置'
+    $subtitle.Margin = New-Object Windows.Forms.Padding(0, 5, 0, 0)
+    $subtitle.ForeColor = $muted
+    [void]$header.Controls.Add($subtitle)
+    [void]$root.Controls.Add($header, 0, 0)
+
+    $body = New-Object Windows.Forms.TableLayoutPanel
+    $body.Dock = 'Fill'; $body.Margin = New-Object Windows.Forms.Padding(0)
+    $body.ColumnCount = 2; $body.RowCount = 1
+    [void]$body.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 34)))
+    [void]$body.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 66)))
+    [void]$body.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent', 100)))
+    [void]$root.Controls.Add($body, 0, 1)
+    $ui.Body = $body
+
+    $library = New-Object Windows.Forms.TableLayoutPanel
+    $library.BackColor = $canvas
+    $library.Padding = New-Object Windows.Forms.Padding(12)
+    $library.Dock = 'Fill'; $library.ColumnCount = 1; $library.RowCount = 4
+    $library.Margin = New-Object Windows.Forms.Padding(0, 0, 12, 0)
+    [void]$library.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
+    foreach ($rowType in @('AutoSize', 'AutoSize', 'Percent', 'AutoSize')) {
+        [void]$library.RowStyles.Add((New-Object Windows.Forms.RowStyle($rowType, 100)))
+    }
+    $libraryHeading = & $newFlow
+    $libraryTitle = & $newLabel '启动程序' 10 $true
+    $libraryTitle.Margin = New-Object Windows.Forms.Padding(0, 5, 24, 4)
+    [void]$libraryHeading.Controls.Add($libraryTitle)
+    $ui.Add = & $newButton '+ 添加' $false
+    [void]$libraryHeading.Controls.Add($ui.Add)
+    [void]$library.Controls.Add($libraryHeading, 0, 0)
+    $ui.ListHint = & $newLabel '选择程序编辑 · 支持拖入 EXE' 8.5
+    $ui.ListHint.ForeColor = $muted
+    [void]$library.Controls.Add($ui.ListHint, 0, 1)
+    $listHost = New-Object Windows.Forms.Panel
+    $listHost.Dock = 'Fill'; $listHost.Margin = New-Object Windows.Forms.Padding(0, 4, 0, 6)
+    $list = New-Object WatchdogUI.ProgramList
+    $list.BackColor = $canvas
+    $list.Dock = 'Fill'; $list.View = 'Details'; $list.BorderStyle = 'None'
+    $list.FullRowSelect = $true; $list.HideSelection = $false
+    $list.MultiSelect = $false; $list.AllowDrop = $true; $list.ShowItemToolTips = $true
+    foreach ($column in @('程序', '路径', '状态', '置顶')) { [void]$list.Columns.Add($column) }
+    $rowImages = New-Object Windows.Forms.ImageList
+    $rowImages.ImageSize = New-Object Drawing.Size(1, 58)
+    $list.SmallImageList = $rowImages
+    [void]$listHost.Controls.Add($list)
+    $ui.EmptyList = & $newLabel "还没有启动程序`r`n`r`n点击下方「添加程序」开始设置。"
+    $ui.EmptyList.AutoSize = $false; $ui.EmptyList.Dock = 'Fill'
+    $ui.EmptyList.TextAlign = 'MiddleCenter'; $ui.EmptyList.ForeColor = $muted
+    $ui.EmptyList.Enabled = $false # Allow drops to reach the underlying program list.
+    [void]$list.Controls.Add($ui.EmptyList)
+    $ui.EmptyList.BringToFront()
+    [void]$library.Controls.Add($listHost, 0, 2)
+    $libraryActions = & $newFlow
+    $ui.Remove = & $newButton '移除程序'
+    [void]$libraryActions.Controls.Add($ui.Remove)
+    [void]$library.Controls.Add($libraryActions, 0, 3)
+    $ui.List = $list
+    [void]$body.Controls.Add($library, 0, 0)
+
+    $right = New-Object Windows.Forms.TableLayoutPanel
+    $right.Dock = 'Fill'; $right.BackColor = [Drawing.Color]::White
+    $right.Margin = New-Object Windows.Forms.Padding(0)
+    $right.Padding = New-Object Windows.Forms.Padding(16, 12, 16, 12)
+    $right.ColumnCount = 1; $right.RowCount = 2
+    [void]$right.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
+    [void]$right.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize')))
+    [void]$right.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent', 100)))
+    $navigation = & $newFlow
+    $navigation.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 10)
+    $ui.ProgramTab = & $newButton '程序配置' $true
+    $ui.HostTab = & $newButton '主机设置'
+    [void]$navigation.Controls.Add($ui.ProgramTab); [void]$navigation.Controls.Add($ui.HostTab)
+    [void]$right.Controls.Add($navigation, 0, 0)
+    $pageHost = New-Object Windows.Forms.Panel
+    $pageHost.Dock = 'Fill'; $pageHost.Margin = New-Object Windows.Forms.Padding(0)
+    [void]$right.Controls.Add($pageHost, 0, 1)
+    [void]$body.Controls.Add($right, 1, 0)
+    foreach ($pageName in @('ProgramPage', 'HostPage')) {
+        $page = New-Object Windows.Forms.Panel
+        $page.Dock = 'Fill'; $page.AutoScroll = $true
+        [void]$pageHost.Controls.Add($page)
+        $ui[$pageName] = $page
+    }
+    $program = & $newStack
+    $program.Padding = New-Object Windows.Forms.Padding(0, 0, 8, 0)
+    [void]$ui.ProgramPage.Controls.Add($program)
+    & $append $program (& $newLabel '启动方式' 10 $true)
+    & $append $program (& $newLabel '程序路径或网址')
+    $pathRow = New-Object Windows.Forms.TableLayoutPanel
+    $pathRow.Dock = 'Top'; $pathRow.AutoSize = $true; $pathRow.ColumnCount = 2; $pathRow.RowCount = 1
+    $pathRow.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 8)
+    [void]$pathRow.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
+    [void]$pathRow.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('AutoSize')))
+    $ui.PathBox = New-Object WatchdogUI.TextField
+    $ui.PathBox.Dock = 'Fill'; $ui.PathBox.Margin = New-Object Windows.Forms.Padding(0, 0, 8, 0)
+    $ui.Browse = & $newButton '浏览…'
+    $ui.Browse.Margin = New-Object Windows.Forms.Padding(0)
+    [void]$pathRow.Controls.Add($ui.PathBox, 0, 0); [void]$pathRow.Controls.Add($ui.Browse, 1, 0)
+    & $append $program $pathRow
+    & $append $program (& $newLabel '启动参数')
+    $ui.ArgsBox = New-Object WatchdogUI.TextField
+    $ui.ArgsBox.Dock = 'Top'; $ui.ArgsBox.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 8)
+    & $append $program $ui.ArgsBox
+    $timing = & $newFlow
+    foreach ($field in @(@('FirstBox', '首次启动延迟'), @('RestartBox', '异常重启延迟'), @('MinBox', '最短运行时间'))) {
+        $group = & $newStack
+        $group.Dock = 'None'; $group.Margin = New-Object Windows.Forms.Padding(0, 0, 20, 10)
+        & $append $group (& $newLabel $field[1])
+        $number = New-Object WatchdogUI.NumberField
+        $number.Minimum = 0; $number.Maximum = 86400; $number.Width = 126
+        $number.Margin = New-Object Windows.Forms.Padding(0)
+        $ui[$field[0]] = $number
+        & $append $group $number
+        [void]$timing.Controls.Add($group)
+    }
+    & $append $program $timing
+    $ui.CheckBoxes = @{}
+    $optionGroups = @(
+        @{ Title = '显示与恢复'; Options = @(
+            @('Fullscreen', '全屏模式'), @('ForceDisplayMode', '强制显示模式'),
+            @('FocusTop', '窗口置顶（全局单选）'), @('HideCursor', '隐藏鼠标光标'),
+            @('RestartOnDisplayChange', '显示器变化时重启'), @('UnityDisplayRecovery', 'Unity 全屏异常恢复')) },
+        @{ Title = '运行策略'; Options = @(
+            @('HideWindow', '隐藏窗口启动'), @('Once', '仅启动一次'),
+            @('KillTreeOnHang', '异常时结束进程树'), @('AllowMultiInstance', '允许多实例')) }
+    )
+    $optionFlows = @()
+    foreach ($group in $optionGroups) {
+        $label = & $newLabel $group.Title 10 $true
+        $label.Margin = New-Object Windows.Forms.Padding(0, 10, 0, 4)
+        & $append $program $label
+        $flow = & $newFlow
+        foreach ($option in $group.Options) {
+            $check = New-Object WatchdogUI.Toggle
+            $check.Text = $option[1]; $check.AutoSize = $true
+            $check.Margin = New-Object Windows.Forms.Padding(0, 0, 20, 2)
+            [void]$flow.Controls.Add($check)
+            $ui.CheckBoxes[$option[0]] = $check
+        }
+        & $append $program $flow
+        $optionFlows += $flow
+        if ($group.Title -eq '显示与恢复') {
+            $ui.RecoveryHint = & $newLabel '开启「显示器变化时重启」后，Unity 持续未全屏也会直接重启；否则先尝试恢复全屏。'
+            $ui.RecoveryHint.ForeColor = $muted
+            $ui.RecoveryHint.Margin = New-Object Windows.Forms.Padding(0, 4, 0, 0)
+            & $append $program $ui.RecoveryHint
+        }
+    }
+
+    $hostContent = & $newStack
+    $hostContent.Padding = New-Object Windows.Forms.Padding(0, 0, 12, 8)
+    [void]$ui.HostPage.Controls.Add($hostContent)
+    & $append $hostContent (& $newLabel '无人值守' 10 $true)
+    foreach ($option in @(@('AutoStart', '随 Windows 自动启动', $Script:StartWithWindows),
+            @('DisableLockScreen', '禁用 Windows 锁屏', $Script:DisableLockScreen),
+            @('MagicWake', '允许魔法唤醒', $Script:EnableMagicWake))) {
+        $check = New-Object WatchdogUI.Toggle
+        $check.Text = $option[1]; $check.AutoSize = $true; $check.Checked = [bool]$option[2]
+        $check.Dock = 'Top'
+        $check.Margin = New-Object Windows.Forms.Padding(0, 4, 0, 6)
+        $ui[$option[0]] = $check
+        & $append $hostContent $check
+    }
+    $ui.WakeHint = & $newLabel '魔法唤醒会配置网卡与设备唤醒，并关闭 Windows 快速启动。'
+    $ui.WakeHint.ForeColor = $muted
+    & $append $hostContent $ui.WakeHint
+    $networkLabel = & $newLabel '物理网卡' 10 $true
+    $networkLabel.Margin = New-Object Windows.Forms.Padding(0, 22, 0, 12)
+    & $append $hostContent $networkLabel
+    $ui.AdapterList = New-Object WatchdogUI.NetworkList
+    $ui.AdapterList.View = 'Details'; $ui.AdapterList.FullRowSelect = $true
+    $ui.AdapterList.HideSelection = $false; $ui.AdapterList.MultiSelect = $false
+    $ui.AdapterList.BorderStyle = 'None'; $ui.AdapterList.Dock = 'Top'
+    $ui.AdapterList.Height = 110
+    $ui.AdapterList.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 8)
+    [void]$ui.AdapterList.Columns.Add('网卡'); [void]$ui.AdapterList.Columns.Add('物理 MAC 地址')
+    & $append $hostContent $ui.AdapterList
+    $ui.CopyMac = & $newButton '复制 MAC 地址'
+    & $append $hostContent $ui.CopyMac
+
+    $footer = New-Object Windows.Forms.TableLayoutPanel
+    $footer.AutoSize = $true; $footer.Dock = 'Fill'
+    $footer.ColumnCount = 2; $footer.RowCount = 1
+    $footer.Margin = New-Object Windows.Forms.Padding(0, 10, 0, 0)
+    [void]$footer.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
+    [void]$footer.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('AutoSize')))
+    $ui.Status = & $newLabel '保存后立即生效' 8.5
+    $ui.Status.ForeColor = $muted
+    $ui.Status.Anchor = 'Left'
+    [void]$footer.Controls.Add($ui.Status, 0, 0)
+    $actions = & $newFlow
+    $actions.FlowDirection = 'RightToLeft'
+    $actions.WrapContents = $false
+    $actions.Dock = 'None'
+    $ui.Save = & $newButton '保存配置' $true
+    $ui.Cancel = & $newButton $(if ($FirstRun) { '退出设置' } else { '取消' })
+    $ui.Cancel.DialogResult = 'Cancel'
+    [void]$actions.Controls.Add($ui.Save); [void]$actions.Controls.Add($ui.Cancel)
+    [void]$footer.Controls.Add($actions, 1, 0)
+    [void]$root.Controls.Add($footer, 0, 2)
+
+    $selectPage = {
+        param([bool]$HostSelected)
+        $ui.HostPage.Visible = $HostSelected
+        $ui.ProgramPage.Visible = -not $HostSelected
+        foreach ($pair in @(@($ui.ProgramTab, (-not $HostSelected)), @($ui.HostTab, $HostSelected))) {
+            $pair[0].BackColor = if ($pair[1]) { $accent } else { [Drawing.Color]::White }
+            $pair[0].ForeColor = if ($pair[1]) { [Drawing.Color]::White } else { $ink }
+            $pair[0].FlatAppearance.BorderSize = if ($pair[1]) { 0 } else { 1 }
+            $pair[0].FlatAppearance.MouseOverBackColor = if ($pair[1]) { [Drawing.Color]::FromArgb(29, 78, 216) } else { [Drawing.Color]::FromArgb(239, 244, 252) }
+        }
+    }.GetNewClosure()
+    $ui.ProgramTab.Add_Click({ & $selectPage $false }.GetNewClosure())
+    $ui.HostTab.Add_Click({ & $selectPage $true }.GetNewClosure())
+    & $selectPage $false
+    $layoutState = @{ Compact = $null; Busy = $false }
+    $adaptLayout = {
+        if ($layoutState.Busy -or $form.IsDisposed) { return }
+        $layoutState.Busy = $true
+        try {
+            $scale = $form.DeviceDpi / 96.0
+            $compact = $body.ClientSize.Width -lt (800 * $scale)
+            if ($layoutState.Compact -ne $compact) {
+                $body.SuspendLayout()
+                $body.ColumnStyles.Clear(); $body.RowStyles.Clear()
+                if ($compact) {
+                    $body.ColumnCount = 1; $body.RowCount = 2
+                    $body.SetCellPosition($right, (New-Object Windows.Forms.TableLayoutPanelCellPosition(0, 1)))
+                    [void]$body.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
+                    [void]$body.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute', (210 * $scale))))
+                    [void]$body.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent', 100)))
+                    $library.Margin = New-Object Windows.Forms.Padding(0, 0, 0, (12 * $scale))
+                }
+                else {
+                    $body.ColumnCount = 2; $body.RowCount = 1
+                    $body.SetCellPosition($right, (New-Object Windows.Forms.TableLayoutPanelCellPosition(1, 0)))
+                    [void]$body.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Absolute', (250 * $scale))))
+                    [void]$body.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
+                    [void]$body.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent', 100)))
+                    $library.Margin = New-Object Windows.Forms.Padding(0, 0, (16 * $scale), 0)
+                }
+                $layoutState.Compact = $compact
+                $body.ResumeLayout($true)
+            }
+            $ui.ListHint.Visible = -not $compact
+            if ($compact) { $body.RowStyles[0].Height = 210 * $scale }
+            foreach ($flow in $optionFlows) {
+                $columns = if ($flow.ClientSize.Width -ge 480 * $scale) { 2 } else { 1 }
+                $optionWidth = [Math]::Max(120, [int][Math]::Floor($flow.ClientSize.Width / $columns) - [int](20 * $scale))
+                foreach ($check in $flow.Controls) {
+                    $check.MinimumSize = New-Object Drawing.Size($optionWidth, (24 * $scale))
+                }
+            }
+            $listWidth = [Math]::Max(160, $list.ClientSize.Width - (20 * $scale))
+            $list.Columns[0].Width = [int]$listWidth
+            $list.Columns[1].Width = 0
+            $list.Columns[2].Width = 0
+            $list.Columns[3].Width = 0
+            $adapterWidth = [Math]::Max(180, $ui.AdapterList.ClientSize.Width - (22 * $scale))
+            $ui.AdapterList.Columns[0].Width = [int]($adapterWidth * 0.46)
+            $ui.AdapterList.Columns[1].Width = [int]($adapterWidth * 0.54)
+            foreach ($pair in @(@($ui.RecoveryHint, $ui.ProgramPage), @($ui.WakeHint, $ui.HostPage), @($ui.Status, $footer), @($ui.ListHint, $library))) {
+                $wrapWidth = if ($pair[0] -eq $ui.Status) {
+                    [Math]::Max(100, $footer.ClientSize.Width - $actions.Width - 20 * $scale)
+                } else { [Math]::Max(100, $pair[1].ClientSize.Width - 48 * $scale) }
+                $pair[0].AutoSize = $false
+                $pair[0].MaximumSize = New-Object Drawing.Size($wrapWidth, 0)
+                $textSize = [Windows.Forms.TextRenderer]::MeasureText($pair[0].Text, $pair[0].Font,
+                    (New-Object Drawing.Size($wrapWidth, 32767)), [Windows.Forms.TextFormatFlags]::WordBreak)
+                $pair[0].Size = New-Object Drawing.Size($wrapWidth, $textSize.Height)
+            }
+        }
+        finally { $layoutState.Busy = $false }
+    }.GetNewClosure()
+    $body.Add_SizeChanged($adaptLayout)
+    $list.Add_SizeChanged($adaptLayout)
+    $ui.AdapterList.Add_SizeChanged($adaptLayout)
+    $ui.ProgramPage.Add_SizeChanged($adaptLayout)
+    $ui.HostPage.Add_VisibleChanged($adaptLayout)
+    $ui.Status.Add_TextChanged($adaptLayout)
+    foreach ($flow in $optionFlows) { $flow.Add_SizeChanged($adaptLayout) }
+    $form.Add_Shown({
+        $screenArea = [Windows.Forms.Screen]::FromControl($form).WorkingArea
+        $form.MinimumSize = New-Object Drawing.Size(([Math]::Min($form.MinimumSize.Width, $screenArea.Width)), ([Math]::Min($form.MinimumSize.Height, $screenArea.Height)))
+        $form.Size = New-Object Drawing.Size(([Math]::Min($form.Width, $screenArea.Width)), ([Math]::Min($form.Height, $screenArea.Height)))
+        if ($form.StartPosition -ne [Windows.Forms.FormStartPosition]::Manual) {
+            $form.Location = New-Object Drawing.Point(($screenArea.Left + [int](($screenArea.Width - $form.Width) / 2)), ($screenArea.Top + [int](($screenArea.Height - $form.Height) / 2)))
+        }
+        & $adaptLayout
+    }.GetNewClosure())
+    $form.Add_Disposed({
+        $rowImages.Dispose()
+        foreach ($ownedFont in $ownedFonts) { $ownedFont.Dispose() }
+    }.GetNewClosure())
+    $form.ResumeLayout($true)
+    & $adaptLayout
+    return $ui
+}
+
 function WdShowSettingsWindow {
     param([switch]$FirstRun)
 
@@ -3175,20 +3961,10 @@ function WdShowSettingsWindow {
     $Script:UserInteractionActive = $true
     $Script:AuthorizationPromptShown = $false
 
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = if ($FirstRun) { "首次设置守护程序" } else { "守护程序设置" }
-    $form.StartPosition = "CenterScreen"
-    $form.ClientSize = New-Object System.Drawing.Size(980, 620)
-    $form.MinimizeBox = $false
-    $form.MaximizeBox = $false
-    $form.FormBorderStyle = "FixedDialog"
-    $form.TopMost = $true
-    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
-    $form.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
-    $form.BackColor = [System.Drawing.Color]::White
+    $view = WdNewSettingsView -FirstRun:$FirstRun
+    $form = $view.Form
     $Script:SettingsWindowOpen = $true
     $Script:SettingsForm = $form
-
     $entries = New-Object System.Collections.ArrayList
     foreach ($appPath in $Apps.Keys) {
         [void]$entries.Add([pscustomobject]@{
@@ -3198,199 +3974,29 @@ function WdShowSettingsWindow {
     }
     $state = [pscustomobject]@{ SelectedIndex = -1; Loading = $false }
 
-    $title = New-Object System.Windows.Forms.Label
-    $title.Text = if ($FirstRun) { "选择要启动和监控的程序" } else { "启动程序设置" }
-    $title.AutoSize = $true
-    $title.Location = New-Object System.Drawing.Point(22, 18)
-    $title.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 13, [System.Drawing.FontStyle]::Bold)
-    [void]$form.Controls.Add($title)
-
-    $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = "可同时管理多个程序"
-    $hint.AutoSize = $true
-    $hint.Location = New-Object System.Drawing.Point(24, 49)
-    $hint.ForeColor = [System.Drawing.Color]::DimGray
-    [void]$form.Controls.Add($hint)
-
-    $listLabel = New-Object System.Windows.Forms.Label
-    $listLabel.Text = "启动程序列表"
-    $listLabel.AutoSize = $true
-    $listLabel.Location = New-Object System.Drawing.Point(22, 84)
-    $listLabel.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9, [System.Drawing.FontStyle]::Bold)
-    [void]$form.Controls.Add($listLabel)
-
-    $list = New-Object System.Windows.Forms.ListView
-    $list.View = [System.Windows.Forms.View]::Details
-    $list.FullRowSelect = $true
-    $list.GridLines = $false
-    $list.HideSelection = $false
-    $list.MultiSelect = $false
-    $list.AllowDrop = $true
-    $list.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-    $list.Location = New-Object System.Drawing.Point(22, 108)
-    $list.Size = New-Object System.Drawing.Size(390, 402)
-    $list.Anchor = "Top,Bottom,Left"
-    [void]$list.Columns.Add("程序", 125)
-    [void]$list.Columns.Add("路径", 145)
-    [void]$list.Columns.Add("状态", 60)
-    [void]$list.Columns.Add("置顶", 55)
-    [void]$form.Controls.Add($list)
-
-    $add = New-Object System.Windows.Forms.Button
-    $add.Text = "添加程序..."
-    $add.Location = New-Object System.Drawing.Point(22, 520)
-    $add.Size = New-Object System.Drawing.Size(105, 32)
-    $add.Anchor = "Bottom,Left"
-    $add.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $add.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(190, 198, 207)
-    [void]$form.Controls.Add($add)
-
-    $remove = New-Object System.Windows.Forms.Button
-    $remove.Text = "删除"
-    $remove.Location = New-Object System.Drawing.Point(136, 520)
-    $remove.Size = New-Object System.Drawing.Size(78, 32)
-    $remove.Anchor = "Bottom,Left"
-    $remove.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $remove.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(190, 198, 207)
-    [void]$form.Controls.Add($remove)
-
-    $editorLabel = New-Object System.Windows.Forms.Label
-    $editorLabel.Text = "程序配置"
-    $editorLabel.AutoSize = $true
-    $editorLabel.Location = New-Object System.Drawing.Point(438, 84)
-    $editorLabel.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9, [System.Drawing.FontStyle]::Bold)
-    [void]$form.Controls.Add($editorLabel)
-
-    $pathLabel = New-Object System.Windows.Forms.Label
-    $pathLabel.Text = "程序路径"
-    $pathLabel.AutoSize = $true
-    $pathLabel.Location = New-Object System.Drawing.Point(438, 112)
-    [void]$form.Controls.Add($pathLabel)
-    $pathBox = New-Object System.Windows.Forms.TextBox
-    $pathBox.Location = New-Object System.Drawing.Point(510, 108)
-    $pathBox.Size = New-Object System.Drawing.Size(340, 26)
-    $pathBox.Anchor = "Top,Left,Right"
-    [void]$form.Controls.Add($pathBox)
-    $browse = New-Object System.Windows.Forms.Button
-    $browse.Text = "浏览..."
-    $browse.Location = New-Object System.Drawing.Point(858, 106)
-    $browse.Size = New-Object System.Drawing.Size(92, 30)
-    $browse.Anchor = "Top,Right"
-    $browse.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $browse.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(190, 198, 207)
-    $browse.BackColor = [System.Drawing.Color]::White
-    [void]$form.Controls.Add($browse)
-
-    $argsLabel = New-Object System.Windows.Forms.Label
-    $argsLabel.Text = "启动参数"
-    $argsLabel.AutoSize = $true
-    $argsLabel.Location = New-Object System.Drawing.Point(438, 151)
-    [void]$form.Controls.Add($argsLabel)
-    $argsBox = New-Object System.Windows.Forms.TextBox
-    $argsBox.Location = New-Object System.Drawing.Point(510, 147)
-    $argsBox.Size = New-Object System.Drawing.Size(440, 26)
-    $argsBox.Anchor = "Top,Left,Right"
-    [void]$form.Controls.Add($argsBox)
-
-    $firstLabel = New-Object System.Windows.Forms.Label
-    $firstLabel.Text = "首次启动延迟"
-    $firstLabel.AutoSize = $true
-    $firstLabel.Location = New-Object System.Drawing.Point(438, 190)
-    [void]$form.Controls.Add($firstLabel)
-    $firstBox = New-Object System.Windows.Forms.NumericUpDown
-    $firstBox.Minimum = 0; $firstBox.Maximum = 86400; $firstBox.Width = 90
-    $firstBox.Location = New-Object System.Drawing.Point(530, 186)
-    [void]$form.Controls.Add($firstBox)
-    $firstUnit = New-Object System.Windows.Forms.Label
-    $firstUnit.Text = "秒"
-    $firstUnit.AutoSize = $true
-    $firstUnit.Location = New-Object System.Drawing.Point(625, 190)
-    [void]$form.Controls.Add($firstUnit)
-
-    $restartLabel = New-Object System.Windows.Forms.Label
-    $restartLabel.Text = "异常重启延迟"
-    $restartLabel.AutoSize = $true
-    $restartLabel.Location = New-Object System.Drawing.Point(680, 190)
-    [void]$form.Controls.Add($restartLabel)
-    $restartBox = New-Object System.Windows.Forms.NumericUpDown
-    $restartBox.Minimum = 0; $restartBox.Maximum = 86400; $restartBox.Width = 90
-    $restartBox.Location = New-Object System.Drawing.Point(772, 186)
-    [void]$form.Controls.Add($restartBox)
-    $restartUnit = New-Object System.Windows.Forms.Label
-    $restartUnit.Text = "秒"
-    $restartUnit.AutoSize = $true
-    $restartUnit.Location = New-Object System.Drawing.Point(867, 190)
-    [void]$form.Controls.Add($restartUnit)
-
-    $minLabel = New-Object System.Windows.Forms.Label
-    $minLabel.Text = "最短运行时间"
-    $minLabel.AutoSize = $true
-    $minLabel.Location = New-Object System.Drawing.Point(438, 229)
-    [void]$form.Controls.Add($minLabel)
-    $minBox = New-Object System.Windows.Forms.NumericUpDown
-    $minBox.Minimum = 0; $minBox.Maximum = 86400; $minBox.Width = 90
-    $minBox.Location = New-Object System.Drawing.Point(530, 225)
-    [void]$form.Controls.Add($minBox)
-    $minUnit = New-Object System.Windows.Forms.Label
-    $minUnit.Text = "秒（快速退出判定）"
-    $minUnit.AutoSize = $true
-    $minUnit.Location = New-Object System.Drawing.Point(625, 229)
-    [void]$form.Controls.Add($minUnit)
-
-    $options = @(
-        @{ Text = "窗口置顶（全局单选）"; Key = "FocusTop" },
-        @{ Text = "全屏模式"; Key = "Fullscreen" },
-        @{ Text = "强制显示模式"; Key = "ForceDisplayMode" },
-        @{ Text = "隐藏窗口启动"; Key = "HideWindow" },
-        @{ Text = "隐藏鼠标光标"; Key = "HideCursor" },
-        @{ Text = "仅启动一次"; Key = "Once" },
-        @{ Text = "异常时结束进程树"; Key = "KillTreeOnHang" },
-        @{ Text = "显示器变化时重启"; Key = "RestartOnDisplayChange" },
-        @{ Text = "允许多实例"; Key = "AllowMultiInstance" }
-    )
-    $checkBoxes = @{}
-    for ($optionIndex = 0; $optionIndex -lt $options.Count; $optionIndex++) {
-        $option = $options[$optionIndex]
-        $check = New-Object System.Windows.Forms.CheckBox
-        $check.Text = $option.Text
-        $check.AutoSize = $true
-        $check.Location = New-Object System.Drawing.Point((438 + (($optionIndex % 2) * 245)), (267 + ([int]($optionIndex / 2) * 29)))
-        [void]$form.Controls.Add($check)
-        $checkBoxes[$option.Key] = $check
+    $list = $view.List
+    $add = $view.Add
+    $remove = $view.Remove
+    $pathBox = $view.PathBox
+    $browse = $view.Browse
+    $argsBox = $view.ArgsBox
+    $firstBox = $view.FirstBox
+    $restartBox = $view.RestartBox
+    $minBox = $view.MinBox
+    $checkBoxes = $view.CheckBoxes
+    $adapterList = $view.AdapterList
+    $copyMac = $view.CopyMac
+    $magicWake = $view.MagicWake
+    $status = $view.Status
+    $autoStart = $view.AutoStart
+    $disableLockScreen = $view.DisableLockScreen
+    $save = $view.Save
+    $cancel = $view.Cancel
+    if ($Script:ConfigLoadError) {
+        $status.ForeColor = [Drawing.Color]::Firebrick
+        $status.Text = "配置文件无法读取，请检查列表后重新保存。"
     }
-
-    $wakeLabel = New-Object System.Windows.Forms.Label
-    $wakeLabel.Text = "物理网卡（魔法唤醒使用）"
-    $wakeLabel.AutoSize = $true
-    $wakeLabel.Location = New-Object System.Drawing.Point(438, 410)
-    $wakeLabel.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9, [System.Drawing.FontStyle]::Bold)
-    [void]$form.Controls.Add($wakeLabel)
-
-    $adapterList = New-Object System.Windows.Forms.ListView
-    $adapterList.View = [System.Windows.Forms.View]::Details
-    $adapterList.FullRowSelect = $true
-    $adapterList.HideSelection = $false
-    $adapterList.MultiSelect = $false
-    $adapterList.Location = New-Object System.Drawing.Point(438, 430)
-    $adapterList.Size = New-Object System.Drawing.Size(410, 48)
-    [void]$adapterList.Columns.Add("网卡", 175)
-    [void]$adapterList.Columns.Add("物理 MAC 地址", 150)
-    [void]$form.Controls.Add($adapterList)
-    $copyMac = New-Object System.Windows.Forms.Button
-    $copyMac.Text = "复制 MAC"
-    $copyMac.Location = New-Object System.Drawing.Point(858, 438)
-    $copyMac.Size = New-Object System.Drawing.Size(92, 30)
-    $copyMac.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $copyMac.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(190, 198, 207)
-    [void]$form.Controls.Add($copyMac)
-
-    $magicWake = New-Object System.Windows.Forms.CheckBox
-    $magicWake.Text = "允许魔法唤醒（自动配置网卡、设备唤醒和关闭快速启动）"
-    $magicWake.AutoSize = $true
-    $magicWake.Checked = [bool]$Script:EnableMagicWake
-    $magicWake.Location = New-Object System.Drawing.Point(438, 482)
-    [void]$form.Controls.Add($magicWake)
-
+    elseif ($FirstRun -and $entries.Count -eq 0) { $status.Text = "当前没有启动程序。添加程序后，看门狗将按配置运行。" }
     $adapters = @(WdGetPhysicalNetworkAdapters)
     foreach ($adapter in $adapters) {
         $item = New-Object System.Windows.Forms.ListViewItem([string]$adapter.Name)
@@ -3408,53 +4014,6 @@ function WdShowSettingsWindow {
             $status.Text = "已复制物理网卡 MAC 地址：$mac"
         }
     })
-
-    $status = New-Object System.Windows.Forms.Label
-    $status.AutoSize = $false
-    $status.Size = New-Object System.Drawing.Size(928, 30)
-    $status.Location = New-Object System.Drawing.Point(22, 560)
-    $status.Anchor = "Bottom,Left,Right"
-    $status.ForeColor = [System.Drawing.Color]::DarkGoldenrod
-    if ($Script:ConfigLoadError) { $status.Text = "配置文件无法读取，请检查列表后重新保存。" }
-    elseif ($FirstRun -and $entries.Count -eq 0) { $status.Text = "当前没有启动程序，看门狗将保持空闲。" }
-    [void]$form.Controls.Add($status)
-
-    $autoStart = New-Object System.Windows.Forms.CheckBox
-    $autoStart.Text = "自动启动"
-    $autoStart.AutoSize = $true
-    $autoStart.Checked = [bool]$Script:StartWithWindows
-    $autoStart.Location = New-Object System.Drawing.Point(438, 520)
-    $autoStart.Anchor = "Bottom,Left"
-    [void]$form.Controls.Add($autoStart)
-
-    $disableLockScreen = New-Object System.Windows.Forms.CheckBox
-    $disableLockScreen.Text = "禁用 Windows 锁屏"
-    $disableLockScreen.AutoSize = $true
-    $disableLockScreen.Checked = [bool]$Script:DisableLockScreen
-    $disableLockScreen.Location = New-Object System.Drawing.Point(535, 520)
-    $disableLockScreen.Anchor = "Bottom,Left"
-    [void]$form.Controls.Add($disableLockScreen)
-
-    $save = New-Object System.Windows.Forms.Button
-    $save.Text = "保存全部"
-    $save.Location = New-Object System.Drawing.Point(755, 516)
-    $save.Size = New-Object System.Drawing.Size(95, 32)
-    $save.Anchor = "Bottom,Right"
-    $save.BackColor = [System.Drawing.Color]::FromArgb(28, 102, 196)
-    $save.ForeColor = [System.Drawing.Color]::White
-    $save.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $save.FlatAppearance.BorderSize = 0
-    [void]$form.Controls.Add($save)
-
-    $cancel = New-Object System.Windows.Forms.Button
-    $cancel.Text = if ($FirstRun) { "退出" } else { "取消" }
-    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $cancel.Location = New-Object System.Drawing.Point(858, 516)
-    $cancel.Size = New-Object System.Drawing.Size(92, 32)
-    $cancel.Anchor = "Bottom,Right"
-    $cancel.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $cancel.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(190, 198, 207)
-    [void]$form.Controls.Add($cancel)
 
     $setEditorEnabled = {
         $enabled = $state.SelectedIndex -ge 0 -and $state.SelectedIndex -lt $entries.Count
@@ -3508,6 +4067,7 @@ function WdShowSettingsWindow {
             if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = "未命名程序" }
             $list.Items[$state.SelectedIndex].Text = $displayName
             $list.Items[$state.SelectedIndex].SubItems[1].Text = $displayPath
+            $list.Items[$state.SelectedIndex].ToolTipText = $displayPath
             $list.Items[$state.SelectedIndex].SubItems[2].Text = if ($displayPath -imatch '^https?://') { "网址" } elseif (Test-Path -LiteralPath $displayPath -PathType Leaf) { "就绪" } else { "待修复" }
             $list.Items[$state.SelectedIndex].SubItems[3].Text = if ([bool]$config.FocusTop) { "是" } else { "" }
         }
@@ -3520,6 +4080,7 @@ function WdShowSettingsWindow {
         $list.BeginUpdate()
         try {
             $list.Items.Clear()
+            $view.EmptyList.Visible = ($entries.Count -eq 0)
             for ($entryIndex = 0; $entryIndex -lt $entries.Count; $entryIndex++) {
                 $entry = $entries[$entryIndex]
                 $displayPath = [string]$entry.Path
@@ -3530,6 +4091,7 @@ function WdShowSettingsWindow {
                 if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = "未命名程序" }
                 $statusText = if ($displayPath -imatch '^https?://') { "网址" } elseif (Test-Path -LiteralPath $displayPath -PathType Leaf) { "就绪" } else { "待修复" }
                 $item = New-Object System.Windows.Forms.ListViewItem($displayName)
+                $item.ToolTipText = $displayPath
                 [void]$item.SubItems.Add($displayPath)
                 [void]$item.SubItems.Add($statusText)
                 [void]$item.SubItems.Add($(if ([bool]$entry.Config.FocusTop) { "是" } else { "" }))
@@ -3893,8 +4455,113 @@ function WdInitializeTrayIcon {
 }
 
 function WdPumpTrayEvents {
-    if (-not $Script:TrayNotifyIcon) { return }
+    if (-not $Script:TrayNotifyIcon -and -not $Script:DisplayEventMonitor) { return }
     try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+}
+
+function WdInitializeDisplayEventMonitor {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        if (-not ([System.Management.Automation.PSTypeName]'WatchdogWin32.DisplayEventMonitor').Type) {
+            $displayEventCode = @"
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+namespace WatchdogWin32
+{
+    // An invisible top-level window receives broadcast messages, including while the tray is disabled.
+    public sealed class DisplayEventMonitor : NativeWindow, IDisposable
+    {
+        private static readonly Guid SessionDisplay = new Guid("2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5");
+        private IntPtr powerRegistration;
+        private int lastPowerState = -1;
+        private bool pending;
+        public bool PowerNotificationsAvailable { get { return powerRegistration != IntPtr.Zero; } }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr RegisterPowerSettingNotification(IntPtr recipient, ref Guid setting, uint flags);
+        [DllImport("user32.dll")]
+        private static extern bool UnregisterPowerSettingNotification(IntPtr handle);
+
+        public DisplayEventMonitor()
+        {
+            CreateParams parameters = new CreateParams();
+            parameters.Caption = "Watchdog Display Events";
+            parameters.Style = 0; // No WS_VISIBLE: no user-facing window or focus change.
+            parameters.ExStyle = 0x80; // WS_EX_TOOLWINDOW
+            CreateHandle(parameters);
+            try
+            {
+                Guid setting = SessionDisplay;
+                powerRegistration = RegisterPowerSettingNotification(Handle, ref setting, 0);
+            }
+            catch (EntryPointNotFoundException) { }
+        }
+
+        public bool ConsumeChange()
+        {
+            bool changed = pending;
+            pending = false;
+            return changed;
+        }
+
+        protected override void WndProc(ref Message message)
+        {
+            if (message.Msg == 0x007E) pending = true; // WM_DISPLAYCHANGE
+            if (message.Msg == 0x0218 && message.WParam.ToInt64() == 0x8013 && message.LParam != IntPtr.Zero)
+            {
+                // POWERBROADCAST_SETTING: GUID (16 bytes), DWORD length, DWORD data.
+                Guid setting = (Guid)Marshal.PtrToStructure(message.LParam, typeof(Guid));
+                if (setting == SessionDisplay && Marshal.ReadInt32(message.LParam, 16) == 4)
+                {
+                    int state = Marshal.ReadInt32(message.LParam, 20);
+                    if (state >= 0 && state <= 2)
+                    {
+                        // The initial notification establishes state, not a spurious power-on event.
+                        if (lastPowerState >= 0 && lastPowerState != 1 && state == 1) pending = true;
+                        lastPowerState = state;
+                    }
+                }
+            }
+            base.WndProc(ref message);
+        }
+
+        public void Dispose()
+        {
+            if (powerRegistration != IntPtr.Zero)
+            {
+                UnregisterPowerSettingNotification(powerRegistration);
+                powerRegistration = IntPtr.Zero;
+            }
+            DestroyHandle();
+        }
+    }
+}
+"@
+            $displayEventReferences = @(
+                [System.Windows.Forms.NativeWindow].Assembly.Location
+                [System.Windows.Forms.Message].Assembly.Location
+            ) | Select-Object -Unique
+            Add-Type -TypeDefinition $displayEventCode -Language CSharp -ReferencedAssemblies $displayEventReferences -ErrorAction Stop
+        }
+        $Script:DisplayEventMonitor = New-Object WatchdogWin32.DisplayEventMonitor
+        WdWriteLog "DISPLAY-EVENTS: Hidden listener ready; power notifications=$($Script:DisplayEventMonitor.PowerNotificationsAvailable)." "DarkGray"
+    }
+    catch {
+        WdWriteLog "DISPLAY-EVENTS: Listener unavailable; continuing topology and fullscreen polling. $($_.Exception.Message)" "DarkYellow"
+    }
+}
+
+function WdConsumeDisplayEvent {
+    if ($Script:DisplayEventMonitor -and $Script:DisplayEventMonitor.ConsumeChange()) {
+        if ($Script:DisplayEventQuietUntil -and (Get-Date) -lt $Script:DisplayEventQuietUntil) {
+            WdWriteLog "DISPLAY-EVENTS: Notification during our own display recovery ignored; topology and fullscreen polling remain active." "DarkGray"
+            return $false
+        }
+        return $true
+    }
+    return $false
 }
 
 function WdDisposeTrayIcon {
@@ -3998,6 +4665,7 @@ WdWriteLog "INFO: GC collect every $GCCollectEvery iterations (~$($GCCollectEver
 WdWriteLog "INFO: Min restart gap = $MinRestartGapSeconds sec, Display loop repair = $DisplayLoopRepair" "DarkGray"
 WdWriteLog "INFO: Hang restart threshold = $HangConsecutiveFailuresToRestart consecutive failures" "DarkGray"
 WdWriteLog "INFO: Display change debounce = $DisplayChangeDebounceSeconds sec" "DarkGray"
+WdWriteLog "INFO: Unity display recovery = refresh fullscreen then verify; startup grace=${UnityDisplayStartupGraceSeconds}s, mismatch checks=$UnityDisplayMismatchChecks, repair grace=${UnityDisplayRepairGraceSeconds}s, restart cooldown=${DisplayRecoveryCooldownSeconds}s" "DarkGray"
 WdWriteLog "INFO: Process stop timeout = $ProcessStopTimeoutSeconds sec, Fast-exit max backoff = $FastExitMaxBackoffSeconds sec" "DarkGray"
 WdWriteLog "INFO: Control commands = reboot, shutdown, restart, VOL GET/SET/INC/DEC/MUTE; heartbeat = ping / heartbeat (TCP / UDP UTF-8 text)" "DarkGray"
 WdWriteLog "INFO: Console hidden = $HideWatchdogConsole, Tray icon = $ShowTrayIcon" "DarkGray"
@@ -4036,12 +4704,14 @@ $FastExitFailCount = @{}
 $FastExitHandledLaunch = @{}
 $ScheduledLaunch = @{}   # Path -> [DateTime] of next permitted launch attempt
 $Script:GCCounter = 0
-$DisplayTopologyFingerprint = WdGetDisplayTopologyFingerprint
-$PendingDisplayTopologyFingerprint = $null
-$DisplayChangeDetectedAt = $null
+$DisplayTopologyState = @{ Baseline = (WdGetDisplayTopologyFingerprint); Pending = $null; ChangedAt = $null }
 $DisplayChangeRestartInProgress = @{}
-if ($DisplayTopologyFingerprint) {
-    WdWriteLog "DISPLAY-CHANGE: Initial topology fingerprint = [$DisplayTopologyFingerprint]" "DarkGray"
+$FullscreenHealth = @{}
+$DisplayRecoveryLastAttempt = @{}
+$DisplayRecoveryPending = @{}
+WdInitializeDisplayEventMonitor
+if ($DisplayTopologyState.Baseline) {
+    WdWriteLog "DISPLAY-CHANGE: Initial topology fingerprint = [$($DisplayTopologyState.Baseline)]" "DarkGray"
 }
 [void](WdStartControlListeners)
 
@@ -4058,11 +4728,14 @@ try {
 
             $disableReason = WdGetDisableReason
             if (WdUpdateDisableState -DisableReason $disableReason) {
+                $FullscreenHealth.Clear()
+                $DisplayRecoveryPending.Clear()
+                [void](WdConsumeDisplayEvent)
                 $currentDisplayTopology = WdGetDisplayTopologyFingerprint
                 if ($currentDisplayTopology) {
-                    $DisplayTopologyFingerprint = $currentDisplayTopology
-                    $PendingDisplayTopologyFingerprint = $null
-                    $DisplayChangeDetectedAt = $null
+                    $DisplayTopologyState.Baseline = $currentDisplayTopology
+                    $DisplayTopologyState.Pending = $null
+                    $DisplayTopologyState.ChangedAt = $null
                     $DisplayChangeRestartInProgress.Clear()
                 }
                 $FirstRun = $false
@@ -4074,78 +4747,15 @@ try {
             $monitoringPaused = $false
 
             $currentDisplayTopology = WdGetDisplayTopologyFingerprint
-            if ($currentDisplayTopology) {
-                if ([string]::IsNullOrWhiteSpace($DisplayTopologyFingerprint)) {
-                    $DisplayTopologyFingerprint = $currentDisplayTopology
-                    WdWriteLog "DISPLAY-CHANGE: Topology baseline captured = [$DisplayTopologyFingerprint]" "DarkGray"
-                }
-                elseif ($currentDisplayTopology -ne $DisplayTopologyFingerprint) {
-                    if ($PendingDisplayTopologyFingerprint -ne $currentDisplayTopology) {
-                        $PendingDisplayTopologyFingerprint = $currentDisplayTopology
-                        $DisplayChangeDetectedAt = Get-Date
-                        WdWriteLog "DISPLAY-CHANGE: Topology changed; waiting $DisplayChangeDebounceSeconds sec for stability. Old=[$DisplayTopologyFingerprint] New=[$currentDisplayTopology]" "Yellow"
+            if (WdUpdateDisplayTopologyState -State $DisplayTopologyState -Fingerprint $currentDisplayTopology -DisplayEvent (WdConsumeDisplayEvent)) {
+                WdWriteLog "DISPLAY-CHANGE: Topology stable; queuing enabled targets for recovery." "Yellow"
+                foreach ($restartPath in $Apps.Keys) {
+                    if (WdIsDisplayChangeRestartEnabled -Path $restartPath -Config $Apps[$restartPath]) {
+                        $DisplayRecoveryPending[$restartPath] = $true
                     }
-                    elseif ($DisplayChangeDetectedAt -and
-                        ((Get-Date) - $DisplayChangeDetectedAt).TotalSeconds -ge $DisplayChangeDebounceSeconds) {
-
-                        WdWriteLog "DISPLAY-CHANGE: Topology stable; restarting enabled targets." "Yellow"
-                        $restartCount = 0
-
-                        foreach ($RestartPath in $Apps.Keys) {
-                            $RestartConfig = $Apps[$RestartPath]
-                            if (-not (WdIsDisplayChangeRestartEnabled -Config $RestartConfig)) {
-                                continue
-                            }
-
-                            if (WdIsBrowserUrl -Path $RestartPath) {
-                                try { $RestartFileName = "[$(([System.Uri]$RestartPath).Host)]" }
-                                catch { $RestartFileName = $RestartPath }
-                            }
-                            else {
-                                $RestartFileName = [System.IO.Path]::GetFileName($RestartPath)
-                            }
-
-                            $restartProcs = WdGetTargetProcess -Path $RestartPath
-                            if (-not $restartProcs) {
-                                WdWriteLog "DISPLAY-CHANGE: $RestartFileName is not running; existing monitor flow will launch it if needed." "DarkGray"
-                                continue
-                            }
-
-                            $restartFirstProc = if ($restartProcs -is [array]) { $restartProcs[0] } else { $restartProcs }
-                            $restartPid = WdGetProcessId $restartFirstProc
-                            if (WdScheduleDisplayChangeRestart `
-                                    -Path $RestartPath `
-                                    -Config $RestartConfig `
-                                    -FileName $RestartFileName `
-                                    -ProcessId $restartPid `
-                                    -ScheduledLaunch $ScheduledLaunch `
-                                    -LaunchTime $LaunchTime `
-                                    -DisplayRepairDone $DisplayRepairDone `
-                                    -HangFailCount $HangFailCount `
-                                    -DisplayChangeRestartInProgress $DisplayChangeRestartInProgress) {
-                                $restartCount++
-                            }
-
-                            if ($restartProcs) {
-                                $restartProcs | ForEach-Object {
-                                    WdDisposeProcessResult $_
-                                }
-                            }
-                        }
-
-                        WdWriteLog "DISPLAY-CHANGE: Restart scheduling complete. Targets restarted=$restartCount." "DarkGreen"
-                        $DisplayTopologyFingerprint = $currentDisplayTopology
-                        $PendingDisplayTopologyFingerprint = $null
-                        $DisplayChangeDetectedAt = $null
-                    }
-                }
-                elseif ($PendingDisplayTopologyFingerprint) {
-                    WdWriteLog "DISPLAY-CHANGE: Topology returned to baseline before debounce elapsed; restart canceled." "DarkGray"
-                    $PendingDisplayTopologyFingerprint = $null
-                    $DisplayChangeDetectedAt = $null
                 }
             }
-
+            $displayStable = ($currentDisplayTopology -and -not $DisplayTopologyState.Pending)
             foreach ($Path in $Apps.Keys) {
                 $procs = $null
                 $FirstProc = $null
@@ -4172,11 +4782,14 @@ try {
 
                 $disableReason = WdGetDisableReason
                 if (WdUpdateDisableState -DisableReason $disableReason) {
+                    $FullscreenHealth.Clear()
+                    $DisplayRecoveryPending.Clear()
+                    [void](WdConsumeDisplayEvent)
                     $currentDisplayTopology = WdGetDisplayTopologyFingerprint
                     if ($currentDisplayTopology) {
-                        $DisplayTopologyFingerprint = $currentDisplayTopology
-                        $PendingDisplayTopologyFingerprint = $null
-                        $DisplayChangeDetectedAt = $null
+                        $DisplayTopologyState.Baseline = $currentDisplayTopology
+                        $DisplayTopologyState.Pending = $null
+                        $DisplayTopologyState.ChangedAt = $null
                         $DisplayChangeRestartInProgress.Clear()
                     }
                     $monitoringPaused = $true
@@ -4184,6 +4797,7 @@ try {
                 }
 
                 $allowMultiInstance = if ($Config.ContainsKey("AllowMultiInstance")) { [bool]$Config.AllowMultiInstance } else { $false }
+                $unityDisplayRecovery = WdIsUnityDisplayRecoveryEnabled -Path $Path -Config $Config
                 $killTreeOnHang = if ($Config.ContainsKey("KillTreeOnHang")) { [bool]$Config.KillTreeOnHang }     else { $true }
                 $browserName = if ($Config.ContainsKey("Browser") -and
                     -not [string]::IsNullOrWhiteSpace([string]$Config.Browser)) { [string]$Config.Browser } else { "auto" }
@@ -4244,6 +4858,11 @@ try {
 
                 if ($procCount -eq 0) {
                     $HangFailCount[$Path] = 0
+                    [void]$FullscreenHealth.Remove($Path)
+                    if ((WdIsDisplayChangeRestartEnabled -Path $Path -Config $Config) -and -not $displayStable) {
+                        continue # 显示尚未稳定时，避免 Unity 再次用临时显示参数启动。
+                    }
+                    [void]$DisplayRecoveryPending.Remove($Path)
 
                     # 节流检查放在这里：只拦截"确实缺失、即将重新拉起"的动作。
                     # 之前放在最前面会导致节流命中后，哪怕程序本轮其实已经在
@@ -4378,6 +4997,42 @@ try {
                     }
 
                     try {
+                        # 持续检查实际客户区；统一通过刷新、复查、重启处理 Unity 全屏异常。
+                        $fullscreenMismatch = $false
+                        $fullscreenObservation = $null
+                        if ($unityDisplayRecovery) {
+                            $fullscreenObservation = WdGetFullscreenObservation -ProcessObj $mainProc
+                            $fullscreenMismatch = WdUpdateFullscreenHealth -States $FullscreenHealth -Path $Path `
+                                -ProcessId $TargetID -Observation $fullscreenObservation -DisplayStable ([bool]$displayStable)
+                        }
+                        $recoveryRequested = ($DisplayRecoveryPending.ContainsKey($Path) -or $fullscreenMismatch)
+                        if ($recoveryRequested -and $displayStable -and
+                            (WdCanScheduleDisplayRecovery -Path $Path -LastRecovery $DisplayRecoveryLastAttempt `
+                                -InProgress $DisplayChangeRestartInProgress -AttemptsThisHour ([int]$RestartStats[$StatKey]))) {
+                            $reason = if ($fullscreenMismatch) { "FULLSCREEN-MISMATCH: $($fullscreenObservation.Details)" } else { "stable display change; $($fullscreenObservation.Details)" }
+                            $explicitDisplayRestart = [bool]$Config.RestartOnDisplayChange
+                            if ($unityDisplayRecovery -and -not $explicitDisplayRestart -and -not $FullscreenHealth[$Path].RepairAt) {
+                                WdWriteLog "DISPLAY-RECOVERY: Refreshing fullscreen for $FileName PID=$TargetID; reason=$reason" "Yellow"
+                                $repairApplied = WdRepairWindowDisplayMode -ProcessObj $mainProc -Fullscreen $true -ForceRefresh
+                                $Script:DisplayEventQuietUntil = (Get-Date).AddSeconds($UnityDisplayRepairGraceSeconds)
+                                $FullscreenHealth[$Path].RepairAt = Get-Date
+                                $FullscreenHealth[$Path].Failures = 0
+                                [void]$DisplayRecoveryPending.Remove($Path)
+                                WdWriteLog "DISPLAY-RECOVERY: Fullscreen refresh applied=$repairApplied; rechecking after $UnityDisplayRepairGraceSeconds sec." "DarkGray"
+                                continue
+                            }
+                            WdWriteLog "DISPLAY-RECOVERY: $FileName PID=$TargetID; reason=$reason" "Yellow"
+                            if (WdScheduleDisplayChangeRestart -Path $Path -Config $Config -FileName $FileName `
+                                -ProcessId $TargetID -ScheduledLaunch $ScheduledLaunch -LaunchTime $LaunchTime `
+                                -DisplayRepairDone $DisplayRepairDone -HangFailCount $HangFailCount `
+                                -DisplayChangeRestartInProgress $DisplayChangeRestartInProgress) {
+                                $DisplayRecoveryLastAttempt[$Path] = Get-Date
+                                [void]$FullscreenHealth.Remove($Path)
+                                [void]$DisplayRecoveryPending.Remove($Path)
+                            }
+                            continue
+                        }
+
                         if ($isExe -and -not $mainProc.Responding) {
                             WdInitializeCounter -Table $HangFailCount -Key $Path -DefaultValue 0
                             $HangFailCount[$Path]++
@@ -4408,7 +5063,7 @@ try {
                             $HangFailCount[$Path] = 0
                         }
 
-                        if ($Config.ContainsKey("ForceDisplayMode") -and [bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
+                        if (-not $unityDisplayRecovery -and $Config.ContainsKey("ForceDisplayMode") -and [bool]$Config.ForceDisplayMode -and -not [bool]$Config.HideWindow) {
                             $needRepair = $false
 
                             if (-not $DisplayRepairDone.ContainsKey($Path) -or -not $DisplayRepairDone[$Path]) {
