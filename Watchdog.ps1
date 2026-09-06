@@ -3484,7 +3484,10 @@ namespace WatchdogUI
         {
             Graphics g = e.Graphics; g.SmoothingMode = SmoothingMode.AntiAlias;
             float scale = DeviceDpi / 96f;
-            Rectangle row = new Rectangle(0, e.Bounds.Top + 2, ClientSize.Width - 2, e.Bounds.Height - 4);
+            // Paint only inside the invalidated item. Clear old rounded edges before changing selection.
+            Rectangle item = new Rectangle(e.Bounds.Left, e.Bounds.Top, Math.Min(e.Bounds.Width, ClientSize.Width), e.Bounds.Height);
+            using (Brush background = new SolidBrush(BackColor)) g.FillRectangle(background, item);
+            Rectangle row = new Rectangle(item.Left + 1, item.Top + 2, Math.Max(1, item.Width - 3), item.Height - 4);
             Color fill = e.Item.Selected ? Color.FromArgb(235, 237, 255) : BackColor;
             PaintKit.Box(g, row, (int)(7 * scale), fill, e.Item.Selected ? Color.FromArgb(215, 220, 255) : Color.Empty);
             int iconSize = (int)(30 * scale), gap = (int)(10 * scale);
@@ -3495,22 +3498,25 @@ namespace WatchdogUI
             string status = e.Item.SubItems.Count > 2 ? e.Item.SubItems[2].Text : "";
             if (status != "待修复" && e.Item.SubItems.Count > 3 && !String.IsNullOrEmpty(e.Item.SubItems[3].Text)) status = "置顶";
             int statusWidth = String.IsNullOrEmpty(status) ? 0 : (int)(46 * scale);
-            Rectangle name = new Rectangle(left, row.Top + (int)(7 * scale), Math.Max(1, width - statusWidth), (int)(21 * scale));
+            Rectangle name = new Rectangle(left, row.Top + (int)(7 * scale), width, (int)(21 * scale));
             TextRenderer.DrawText(g, e.Item.Text, Font, name, PaintKit.Ink, TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
             if (statusWidth > 0)
             {
-                Rectangle badge = new Rectangle(row.Right - gap - statusWidth, name.Top, statusWidth, name.Height);
+                Rectangle badge = new Rectangle(row.Right - gap - statusWidth, name.Bottom, statusWidth, (int)(18 * scale));
                 using (Font small = new Font(Font.FontFamily, Math.Max(7, Font.Size - 1)))
                     TextRenderer.DrawText(g, status, small, badge, status == "待修复" ? Color.FromArgb(178, 104, 22) : PaintKit.Muted, TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
             }
             if (e.Item.SubItems.Count > 1)
             {
-                Rectangle path = new Rectangle(left, name.Bottom, width, (int)(18 * scale));
+                Rectangle path = new Rectangle(left, name.Bottom, Math.Max(1, width - statusWidth), (int)(18 * scale));
                 using (Font small = new Font(Font.FontFamily, Math.Max(7, Font.Size - 1)))
-                    TextRenderer.DrawText(g, e.Item.SubItems[1].Text, small, path, PaintKit.Muted, TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+                    TextRenderer.DrawText(g, e.Item.SubItems[1].Text, small, path, PaintKit.Muted, TextFormatFlags.SingleLine | TextFormatFlags.PathEllipsis);
             }
-            if (Focused && e.Item.Focused && ShowFocusCues) ControlPaint.DrawFocusRectangle(g, Rectangle.Inflate(row, -3, -3));
         }
+        protected override void OnSelectedIndexChanged(EventArgs e) { base.OnSelectedIndexChanged(e); Invalidate(); }
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+        protected override bool ShowFocusCues { get { return false; } }
     }
 
     public sealed class NetworkList : ListView
@@ -3566,9 +3572,10 @@ function WdNewSettingsView {
     $form.FormBorderStyle = 'Sizable'
     $form.MinimizeBox = $false
     $form.TopMost = $true
-    $form.MinimumSize = New-Object Drawing.Size(480, 580)
     $area = [Windows.Forms.Screen]::FromPoint([Windows.Forms.Cursor]::Position).WorkingArea
-    $form.ClientSize = New-Object Drawing.Size(([Math]::Min(1040, $area.Width - 64)), ([Math]::Min(680, $area.Height - 80)))
+    $tallLayout = $area.Height -gt $area.Width
+    $form.MinimumSize = New-Object Drawing.Size(($(if ($tallLayout) { 720 } else { 1280 })), ($(if ($tallLayout) { 1340 } else { 720 })))
+    $form.ClientSize = New-Object Drawing.Size(($(if ($tallLayout) { [Math]::Min(900, $area.Width - 32) } else { [Math]::Min(1380, $area.Width - 32) })), ($(if ($tallLayout) { [Math]::Min(1320, $area.Height - 64) } else { [Math]::Min(740, $area.Height - 64) })))
     $form.SuspendLayout()
 
     $newLabel = {
@@ -3688,7 +3695,7 @@ function WdNewSettingsView {
     $rowImages.ImageSize = New-Object Drawing.Size(1, 58)
     $list.SmallImageList = $rowImages
     [void]$listHost.Controls.Add($list)
-    $ui.EmptyList = & $newLabel "还没有启动程序`r`n`r`n点击下方「添加程序」开始设置。"
+    $ui.EmptyList = & $newLabel "还没有启动程序`r`n`r`n点击「+ 添加」开始设置。"
     $ui.EmptyList.AutoSize = $false; $ui.EmptyList.Dock = 'Fill'
     $ui.EmptyList.TextAlign = 'MiddleCenter'; $ui.EmptyList.ForeColor = $muted
     $ui.EmptyList.Enabled = $false # Allow drops to reach the underlying program list.
@@ -3706,29 +3713,25 @@ function WdNewSettingsView {
     $right.Dock = 'Fill'; $right.BackColor = [Drawing.Color]::White
     $right.Margin = New-Object Windows.Forms.Padding(0)
     $right.Padding = New-Object Windows.Forms.Padding(16, 12, 16, 12)
-    $right.ColumnCount = 1; $right.RowCount = 2
+    $right.ColumnCount = 1; $right.RowCount = 1
     [void]$right.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
-    [void]$right.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize')))
     [void]$right.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent', 100)))
-    $navigation = & $newFlow
-    $navigation.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 10)
-    $ui.ProgramTab = & $newButton '程序配置' $true
-    $ui.HostTab = & $newButton '主机设置'
-    [void]$navigation.Controls.Add($ui.ProgramTab); [void]$navigation.Controls.Add($ui.HostTab)
-    [void]$right.Controls.Add($navigation, 0, 0)
-    $pageHost = New-Object Windows.Forms.Panel
+    $pageHost = New-Object Windows.Forms.TableLayoutPanel
     $pageHost.Dock = 'Fill'; $pageHost.Margin = New-Object Windows.Forms.Padding(0)
-    [void]$right.Controls.Add($pageHost, 0, 1)
+    $pageHost.ColumnCount = 2; $pageHost.RowCount = 1
+    [void]$right.Controls.Add($pageHost, 0, 0)
     [void]$body.Controls.Add($right, 1, 0)
     foreach ($pageName in @('ProgramPage', 'HostPage')) {
         $page = New-Object Windows.Forms.Panel
-        $page.Dock = 'Fill'; $page.AutoScroll = $true
+        $page.Dock = 'Fill'; $page.AutoScroll = $false
+        $page.Margin = New-Object Windows.Forms.Padding(0)
         [void]$pageHost.Controls.Add($page)
         $ui[$pageName] = $page
     }
     $program = & $newStack
     $program.Padding = New-Object Windows.Forms.Padding(0, 0, 8, 0)
     [void]$ui.ProgramPage.Controls.Add($program)
+    & $append $program (& $newLabel '程序配置' 12 $true)
     & $append $program (& $newLabel '启动方式' 10 $true)
     & $append $program (& $newLabel '程序路径或网址')
     $pathRow = New-Object Windows.Forms.TableLayoutPanel
@@ -3777,7 +3780,7 @@ function WdNewSettingsView {
         $flow = & $newFlow
         foreach ($option in $group.Options) {
             $check = New-Object WatchdogUI.Toggle
-            $check.Text = $option[1]; $check.AutoSize = $true
+            $check.Text = $option[1]; $check.AutoSize = $false
             $check.Margin = New-Object Windows.Forms.Padding(0, 0, 20, 2)
             [void]$flow.Controls.Add($check)
             $ui.CheckBoxes[$option[0]] = $check
@@ -3795,6 +3798,7 @@ function WdNewSettingsView {
     $hostContent = & $newStack
     $hostContent.Padding = New-Object Windows.Forms.Padding(0, 0, 12, 8)
     [void]$ui.HostPage.Controls.Add($hostContent)
+    & $append $hostContent (& $newLabel '主机设置' 12 $true)
     & $append $hostContent (& $newLabel '无人值守' 10 $true)
     foreach ($option in @(@('AutoStart', '随 Windows 自动启动', $Script:StartWithWindows),
             @('DisableLockScreen', '禁用 Windows 锁屏', $Script:DisableLockScreen),
@@ -3816,7 +3820,7 @@ function WdNewSettingsView {
     $ui.AdapterList.View = 'Details'; $ui.AdapterList.FullRowSelect = $true
     $ui.AdapterList.HideSelection = $false; $ui.AdapterList.MultiSelect = $false
     $ui.AdapterList.BorderStyle = 'None'; $ui.AdapterList.Dock = 'Top'
-    $ui.AdapterList.Height = 110
+    $ui.AdapterList.Height = 76
     $ui.AdapterList.Margin = New-Object Windows.Forms.Padding(0, 0, 0, 8)
     [void]$ui.AdapterList.Columns.Add('网卡'); [void]$ui.AdapterList.Columns.Add('物理 MAC 地址')
     & $append $hostContent $ui.AdapterList
@@ -3844,30 +3848,21 @@ function WdNewSettingsView {
     [void]$footer.Controls.Add($actions, 1, 0)
     [void]$root.Controls.Add($footer, 0, 2)
 
-    $selectPage = {
-        param([bool]$HostSelected)
-        $ui.HostPage.Visible = $HostSelected
-        $ui.ProgramPage.Visible = -not $HostSelected
-        foreach ($pair in @(@($ui.ProgramTab, (-not $HostSelected)), @($ui.HostTab, $HostSelected))) {
-            $pair[0].BackColor = if ($pair[1]) { $accent } else { [Drawing.Color]::White }
-            $pair[0].ForeColor = if ($pair[1]) { [Drawing.Color]::White } else { $ink }
-            $pair[0].FlatAppearance.BorderSize = if ($pair[1]) { 0 } else { 1 }
-            $pair[0].FlatAppearance.MouseOverBackColor = if ($pair[1]) { [Drawing.Color]::FromArgb(29, 78, 216) } else { [Drawing.Color]::FromArgb(239, 244, 252) }
-        }
-    }.GetNewClosure()
-    $ui.ProgramTab.Add_Click({ & $selectPage $false }.GetNewClosure())
-    $ui.HostTab.Add_Click({ & $selectPage $true }.GetNewClosure())
-    & $selectPage $false
+    $ui.ProgramContent = $program
+    $ui.HostContent = $hostContent
+    $ui.PageHost = $pageHost
+
     $layoutState = @{ Compact = $null; Busy = $false }
     $adaptLayout = {
         if ($layoutState.Busy -or $form.IsDisposed) { return }
         $layoutState.Busy = $true
         try {
             $scale = $form.DeviceDpi / 96.0
-            $compact = $body.ClientSize.Width -lt (800 * $scale)
+            $compact = $tallLayout
             if ($layoutState.Compact -ne $compact) {
                 $body.SuspendLayout()
                 $body.ColumnStyles.Clear(); $body.RowStyles.Clear()
+                $pageHost.ColumnStyles.Clear(); $pageHost.RowStyles.Clear()
                 if ($compact) {
                     $body.ColumnCount = 1; $body.RowCount = 2
                     $body.SetCellPosition($right, (New-Object Windows.Forms.TableLayoutPanelCellPosition(0, 1)))
@@ -3875,28 +3870,46 @@ function WdNewSettingsView {
                     [void]$body.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute', (210 * $scale))))
                     [void]$body.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent', 100)))
                     $library.Margin = New-Object Windows.Forms.Padding(0, 0, 0, (12 * $scale))
+                    $pageHost.ColumnCount = 1; $pageHost.RowCount = 2
+                    $pageHost.SetCellPosition($ui.ProgramPage, (New-Object Windows.Forms.TableLayoutPanelCellPosition(0, 0)))
+                    $pageHost.SetCellPosition($ui.HostPage, (New-Object Windows.Forms.TableLayoutPanelCellPosition(0, 1)))
+                    [void]$pageHost.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
+                    [void]$pageHost.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute', (520 * $scale))))
+                    [void]$pageHost.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent', 100)))
+                    $ui.HostPage.Margin = New-Object Windows.Forms.Padding(0, (12 * $scale), 0, 0)
                 }
                 else {
                     $body.ColumnCount = 2; $body.RowCount = 1
                     $body.SetCellPosition($right, (New-Object Windows.Forms.TableLayoutPanelCellPosition(1, 0)))
-                    [void]$body.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Absolute', (250 * $scale))))
+                    [void]$body.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Absolute', (290 * $scale))))
                     [void]$body.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
                     [void]$body.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent', 100)))
                     $library.Margin = New-Object Windows.Forms.Padding(0, 0, (16 * $scale), 0)
+                    $pageHost.ColumnCount = 2; $pageHost.RowCount = 1
+                    $pageHost.SetCellPosition($ui.ProgramPage, (New-Object Windows.Forms.TableLayoutPanelCellPosition(0, 0)))
+                    $pageHost.SetCellPosition($ui.HostPage, (New-Object Windows.Forms.TableLayoutPanelCellPosition(1, 0)))
+                    [void]$pageHost.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 62)))
+                    [void]$pageHost.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 38)))
+                    [void]$pageHost.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent', 100)))
+                    $ui.HostPage.Margin = New-Object Windows.Forms.Padding((20 * $scale), 0, 0, 0)
                 }
                 $layoutState.Compact = $compact
                 $body.ResumeLayout($true)
             }
             $ui.ListHint.Visible = -not $compact
-            if ($compact) { $body.RowStyles[0].Height = 210 * $scale }
+            if ($compact) { $body.RowStyles[0].Height = 244 * $scale }
             foreach ($flow in $optionFlows) {
-                $columns = if ($flow.ClientSize.Width -ge 480 * $scale) { 2 } else { 1 }
-                $optionWidth = [Math]::Max(120, [int][Math]::Floor($flow.ClientSize.Width / $columns) - [int](20 * $scale))
+                # Child flow bounds can still reflect the previous size during a parent resize.
+                $flowWidth = $ui.ProgramPage.ClientSize.Width - $program.Padding.Horizontal
+                $columns = if ($flowWidth -ge 480 * $scale) { 2 } else { 1 }
+                $optionWidth = [Math]::Max(120, [int][Math]::Floor($flowWidth / $columns) - [int](20 * $scale))
                 foreach ($check in $flow.Controls) {
-                    $check.MinimumSize = New-Object Drawing.Size($optionWidth, (24 * $scale))
+                    $check.Size = New-Object Drawing.Size($optionWidth, (30 * $scale))
                 }
+                $flow.AutoSize = $false
+                $flow.Height = [int][Math]::Ceiling($flow.Controls.Count / [double]$columns) * (32 * $scale)
             }
-            $listWidth = [Math]::Max(160, $list.ClientSize.Width - (20 * $scale))
+            $listWidth = [Math]::Max(1, $list.ClientSize.Width - 1)
             $list.Columns[0].Width = [int]$listWidth
             $list.Columns[1].Width = 0
             $list.Columns[2].Width = 0
@@ -3914,6 +3927,7 @@ function WdNewSettingsView {
                     (New-Object Drawing.Size($wrapWidth, 32767)), [Windows.Forms.TextFormatFlags]::WordBreak)
                 $pair[0].Size = New-Object Drawing.Size($wrapWidth, $textSize.Height)
             }
+            if ($compact) { $pageHost.RowStyles[0].Height = [Math]::Max(520 * $scale, $program.Height + 2 * $scale) }
         }
         finally { $layoutState.Busy = $false }
     }.GetNewClosure()

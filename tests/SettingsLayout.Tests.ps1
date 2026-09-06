@@ -15,17 +15,23 @@ public class WatchdogSettingsPreviewForm : System.Windows.Forms.Form {
 }
 '@
 # Use the production view with only a non-activating Form subclass for offscreen rendering.
-. ([scriptblock]::Create($builder.Extent.Text.Replace('New-Object Windows.Forms.Form', 'New-Object WatchdogSettingsPreviewForm')))
+$previewBuilder = $builder.Extent.Text.Replace('New-Object Windows.Forms.Form', 'New-Object WatchdogSettingsPreviewForm')
+$previewBuilder = $previewBuilder.Replace('[Windows.Forms.Screen]::FromPoint([Windows.Forms.Cursor]::Position).WorkingArea', '$global:SettingsPreviewArea')
+$previewBuilder = $previewBuilder.Replace('[Windows.Forms.Screen]::FromControl($form).WorkingArea', '$global:SettingsPreviewArea')
+. ([scriptblock]::Create($previewBuilder))
 [Windows.Forms.Application]::EnableVisualStyles()
 $Script:StartWithWindows = $true
 $Script:DisableLockScreen = $false
 $Script:EnableMagicWake = $true
 if ($OutputDirectory) { [void][IO.Directory]::CreateDirectory($OutputDirectory) }
-$cases = @(@('desktop', 1040, 680), @('portrait', 760, 900), @('compact', 480, 680))
+$cases = @(@('desktop', 1380, 740, 1920, 1080), @('small-desktop', 1280, 680, 1366, 728), @('portrait', 900, 1320, 1080, 1920), @('small-portrait', 704, 1301, 800, 1440))
 foreach ($case in $cases) {
+    $global:SettingsPreviewArea = New-Object Drawing.Rectangle(0, 0, $case[3], $case[4])
     $view = WdNewSettingsView
     $form = $view.Form
     try {
+        # Allow simulated portrait screens taller than the test machine's physical display.
+        $form.MaximumSize = New-Object Drawing.Size(4000, 4000)
         $form.ClientSize = New-Object Drawing.Size($case[1], $case[2])
         $form.StartPosition = 'Manual'
         $form.Location = New-Object Drawing.Point(-20000, -20000)
@@ -56,6 +62,8 @@ foreach ($case in $cases) {
         & $createHandles $form
         $form.Show()
         [Windows.Forms.Application]::DoEvents()
+        $form.ClientSize = New-Object Drawing.Size($case[1], $case[2])
+        [Windows.Forms.Application]::DoEvents()
         $form.PerformLayout()
         $bitmap = New-Object Drawing.Bitmap($form.ClientSize.Width, $form.ClientSize.Height)
         try {
@@ -66,7 +74,7 @@ foreach ($case in $cases) {
         if ($view.CheckBoxes.Count -ne 10) { throw 'A configuration option was lost' }
         if ($case[0] -eq 'desktop' -and $view.ProgramPage.VerticalScroll.Visible) { throw 'Default compact desktop layout should show all program settings without scrolling' }
         if ($case[0] -ne 'compact' -and $view.CheckBoxes.Fullscreen.Top -ne $view.CheckBoxes.ForceDisplayMode.Top) { throw 'Wide options failed to align in two columns' }
-        if ($view.Body.ColumnCount -ne $(if ($case[0] -eq 'desktop') { 2 } else { 1 })) { throw 'Responsive breakpoint failed' }
+        if ($view.Body.ColumnCount -ne $(if ($case[0] -like '*portrait') { 1 } else { 2 })) { throw 'Responsive breakpoint failed' }
         $saveTop = $view.Save.Location
         $parent = $view.Save.Parent
         while ($parent -and $parent -ne $form) {
@@ -78,25 +86,27 @@ foreach ($case in $cases) {
         foreach ($check in $view.CheckBoxes.Values) {
             if ($check.Right -gt $check.Parent.ClientSize.Width) { throw "Option clipped: $($check.Text)" }
         }
-        if ($view.List.ClientSize.Height -lt 55) { throw 'Program list cannot show even one complete item' }
-        Write-Output ("PASS {0}: client={1}; body={2}; save={3}; program={4}" -f $case[0], $form.ClientSize, $view.Body.Size, $saveTop, $view.ProgramPage.Size)
-        # Invoke the actual page-switch event without showing the window or changing settings.
-        $click = [Windows.Forms.Control].GetMethod('OnClick', [Reflection.BindingFlags]'Instance,NonPublic')
-        [void]$click.Invoke($view.HostTab, @([EventArgs]::Empty))
-        [Windows.Forms.Application]::DoEvents()
-        $form.PerformLayout()
-        $bitmap = New-Object Drawing.Bitmap($form.ClientSize.Width, $form.ClientSize.Height)
-        try {
-            $form.Controls[0].DrawToBitmap($bitmap, (New-Object Drawing.Rectangle(0, 0, $bitmap.Width, $bitmap.Height)))
-            if ($OutputDirectory) { $bitmap.Save((Join-Path $OutputDirectory ($case[0] + '-host.png'))) }
+        foreach ($page in @($view.ProgramPage, $view.HostPage)) {
+            if (-not $page.Visible -or $page.AutoScroll -or $page.VerticalScroll.Visible -or $page.HorizontalScroll.Visible) { throw 'All settings must be visible together without scrollbars' }
+            foreach ($control in @($page.Controls[0].Controls)) {
+                if ($control.Bottom -gt $page.ClientSize.Height) { throw "Settings content clipped on $($case[0]): $($control.Text); bottom=$($control.Bottom), available=$($page.ClientSize.Height)" }
+            }
         }
-        finally { $bitmap.Dispose() }
-        # Resize the same live form in both directions; switching layout must retain edits.
-        foreach ($width in @(520, 1180, $case[1])) {
-            $form.ClientSize = New-Object Drawing.Size($width, $case[2])
+        if ($view.List.ClientSize.Height -lt 116) { throw 'Program list cannot show both sample items without scrolling' }
+        Write-Output ("PASS {0}: client={1}; body={2}; save={3}; program={4}" -f $case[0], $form.ClientSize, $view.Body.Size, $saveTop, $view.ProgramPage.Size)
+        # Resize the same live form in both directions; its minimum size must retain access and edits.
+        # Native resizing clamps tall windows to the real landscape monitor; portrait sizes are checked as separate cases.
+        $resizeWidths = if ($case[0] -like '*portrait') { @() } else { @(520, 1180, $case[1]) }
+        foreach ($width in $resizeWidths) {
+            $frameWidth = $form.Width - $form.ClientSize.Width
+            $frameHeight = $form.Height - $form.ClientSize.Height
+            $form.Size = New-Object Drawing.Size(([Math]::Max($form.MinimumSize.Width, $width + $frameWidth)), ([Math]::Max($form.MinimumSize.Height, $case[2] + $frameHeight)))
             [Windows.Forms.Application]::DoEvents()
             if ($view.PathBox.Text -ne 'D:\Exhibition\Exhibition.exe' -or -not $view.CheckBoxes.RestartOnDisplayChange.Checked) { throw 'Resize lost configuration edits' }
-            if ($view.Body.GetCellPosition($view.HostPage.Parent.Parent).Column -ne $(if ($width -ge 928) { 1 } else { 0 })) { throw 'Live resize placed the settings panel incorrectly' }
+            if ($view.Body.GetCellPosition($view.HostPage.Parent.Parent).Column -ne $(if ($case[0] -like '*portrait') { 0 } else { 1 })) { throw 'Live resize placed the settings panel incorrectly' }
+            foreach ($page in @($view.ProgramPage, $view.HostPage)) {
+                if ($page.Controls[0].Height -gt $page.ClientSize.Height) { throw "Resize clipped settings on $($case[0]) at width $width; form=$($form.Size), page=$($page.Size), content=$($page.Controls[0].Size)" }
+            }
         }
     }
     finally { $form.Dispose() }
@@ -123,7 +133,7 @@ $script:settingsExercise = {
     $numberEdit = @($restartBox.Controls[0].Controls | Where-Object { $_ -is [Windows.Forms.TextBox] })[0]
     $numberEdit.Text = '8'
     $checkBoxes.RestartOnDisplayChange.Checked = $true
-    $view.HostTab.PerformClick()
+
     $autoStart.Checked = $false
     $disableLockScreen.Checked = $true
     $magicWake.Checked = $false
@@ -140,4 +150,4 @@ $script:settingsExercise = {
     if ($pathBox.Enabled -or $save.Enabled -eq $false -or $remove.Enabled) { throw 'Empty state enables invalid editing or disables saving' }
 }
 [void](WdShowSettingsWindow -FirstRun)
-Write-Output 'PASS: responsive layout, page switching, editor bindings, empty state and unattended-state cleanup; persistence was mocked.'
+Write-Output 'PASS: simultaneous settings layout, resizing, editor bindings, empty state and unattended-state cleanup; persistence was mocked.'
