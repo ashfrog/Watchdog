@@ -1,8 +1,9 @@
 {
-    "Version":  4,
+    "Version":  5,
     "StartWithWindows":  true,
     "DisableLockScreen":  false,
     "EnableMagicWake":  true,
+    "EnableUdpShutdown":  true,
     "Targets":  [
 
                 ]

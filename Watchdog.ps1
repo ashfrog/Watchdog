@@ -18,6 +18,8 @@ $Script:StartWithWindows = $true
 $Script:DisableLockScreen = $false
 $Script:DisableLockScreenWasConfigured = $false
 $Script:EnableMagicWake = $true
+$Script:EnableUdpShutdown = $true
+$Script:TopmostWindows = @{}
 $Script:UserInteractionActive = $false
 $Script:DisplayEventQuietUntil = [DateTime]::MinValue
 
@@ -39,6 +41,7 @@ function WdNewAppConfiguration {
     param($Source)
 
     return @{
+        LaunchEnabled          = [bool](WdGetConfigValue $Source "LaunchEnabled" $true)
         First                  = [int](WdGetConfigValue $Source "First" 1)
         Restart                = [int](WdGetConfigValue $Source "Restart" 5)
         Arguments              = [string](WdGetConfigValue $Source "Arguments" "")
@@ -131,6 +134,7 @@ if ($configurationExists) {
             throw "启动程序列表中没有有效路径。"
         }
         $Script:StartWithWindows = [bool](WdGetConfigValue $savedConfiguration "StartWithWindows" $false)
+        $Script:EnableUdpShutdown = [bool](WdGetConfigValue $savedConfiguration "EnableUdpShutdown" $true)
         $magicWakeProperty = $savedConfiguration.PSObject.Properties["EnableMagicWake"]
         if ($magicWakeProperty) {
             $Script:EnableMagicWake = [bool]$magicWakeProperty.Value
@@ -174,6 +178,7 @@ if (-not $Script:ConfigWasLoaded) {
 #   或直接打开任务管理器
 #   Watchdog 检测到后将停止拉起目标程序，仅记录日志
 # 启动程序列表字段说明：
+# LaunchEnabled:      $true=由看门狗启动和守护  $false=仅检测外部启动的程序并按需置顶
 # First:              首次启动延迟秒数
 # Restart:            异常重启前等待秒数
 # Arguments:          传递给程序的额外参数
@@ -303,6 +308,9 @@ $HWND_NOTOPMOST = [IntPtr]-2       # 解除置顶
 
 # GetWindowLong / SetWindowLong 索引
 $GWL_STYLE = -16          # 窗口样式
+$GWL_EXSTYLE = -20        # 扩展窗口样式
+$WS_EX_TOPMOST = 0x00000008
+$SWP_NOACTIVATE = 0x0010
 
 # 窗口样式位掩码
 $WS_CAPTION = 0x00C00000   # 标题栏（含边框）
@@ -392,6 +400,8 @@ $Script:ExitRequested = $false
 function WdInvokeShutdownCleanup {
     if ($Script:ShutdownCleanupDone) { return }
     $Script:ShutdownCleanupDone = $true
+
+    try { WdReleaseTopmostWindows } catch {}
 
     # 恢复系统光标（若之前被隐藏）
     try {
@@ -1052,6 +1062,7 @@ function WdUpdateDisableState {
     param([string]$DisableReason)
 
     if ($DisableReason) {
+        WdReleaseTopmostWindows
         WdRestoreSystemCursor
         if ($Script:LastDisableReason -ne $DisableReason) {
             WdWriteLog "SAFE-MODE: $DisableReason detected. Monitoring paused; no app will be launched or restarted." "Yellow"
@@ -1114,6 +1125,7 @@ function WdIsDisplayChangeRestartEnabled {
     param($Config, [string]$Path = "")
 
     if ($null -eq $Config) { return $false }
+    if (-not [bool](WdGetConfigValue $Config "LaunchEnabled" $true)) { return $false }
     if ($Config.ContainsKey("Once") -and [bool]$Config.Once) { return $false }
     return ([bool]$Config.RestartOnDisplayChange -or (WdIsUnityDisplayRecoveryEnabled -Path $Path -Config $Config))
 }
@@ -1121,7 +1133,8 @@ function WdIsDisplayChangeRestartEnabled {
 function WdIsUnityDisplayRecoveryEnabled {
     param([string]$Path, $Config)
 
-    if (-not $Config -or (-not [bool](WdGetConfigValue $Config "UnityDisplayRecovery" $true) -and
+    if (-not $Config -or -not [bool](WdGetConfigValue $Config "LaunchEnabled" $true) -or
+        (-not [bool](WdGetConfigValue $Config "UnityDisplayRecovery" $true) -and
             -not [bool]$Config.RestartOnDisplayChange) -or
         [bool]$Config.Once -or [bool]$Config.HideWindow -or [bool]$Config.AllowMultiInstance -or
         ([bool]$Config.ForceDisplayMode -and -not [bool]$Config.Fullscreen) -or
@@ -1759,6 +1772,14 @@ function WdSetWindowToForeground {
     $hwnd = WdWaitForWindowHandle -ProcessObj $ProcessObj -TimeoutMs $WD_FOCUS_WINDOW_HANDLE_TIMEOUT_MS
     if ($null -eq $hwnd -or $hwnd -eq [IntPtr]::Zero) { return $false }
 
+    # 前台窗口也可能没有 TOPMOST 样式；先确保持续置顶，再按需激活。
+    if (([WatchdogWin32.DisplayAPI]::GetWindowLong($hwnd, $GWL_EXSTYLE) -band $WS_EX_TOPMOST) -eq 0) {
+        if (-not [WatchdogWin32.DisplayAPI]::SetWindowPos($hwnd, $HWND_TOPMOST, 0, 0, 0, 0, ($SWP_TOPMOST_FLAGS -bor $SWP_NOACTIVATE))) {
+            return $false
+        }
+        $Script:TopmostWindows[$hwnd.ToInt64()] = WdGetProcessId $ProcessObj
+        WdWriteLog "TOPMOST: Applied to PID=$(WdGetProcessId $ProcessObj), HWND=$hwnd." "DarkCyan"
+    }
     if (WdIsWindowForeground -Hwnd $hwnd) { return $true }
 
     $currentThreadId = [WatchdogWin32.DisplayAPI]::GetCurrentThreadId()
@@ -1780,7 +1801,6 @@ function WdSetWindowToForeground {
         [WatchdogWin32.DisplayAPI]::SetForegroundWindow($hwnd) | Out-Null
 
         Start-Sleep -Milliseconds $WD_FOCUS_SETTLE_MS
-        [WatchdogWin32.DisplayAPI]::SetWindowPos($hwnd, $HWND_NOTOPMOST, 0, 0, 0, 0, $SWP_TOPMOST_FLAGS) | Out-Null
 
         $success = $true
     }
@@ -1793,6 +1813,8 @@ function WdSetWindowToForeground {
             catch {}
         }
     }
+
+    if ($success) { WdWriteLog "FOCUS: Brought PID=$(WdGetProcessId $ProcessObj) to foreground." "DarkCyan" }
 
     # SetForegroundWindow sends WM_ACTIVATE to the target window, which can cause Unity to
     # reset its cursor visible state. Unity re-hides the cursor in its WM_SETCURSOR handler,
@@ -1807,6 +1829,34 @@ function WdSetWindowToForeground {
     }
 
     return $success
+}
+
+function WdReleaseTopmostWindows {
+    # 只还原看门狗设置过的窗口，并验证句柄仍属于原进程，避免句柄复用。
+    foreach ($windowHandle in @($Script:TopmostWindows.Keys)) {
+        $process = $null
+        try {
+            $process = Get-Process -Id $Script:TopmostWindows[$windowHandle] -ErrorAction SilentlyContinue
+            if ($process -and $process.MainWindowHandle.ToInt64() -eq $windowHandle) {
+                [void][WatchdogWin32.DisplayAPI]::SetWindowPos([IntPtr]$windowHandle, $HWND_NOTOPMOST, 0, 0, 0, 0, ($SWP_TOPMOST_FLAGS -bor $SWP_NOACTIVATE))
+            }
+        }
+        catch {}
+        finally { if ($process) { WdDisposeProcessResult $process } }
+    }
+    $Script:TopmostWindows.Clear()
+}
+
+function WdMaintainWindowFocus {
+    param([string]$Path, $Config, $ProcessObj, [hashtable]$FocusLastTime)
+
+    if (-not [bool]$Config.FocusTop -or $null -eq $ProcessObj) { return }
+    if ($FocusLastTime.ContainsKey($Path) -and $FocusLastTime[$Path] -and
+        ((Get-Date) - $FocusLastTime[$Path]).TotalSeconds -lt $FocusCooldownSeconds) { return }
+
+    if (WdSetWindowToForeground -ProcessObj $ProcessObj) {
+        $FocusLastTime[$Path] = Get-Date
+    }
 }
 
 function WdRepairWindowDisplayMode {
@@ -2432,6 +2482,10 @@ function WdGetControlResponse {
             return "OK reboot accepted"
         }
         "shutdown" {
+            if ($Protocol -ieq "UDP" -and -not $Script:EnableUdpShutdown) {
+                WdWriteLog "CONTROL: Rejected UDP shutdown command from [$source]; UDP shutdown is disabled." "DarkYellow"
+                return "ERR UDP shutdown disabled"
+            }
             if ($Script:PendingSystemPowerAction) {
                 return "ERR system power action already pending"
             }
@@ -2698,6 +2752,7 @@ function WdRestartTopmostApps {
 
     foreach ($path in $Apps.Keys) {
         $config = $Apps[$path]
+        if (-not [bool](WdGetConfigValue $config "LaunchEnabled" $true)) { continue }
         if (-not $config.ContainsKey("FocusTop") -or -not [bool]$config.FocusTop) { continue }
 
         if (WdIsBrowserUrl -Path $path) {
@@ -3159,7 +3214,8 @@ function WdSaveUserConfiguration {
         [System.Collections.IDictionary]$AppConfigurations,
         [bool]$StartWithWindows = $Script:StartWithWindows,
         [bool]$DisableLockScreen = $Script:DisableLockScreen,
-        [bool]$EnableMagicWake = $Script:EnableMagicWake
+        [bool]$EnableMagicWake = $Script:EnableMagicWake,
+        [bool]$EnableUdpShutdown = $Script:EnableUdpShutdown
     )
 
     if ($null -eq $AppConfigurations) {
@@ -3180,10 +3236,11 @@ function WdSaveUserConfiguration {
     }
 
     $payload = [ordered]@{
-        Version          = 4
+        Version          = 5
         StartWithWindows = $StartWithWindows
         DisableLockScreen = $DisableLockScreen
         EnableMagicWake  = $EnableMagicWake
+        EnableUdpShutdown = $EnableUdpShutdown
         Targets          = @($targets)
     }
     $json = $payload | ConvertTo-Json -Depth 8
@@ -3255,17 +3312,20 @@ function WdResetMonitoringState {
 }
 
 function WdApplyAppConfigurations {
-    param($Entries, [bool]$StartWithWindows, [bool]$DisableLockScreen, [bool]$EnableMagicWake)
+    param($Entries, [bool]$StartWithWindows, [bool]$DisableLockScreen, [bool]$EnableMagicWake,
+        [bool]$EnableUdpShutdown = $Script:EnableUdpShutdown)
 
     $newApps = WdConvertConfigurationEntriesToApps -Entries $Entries
     WdSaveUserConfiguration `
         -AppConfigurations $newApps `
         -StartWithWindows $StartWithWindows `
         -DisableLockScreen $DisableLockScreen `
-        -EnableMagicWake $EnableMagicWake
+        -EnableMagicWake $EnableMagicWake `
+        -EnableUdpShutdown $EnableUdpShutdown
     WdSetStartupEnabled -Enabled $StartWithWindows
     WdSetLockScreenDisabled -Disabled $DisableLockScreen
     WdApplyMagicWakeSettings -Enabled $EnableMagicWake
+    WdReleaseTopmostWindows
     $script:Apps = $newApps
     $Script:ConfigWasLoaded = $true
     $Script:ConfigLoadError = $null
@@ -3274,6 +3334,7 @@ function WdApplyAppConfigurations {
     $Script:DisableLockScreen = $DisableLockScreen
     $Script:DisableLockScreenWasConfigured = $true
     $Script:EnableMagicWake = $EnableMagicWake
+    $Script:EnableUdpShutdown = $EnableUdpShutdown
     WdResetMonitoringState
     WdWriteLog "UI: Saved $($newApps.Count) monitoring target(s)." "DarkGreen"
 }
@@ -3674,7 +3735,7 @@ function WdNewSettingsView {
         [void]$library.RowStyles.Add((New-Object Windows.Forms.RowStyle($rowType, 100)))
     }
     $libraryHeading = & $newFlow
-    $libraryTitle = & $newLabel '启动程序' 10 $true
+    $libraryTitle = & $newLabel '监控程序' 10 $true
     $libraryTitle.Margin = New-Object Windows.Forms.Padding(0, 5, 24, 4)
     [void]$libraryHeading.Controls.Add($libraryTitle)
     $ui.Add = & $newButton '+ 添加' $false
@@ -3769,6 +3830,7 @@ function WdNewSettingsView {
             @('FocusTop', '窗口置顶（全局单选）'), @('HideCursor', '隐藏鼠标光标'),
             @('RestartOnDisplayChange', '显示器变化时重启'), @('UnityDisplayRecovery', 'Unity 全屏异常恢复')) },
         @{ Title = '运行策略'; Options = @(
+            @('LaunchEnabled', '通过看门狗启动'),
             @('HideWindow', '隐藏窗口启动'), @('Once', '仅启动一次'),
             @('KillTreeOnHang', '异常时结束进程树'), @('AllowMultiInstance', '允许多实例')) }
     )
@@ -3802,7 +3864,8 @@ function WdNewSettingsView {
     & $append $hostContent (& $newLabel '无人值守' 10 $true)
     foreach ($option in @(@('AutoStart', '随 Windows 自动启动', $Script:StartWithWindows),
             @('DisableLockScreen', '禁用 Windows 锁屏', $Script:DisableLockScreen),
-            @('MagicWake', '允许魔法唤醒', $Script:EnableMagicWake))) {
+            @('MagicWake', '允许魔法唤醒', $Script:EnableMagicWake),
+            @('EnableUdpShutdown', '接收 UDP 关机指令', $Script:EnableUdpShutdown))) {
         $check = New-Object WatchdogUI.Toggle
         $check.Text = $option[1]; $check.AutoSize = $true; $check.Checked = [bool]$option[2]
         $check.Dock = 'Top'
@@ -3875,7 +3938,7 @@ function WdNewSettingsView {
                     $pageHost.SetCellPosition($ui.ProgramPage, (New-Object Windows.Forms.TableLayoutPanelCellPosition(0, 0)))
                     $pageHost.SetCellPosition($ui.HostPage, (New-Object Windows.Forms.TableLayoutPanelCellPosition(0, 1)))
                     [void]$pageHost.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle('Percent', 100)))
-                    [void]$pageHost.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute', (520 * $scale))))
+                    [void]$pageHost.RowStyles.Add((New-Object Windows.Forms.RowStyle('Absolute', (500 * $scale))))
                     [void]$pageHost.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent', 100)))
                     $ui.HostPage.Margin = New-Object Windows.Forms.Padding(0, (12 * $scale), 0, 0)
                 }
@@ -3938,7 +4001,7 @@ function WdNewSettingsView {
                     (New-Object Drawing.Size($wrapWidth, 32767)), [Windows.Forms.TextFormatFlags]::WordBreak)
                 $pair[0].Size = New-Object Drawing.Size($wrapWidth, $textSize.Height)
             }
-            if ($compact) { $pageHost.RowStyles[0].Height = [Math]::Max(520 * $scale, $program.Height + 2 * $scale) }
+            if ($compact) { $pageHost.RowStyles[0].Height = [Math]::Max(500 * $scale, $program.Height + 2 * $scale) }
         }
         finally { $layoutState.Busy = $false }
     }.GetNewClosure()
@@ -4015,6 +4078,7 @@ function WdShowSettingsWindow {
     $status = $view.Status
     $autoStart = $view.AutoStart
     $disableLockScreen = $view.DisableLockScreen
+    $enableUdpShutdown = $view.EnableUdpShutdown
     $save = $view.Save
     $cancel = $view.Cancel
     if ($Script:ConfigLoadError) {
@@ -4281,7 +4345,8 @@ function WdShowSettingsWindow {
                 -Entries $entries `
                 -StartWithWindows $autoStart.Checked `
                 -DisableLockScreen $disableLockScreen.Checked `
-                -EnableMagicWake $magicWake.Checked
+                -EnableMagicWake $magicWake.Checked `
+                -EnableUdpShutdown $enableUdpShutdown.Checked
             $form.Tag = "saved"
             $status.ForeColor = [System.Drawing.Color]::DarkGreen
             $status.Text = "已保存 $($entries.Count) 个启动程序，监控已立即更新。"
@@ -4682,6 +4747,7 @@ WdWriteLog "=== Watchdog Service Active (Monitor Count: $($Apps.Count)) ===" "Ye
 WdWriteLog "INFO: Portable configuration path = $UserConfigPath" "DarkGray"
 WdWriteLog "INFO: Start with Windows = $Script:StartWithWindows" "DarkGray"
 WdWriteLog "INFO: Magic wake enabled = $Script:EnableMagicWake" "DarkGray"
+WdWriteLog "INFO: UDP shutdown enabled = $Script:EnableUdpShutdown" "DarkGray"
 WdWriteLog "INFO: Disable flag path = $DisableFlag" "DarkGray"
 WdWriteLog "INFO: Task Manager open state is treated as disable flag" "DarkGray"
 WdWriteLog "INFO: Check interval = $CheckInterval sec, Max retry/hour = $MaxRetryInHour" "DarkGray"
@@ -4831,6 +4897,18 @@ try {
 
                 $procs = WdGetTargetProcess -Path $Path
                 $procCount = if ($procs -is [array]) { $procs.Count } elseif ($procs) { 1 } else { 0 }
+
+                # 关闭启动后只观察外部程序并维护置顶，不参与拉起、杀进程或恢复重启。
+                if (-not [bool](WdGetConfigValue $Config "LaunchEnabled" $true)) {
+                    if ($procCount -gt 0 -and [bool]$Config.FocusTop -and ($isExe -or $isUrl)) {
+                        $FirstProc = WdGetPreferredProcess -Processes $procs
+                        if ($FirstProc) {
+                            $mainProc = Get-Process -Id (WdGetProcessId $FirstProc) -ErrorAction SilentlyContinue
+                            WdMaintainWindowFocus -Path $Path -Config $Config -ProcessObj $mainProc -FocusLastTime $FocusLastTime
+                        }
+                    }
+                    continue
+                }
 
                 if ($DisplayChangeRestartInProgress.ContainsKey($Path)) {
                     $displayRestartState = $DisplayChangeRestartInProgress[$Path]
@@ -5106,33 +5184,8 @@ try {
                             }
                         }
 
-                        if ([bool]$Config.FocusTop -and -not [bool]$Config.HideWindow -and ($isExe -or $isUrl)) {
-                            $allowFocus = $true
-
-                            if ($FocusLastTime.ContainsKey($Path) -and $FocusLastTime[$Path]) {
-                                $elapsed = ((Get-Date) - $FocusLastTime[$Path]).TotalSeconds
-                                if ($elapsed -lt $FocusCooldownSeconds) {
-                                    $allowFocus = $false
-                                }
-                            }
-
-                            if ($allowFocus) {
-                                $fgHwnd = [IntPtr]::Zero
-                                try {
-                                    if ($null -ne $mainProc.MainWindowHandle) {
-                                        $fgHwnd = [IntPtr]$mainProc.MainWindowHandle
-                                    }
-                                }
-                                catch {} # process may have just exited; leave fgHwnd as Zero
-                                if ($fgHwnd -ne [IntPtr]::Zero -and (WdIsWindowForeground -Hwnd $fgHwnd)) {
-                                    # Already in foreground; reset cooldown to skip redundant attempts
-                                    $FocusLastTime[$Path] = Get-Date
-                                }
-                                elseif (WdSetWindowToForeground -ProcessObj $mainProc) {
-                                    $FocusLastTime[$Path] = Get-Date
-                                    WdWriteLog "FOCUS: Brought $FileName (PID:$TargetID) to foreground." "DarkCyan"
-                                }
-                            }
+                        if (-not [bool]$Config.HideWindow -and ($isExe -or $isUrl)) {
+                            WdMaintainWindowFocus -Path $Path -Config $Config -ProcessObj $mainProc -FocusLastTime $FocusLastTime
                         }
 
                         if ($hideCursor) {

@@ -23,6 +23,7 @@ $previewBuilder = $previewBuilder.Replace('[Windows.Forms.Screen]::FromControl($
 $Script:StartWithWindows = $true
 $Script:DisableLockScreen = $false
 $Script:EnableMagicWake = $true
+$Script:EnableUdpShutdown = $true
 if ($OutputDirectory) { [void][IO.Directory]::CreateDirectory($OutputDirectory) }
 $cases = @(@('desktop', 1120, 660, 1920, 1080), @('minimum-desktop', 960, 640, 1024, 768), @('portrait', 900, 1280, 1080, 1920), @('small-portrait', 704, 1241, 800, 1440))
 foreach ($case in $cases) {
@@ -74,7 +75,7 @@ foreach ($case in $cases) {
             if ($OutputDirectory) { $bitmap.Save((Join-Path $OutputDirectory ($case[0] + '.png'))) }
         }
         finally { $bitmap.Dispose() }
-        if ($view.CheckBoxes.Count -ne 10) { throw 'A configuration option was lost' }
+        if ($view.CheckBoxes.Count -ne 11) { throw 'A configuration option was lost' }
         if ($case[0] -eq 'desktop' -and $view.ProgramPage.VerticalScroll.Visible) { throw 'Default compact desktop layout should show all program settings without scrolling' }
         if ($case[0] -ne 'compact' -and $view.CheckBoxes.Fullscreen.Top -ne $view.CheckBoxes.ForceDisplayMode.Top) { throw 'Wide options failed to align in two columns' }
         if ($view.Body.ColumnCount -ne $(if ($case[0] -like '*portrait') { 1 } else { 2 })) { throw 'Responsive breakpoint failed' }
@@ -146,8 +147,8 @@ foreach ($name in @('WdGetConfigValue', 'WdNewAppConfiguration', 'WdShowSettings
 }
 function WdGetPhysicalNetworkAdapters { return @() }
 function WdApplyAppConfigurations {
-    param($Entries, $StartWithWindows, $DisableLockScreen, $EnableMagicWake)
-    $script:capturedSettings = @{ Entries = @($Entries); AutoStart = $StartWithWindows; LockScreen = $DisableLockScreen; Wake = $EnableMagicWake }
+    param($Entries, $StartWithWindows, $DisableLockScreen, $EnableMagicWake, $EnableUdpShutdown)
+    $script:capturedSettings = @{ Entries = @($Entries); AutoStart = $StartWithWindows; LockScreen = $DisableLockScreen; Wake = $EnableMagicWake; UdpShutdown = $EnableUdpShutdown }
 }
 function WdOfferAuthorizationForError { param($Exception, $Operation) throw $Exception }
 $Apps = [ordered]@{ 'D:\Exhibition\Exhibition.exe' = (WdNewAppConfiguration @{ HideCursor = $true; Arguments = 'original' }) }
@@ -164,13 +165,16 @@ $script:settingsExercise = {
     $autoStart.Checked = $false
     $disableLockScreen.Checked = $true
     $magicWake.Checked = $false
+    $enableUdpShutdown.Checked = $false
+    $checkBoxes.LaunchEnabled.Checked = $false
+    $checkBoxes.FocusTop.Checked = $true
     $save.PerformClick()
 }
 if (-not (WdShowSettingsWindow)) { throw 'Settings editor failed to save through existing handler' }
 $savedConfig = $script:capturedSettings.Entries[0].Config
 if ($savedConfig.Arguments -ne '-screen-fullscreen 1' -or $savedConfig.Restart -ne 8 -or
-    -not $savedConfig.RestartOnDisplayChange -or -not $savedConfig.HideCursor -or -not $savedConfig.UnityDisplayRecovery) { throw 'Editor did not preserve program options' }
-if ($script:capturedSettings.AutoStart -or -not $script:capturedSettings.LockScreen -or $script:capturedSettings.Wake) { throw 'Host options were not bound to save' }
+    -not $savedConfig.RestartOnDisplayChange -or -not $savedConfig.HideCursor -or -not $savedConfig.UnityDisplayRecovery -or $savedConfig.LaunchEnabled -or -not $savedConfig.FocusTop) { throw 'Editor did not preserve program options' }
+if ($script:capturedSettings.AutoStart -or -not $script:capturedSettings.LockScreen -or $script:capturedSettings.Wake -or $script:capturedSettings.UdpShutdown) { throw 'Host options were not bound to save' }
 if ($Script:SettingsWindowOpen -or $null -ne $Script:SettingsForm -or $Script:UserInteractionActive) { throw 'Editor did not restore unattended state after closing' }
 $Apps = [ordered]@{}
 $script:settingsExercise = {
