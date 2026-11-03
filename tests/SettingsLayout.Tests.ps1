@@ -75,6 +75,7 @@ foreach ($case in $cases) {
             if ($OutputDirectory) { $bitmap.Save((Join-Path $OutputDirectory ($case[0] + '.png'))) }
         }
         finally { $bitmap.Dispose() }
+        if ($form.TopMost) { throw 'Watchdog settings panel must not be topmost' }
         if ($view.CheckBoxes.Count -ne 11) { throw 'A configuration option was lost' }
         if ($case[0] -eq 'desktop' -and $view.ProgramPage.VerticalScroll.Visible) { throw 'Default compact desktop layout should show all program settings without scrolling' }
         if ($case[0] -ne 'compact' -and $view.CheckBoxes.Fullscreen.Top -ne $view.CheckBoxes.ForceDisplayMode.Top) { throw 'Wide options failed to align in two columns' }

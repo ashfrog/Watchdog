@@ -1,10 +1,30 @@
 {
     "Version":  5,
-    "StartWithWindows":  true,
+    "StartWithWindows":  false,
     "DisableLockScreen":  false,
     "EnableMagicWake":  true,
     "EnableUdpShutdown":  true,
     "Targets":  [
-
+                    {
+                        "Path":  "M:\\GitHub\\shanxi_yangquan\\shanxi_yangquan\\TouchSocketCentrolControlManager\\ServiceApp\\bin\\Release\\ServiceApp.exe",
+                        "Restart":  5,
+                        "ForceDisplayMode":  false,
+                        "Browser":  "auto",
+                        "Arguments":  "",
+                        "First":  1,
+                        "RestartOnDisplayChange":  false,
+                        "KillTreeOnHang":  true,
+                        "Fullscreen":  false,
+                        "MinUpSeconds":  15,
+                        "PythonExe":  "",
+                        "HideWindow":  false,
+                        "Once":  false,
+                        "LaunchEnabled":  false,
+                        "AllowMultiInstance":  false,
+                        "FocusTop":  true,
+                        "ConsoleMode":  "Auto",
+                        "UnityDisplayRecovery":  true,
+                        "HideCursor":  false
+                    }
                 ]
 }

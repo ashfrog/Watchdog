@@ -3632,7 +3632,7 @@ function WdNewSettingsView {
     $form.BackColor = $canvas
     $form.FormBorderStyle = 'Sizable'
     $form.MinimizeBox = $false
-    $form.TopMost = $true
+    $form.TopMost = $false
     $area = [Windows.Forms.Screen]::FromPoint([Windows.Forms.Cursor]::Position).WorkingArea
     $tallLayout = $area.Height -gt $area.Width
     $form.MinimumSize = New-Object Drawing.Size(($(if ($tallLayout) { 720 } else { 960 })), ($(if ($tallLayout) { 1280 } else { 640 })))
